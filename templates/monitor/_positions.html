@@ -1,0 +1,25 @@
+<div class="bg-white shadow rounded p-4">
+  <h2 class="text-xl font-semibold mb-2">Активные позиции</h2>
+  {% if positions and positions|length > 0 %}
+    <table class="min-w-full border">
+      <thead>
+        <tr>
+          <th class="border px-2 py-1">Символ</th>
+          <th class="border px-2 py-1">Сторона</th>
+          <th class="border px-2 py-1">Количество</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for pos in positions %}
+          <tr>
+            <td class="border px-2 py-1">{{ pos.symbol }}</td>
+            <td class="border px-2 py-1">{{ pos.side }}</td>
+            <td class="border px-2 py-1">{{ pos.qty }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>Нет активных позиций</p>
+  {% endif %}
+</div>

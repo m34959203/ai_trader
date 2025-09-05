@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: ai_trader_app
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./configs/.env
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: ai_trader_db
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: traderpass
+      POSTGRES_DB: ai_trader
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d ai_trader"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai_trader_redis
+    ports:
+      - "6379:6379"
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # при необходимости можно добавить RabbitMQ
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ai_trader_rabbit
+    ports:
+      - "5672:5672"
+      - "15672:15672" # web UI
+    restart: always
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  db_data:

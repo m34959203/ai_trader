@@ -1,0 +1,31 @@
+<div class="bg-white shadow rounded p-4">
+  <h2 class="text-xl font-semibold mb-2">Последние ордера</h2>
+  {% if orders and orders|length > 0 %}
+    <table class="min-w-full border">
+      <thead>
+        <tr>
+          <th class="border px-2 py-1">Время</th>
+          <th class="border px-2 py-1">Символ</th>
+          <th class="border px-2 py-1">Сторона</th>
+          <th class="border px-2 py-1">Qty</th>
+          <th class="border px-2 py-1">Статус</th>
+          <th class="border px-2 py-1">Причина</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in orders %}
+          <tr>
+            <td class="border px-2 py-1">{{ o.ts }}</td>
+            <td class="border px-2 py-1">{{ o.symbol }}</td>
+            <td class="border px-2 py-1">{{ o.side }}</td>
+            <td class="border px-2 py-1">{{ o.qty }}</td>
+            <td class="border px-2 py-1">{{ o.status }}</td>
+            <td class="border px-2 py-1">{{ o.reason }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>Нет ордеров</p>
+  {% endif %}
+</div>
