@@ -1,0 +1,299 @@
+
+C:\Users\Дмитрий\Desktop\ai_trader\tests>cd C:\Users\Дмитрий\Desktop\ai_trader
+
+C:\Users\Дмитрий\Desktop\ai_trader>(.venv) C:\Users\Дмитрий\Desktop\ai_trader>pip install --upgrade httpx asgi-lifespan
+Непредвиденное появление: C:\Users\Дмитрий\Desktop\ai_trader.
+
+C:\Users\Дмитрий\Desktop\ai_trader>tree /f
+Структура папок
+Серийный номер тома: 7404-48E4
+C:.
+│   .coverage
+│   alembic.ini
+│   docker-compose.yml
+│   Dockerfile
+│   pytest.ini
+│   requirements.txt
+│   run-dev.bat
+│
+├───.pytest_cache
+│   │   .gitignore
+│   │   CACHEDIR.TAG
+│   │   README.md
+│   │
+│   └───v
+│       └───cache
+│               lastfailed
+│               nodeids
+│               stepwise
+│
+├───backup
+│       backup.sh
+│       crontab.txt
+│
+├───configs
+│       .env
+│       .env.test
+│       exec.yaml
+│
+├───data
+│   │   ai_trader.db
+│   │   ai_trader.db-shm
+│   │   ai_trader.db-wal
+│   │   news.json
+│   │   trader.db
+│   │
+│   └───state
+│           daily_limits.json
+│           daily_limits.json.bak
+│           heartbeat.txt
+│
+├───db
+│   │   crud.py
+│   │   crud_orders.py
+│   │   models.py
+│   │   models_orders.py
+│   │   session.py
+│   │   __init__.py
+│   │
+│   └───__pycache__
+│           crud.cpython-311.pyc
+│           crud_orders.cpython-311.pyc
+│           models.cpython-311.pyc
+│           models_orders.cpython-311.pyc
+│           session.cpython-311.pyc
+│           __init__.cpython-311.pyc
+│
+├───deploy
+│       supervisord.conf
+│
+├───doc
+│       анализ готовности архива.docx
+│       главная цель AI- трейдера.docx
+│       Документ Microsoft Word.docx
+│       Поэтапный план реализации AI-трейдера.docx
+│       Промт и Архитектура Полностью Автономного AI-Трейдера на Основе Книг.docx
+│       Спринты.docx
+│       структура файлов и папок в проекте.txt
+│       технический аудит с конкретикой что делает каждый файл.docx
+│       Функционал AI-трейдера.docx
+│       Чек-лист промышленной эксплуатации AI-Трейдера.docx
+│
+├───executors
+│   │   api_binance.py
+│   │   base.py
+│   │   simulated.py
+│   │   ui_agent.py
+│   │   __init__.py
+│   │
+│   └───__pycache__
+│           api_binance.cpython-311.pyc
+│           base.cpython-311.pyc
+│           simulated.cpython-311.pyc
+│           ui_agent.cpython-311.pyc
+│           __init__.cpython-311.pyc
+│
+├───htmlcov
+│       .gitignore
+│       class_index.html
+│       coverage_html_cb_497bf287.js
+│       favicon_32_cb_58284776.png
+│       function_index.html
+│       index.html
+│       keybd_closed_cb_ce680311.png
+│       status.json
+│       style_cb_dca529e9.css
+│       z_145eef247bfb46b6_data_loader_py.html
+│       z_145eef247bfb46b6_main_py.html
+│       z_145eef247bfb46b6___init___py.html
+│       z_1f4cdc73c39a6604_crud_py.html
+│       z_1f4cdc73c39a6604_models_py.html
+│       z_1f4cdc73c39a6604_session_py.html
+│       z_1f4cdc73c39a6604___init___py.html
+│       z_51fcec635d35c76c_ohlcv_py.html
+│       z_51fcec635d35c76c___init___py.html
+│       z_5d746b4c5dd79dd0_alpha_vantage_py.html
+│       z_5d746b4c5dd79dd0_base_py.html
+│       z_5d746b4c5dd79dd0_binance_py.html
+│       z_5d746b4c5dd79dd0___init___py.html
+│       z_9b0341f23a4a319f_ohlcv_py.html
+│       z_9b0341f23a4a319f___init___py.html
+│       z_a44f0ac069e85531_conftest_py.html
+│       z_a44f0ac069e85531_test_ohlcv_py.html
+│       z_a44f0ac069e85531_test_paging_py.html
+│       z_a44f0ac069e85531_test_prices_endpoint_py.html
+│
+├───logs
+├───migrations
+│   │   env.py
+│   │   README
+│   │   script.py.mako
+│   │
+│   └───versions
+│       │   2f72cc1a6d74_add_source_column_to_ohlcv.py
+│       │
+│       └───__pycache__
+│               2f72cc1a6d74_add_source_column_to_ohlcv.cpython-311.pyc
+│
+├───monitoring
+│       alerts.py
+│
+├───news
+│       nlp_gate.py
+│       rss_client.py
+│
+├───risk
+│   │   deadman.py
+│   │   risk_manager.py
+│   │   trailing.py
+│   │
+│   └───__pycache__
+│           deadman.cpython-311.pyc
+│
+├───routers
+│   │   ohlcv.py
+│   │   trading.py
+│   │   trading_exec.py
+│   │   ui.py
+│   │   __init__.py
+│   │
+│   └───__pycache__
+│           ohlcv.cpython-311.pyc
+│           trading.cpython-311.pyc
+│           trading_exec.cpython-311.pyc
+│           ui.cpython-311.pyc
+│           __init__.cpython-311.pyc
+│
+├───schemas
+│   │   ohlcv.py
+│   │   trading.py
+│   │   __init__.py
+│   │
+│   └───__pycache__
+│           ohlcv.cpython-311.pyc
+│           trading.cpython-311.pyc
+│           __init__.cpython-311.pyc
+│
+├───scripts
+│       demo_analyze.py
+│       init_db.py
+│
+├───services
+│   │   protection.py
+│   │   reconcile.py
+│   │   stream_router.py
+│   │   trading_service.py
+│   │
+│   └───__pycache__
+│           reconcile.cpython-311.pyc
+│           stream_router.cpython-311.pyc
+│           trading_service.cpython-311.pyc
+│
+├───sources
+│   │   alpha_vantage.py
+│   │   base.py
+│   │   binance.py
+│   │   binance_ws.py
+│   │   ohlcv.py
+│   │   __init__.py
+│   │
+│   └───__pycache__
+│           alpha_vantage.cpython-311.pyc
+│           base.cpython-311.pyc
+│           binance.cpython-311.pyc
+│           __init__.cpython-311.pyc
+│
+├───src
+│   │   data_loader.py
+│   │   indicators.py
+│   │   main.py
+│   │   paper.py
+│   │   strategy.py
+│   │   __init__.py
+│   │
+│   ├───analysis
+│   │   │   analyze_market.py
+│   │   │
+│   │   └───__pycache__
+│   │           analyze_market.cpython-311.pyc
+│   │
+│   └───__pycache__
+│           data_loader.cpython-311.pyc
+│           indicators.cpython-311.pyc
+│           main.cpython-311.pyc
+│           paper.cpython-311.pyc
+│           strategy.cpython-311.pyc
+│           __init__.cpython-311.pyc
+│
+├───state
+│   │   daily_limits.py
+│   │
+│   └───__pycache__
+│           daily_limits.cpython-311.pyc
+│
+├───static
+│       htmx.min.js
+│
+├───templates
+│   └───monitor
+│           index.html
+│           _balance.html
+│           _metrics.html
+│           _orders.html
+│           _positions.html
+│
+├───tests
+│   │   conftest.py
+│   │   exec.example.yaml
+│   │   secrets_testdata.py
+│   │   test_analyze_market.py
+│   │   test_execution_api.py
+│   │   test_exec_balance.py
+│   │   test_indicators.py
+│   │   test_ohlcv.py
+│   │   test_paging.py
+│   │   test_paper.py
+│   │   test_prices_endpoint.py
+│   │   test_strategy.py
+│   │   test_ui_agent_stub.py
+│   │   test_ui_smoke.py
+│   │
+│   └───__pycache__
+│           conftest.cpython-311-pytest-8.3.4.pyc
+│           conftest.cpython-311-pytest-8.4.1.pyc
+│           secrets.cpython-311.pyc
+│           test_analyze_market.cpython-311-pytest-8.3.4.pyc
+│           test_analyze_market.cpython-311-pytest-8.4.1.pyc
+│           test_execution_api.cpython-311-pytest-8.3.4.pyc
+│           test_execution_api.cpython-311-pytest-8.4.1.pyc
+│           test_exec_balance.cpython-311-pytest-8.3.4.pyc
+│           test_exec_balance.cpython-311-pytest-8.4.1.pyc
+│           test_indicators.cpython-311-pytest-8.3.4.pyc
+│           test_indicators.cpython-311-pytest-8.4.1.pyc
+│           test_ohlcv.cpython-311-pytest-8.3.4.pyc
+│           test_ohlcv.cpython-311-pytest-8.4.1.pyc
+│           test_paging.cpython-311-pytest-8.3.4.pyc
+│           test_paging.cpython-311-pytest-8.4.1.pyc
+│           test_paper.cpython-311-pytest-8.3.4.pyc
+│           test_paper.cpython-311-pytest-8.4.1.pyc
+│           test_prices_endpoint.cpython-311-pytest-8.3.4.pyc
+│           test_prices_endpoint.cpython-311-pytest-8.4.1.pyc
+│           test_strategy.cpython-311-pytest-8.3.4.pyc
+│           test_strategy.cpython-311-pytest-8.4.1.pyc
+│           test_ui_agent_stub.cpython-311-pytest-8.3.4.pyc
+│           test_ui_agent_stub.cpython-311-pytest-8.4.1.pyc
+│           test_ui_smoke.cpython-311-pytest-8.3.4.pyc
+│           test_ui_smoke.cpython-311-pytest-8.4.1.pyc
+│
+└───utils
+    │   risk_config.py
+    │   secrets.py
+    │   __init__.py
+    │
+    └───__pycache__
+            risk_config.cpython-311.pyc
+            secrets.cpython-311.pyc
+            __init__.cpython-311.pyc
+
+
+C:\Users\Дмитрий\Desktop\ai_trader>

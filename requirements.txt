@@ -1,0 +1,54 @@
+# ── Core API
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+
+# ── Web / HTTP clients
+requests==2.32.5
+httpx==0.28.1
+aiohttp==3.12.15
+websockets==15.0.1
+
+# ── Templates (UI / /ui/*)
+jinja2==3.1.6
+
+# ── Data / Analytics
+pandas==2.3.2
+numpy==2.3.2
+ta==0.11.0
+yfinance==0.2.65
+
+# ── Exchanges / Market connectivity
+ccxt==4.5.2
+
+# ── DB / Migrations (async SQLite)
+SQLAlchemy==2.0.43
+aiosqlite==0.21.0
+alembic==1.16.5
+
+# ── ML / Classic models (используется в тестах/анализе)
+scikit-learn==1.7.1
+
+# ── News/RSS (есть модуль news/rss_client.py)
+feedparser==6.0.11
+
+# ── Utilities
+python-dotenv==1.1.1
+tenacity==9.0.0        # надёжные ретраи для сетевых вызовов
+loguru==0.7.2          # удобное логирование (опционально, но полезно)
+
+# ── Dev / Ops (можно оставить и для prod — безвредно)
+prometheus-client==0.22.1  # /metrics при желании
+apscheduler==3.10.4        # периодические задачи (сверка и т.п.)
+
+torch
+transformers
+scikit-learn
+plotly
+
+
+# Тесты
+pytest==8.3.4
+pytest-asyncio==0.24.0
+coverage==7.6.10
+asgi-lifespan

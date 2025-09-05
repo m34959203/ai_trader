@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ru" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI-Trader Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- HTMX -->
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <!-- Tailwind (CDN) -->
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet"/>
+
+  <style>
+    /* HTMX inline indicator */
+    .htmx-indicator { display: none; }
+    .htmx-request .htmx-indicator,
+    .htmx-request.htmx-indicator { display: inline-block; }
+
+    /* Toasts */
+    .toast {
+      pointer-events: auto;
+      transform: translateY(0);
+      transition: opacity .2s ease, transform .2s ease;
+    }
+    .toast-enter { opacity: 0; transform: translateY(6px); }
+    .toast-exit  { opacity: 0; transform: translateY(-6px); }
+  </style>
+</head>
+
+<body class="h-full bg-gray-50 text-gray-900">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-bold">AI-Trader Dashboard</h1>
+
+      <div class="flex items-center space-x-3">
+        <!-- Live indicator -->
+        <span class="htmx-indicator text-sm text-gray-600" aria-live="polite">
+          Обновление…
+        </span>
+
+        <!-- Dark mode toggle -->
+        <button
+          type="button"
+          id="btnTheme"
+          class="px-3 py-1.5 rounded border text-sm hover:bg-gray-100"
+          title="Переключить тему"
+          aria-label="Переключить тему"
+        >🌓</button>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div id="controls" class="bg-white border border-gray-200 rounded-md p-4 mb-6 shadow-sm">
+      <form class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end" onsubmit="return false;">
+        <!-- Exec mode -->
+        <label class="block">
+          <span class="block text-sm font-medium mb-1">Режим исполнения</span>
+          <select id="mode" name="mode" class="w-full border-gray-300 rounded-md">
+            <option value="binance">binance</option>
+            <option value="sim">sim</option>
+          </select>
+        </label>
+
+        <!-- Testnet -->
+        <label class="block">
+          <span class="block text-sm font-medium mb-1">Testnet</span>
+          <select id="testnet" name="testnet" class="w-full border-gray-300 rounded-md">
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+        </label>
+
+        <!-- Auto refresh -->
+        <label class="block">
+          <span class="block text-sm font-medium mb-1">Интервал обновления</span>
+          <select id="refreshSec" class="w-full border-gray-300 rounded-md">
+            <option value="5">каждые 5s</option>
+            <option value="10">каждые 10s</option>
+            <option value="15">каждые 15s</option>
+            <option value="30">каждые 30s</option>
+            <option value="0">выкл.</option>
+          </select>
+        </label>
+
+        <!-- Buttons -->
+        <div class="flex space-x-2">
+          <button
+            type="button"
+            class="px-3 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 w-full"
+            onclick="refreshAll()"
+            title="Запросить все партиалы заново"
+          >
+            Обновить сейчас
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <!-- 4-column grid (добавили Metrics) -->
+    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+      <!-- Balance -->
+      <section
+        id="balance"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
+        hx-get="/ui/partials/balance"
+        hx-trigger="load"
+        hx-include="#controls"
+        hx-params="mode,testnet"
+        hx-indicator=".htmx-indicator"
+        hx-swap="outerHTML"
+      >
+        <div class="text-sm text-gray-500">Загрузка баланса…</div>
+      </section>
+
+      <!-- Positions -->
+      <section
+        id="positions"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
+        hx-get="/ui/partials/positions"
+        hx-trigger="load"
+        hx-include="#controls"
+        hx-params="mode,testnet"
+        hx-indicator=".htmx-indicator"
+        hx-swap="outerHTML"
+      >
+        <div class="text-sm text-gray-500">Загрузка позиций…</div>
+      </section>
+
+      <!-- Orders -->
+      <section
+        id="orders"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
+        hx-get="/ui/partials/orders"
+        hx-trigger="load"
+        hx-include="#controls"
+        hx-params="*"
+        hx-indicator=".htmx-indicator"
+        hx-swap="outerHTML"
+      >
+        <div class="text-sm text-gray-500">Загрузка журнала ордеров…</div>
+      </section>
+
+      <!-- Metrics (новая карточка) -->
+      <section
+        id="metrics"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
+        hx-get="/ui/partials/metrics"
+        hx-trigger="load"
+        hx-include="#controls"
+        hx-params="mode,testnet"
+        hx-indicator=".htmx-indicator"
+        hx-swap="outerHTML"
+      >
+        <div class="text-sm text-gray-500">Загрузка метрик…</div>
+      </section>
+    </div>
+
+    <p class="mt-6 text-xs text-gray-500">
+      Подсказка: переключай режим <code>binance/sim</code> и флаг <code>testnet</code> — партиалы подгружают данные с этими параметрами.
+      Интервалы автообновления задаются селектором «Интервал обновления».
+    </p>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-root" class="fixed z-50 top-4 right-4 space-y-2 pointer-events-none"></div>
+
+  <script>
+    // ------------------------
+    // Persistence (localStorage)
+    // ------------------------
+    const LS_KEYS = {
+      mode: 'ui.mode',
+      testnet: 'ui.testnet',
+      refreshSec: 'ui.refreshSec',
+      theme: 'ui.theme', // 'light' | 'dark'
+    };
+
+    function lsGet(k, def) { try { const v = localStorage.getItem(k); return v === null ? def : v; } catch { return def; } }
+    function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+    function initControlsFromStorage() {
+      document.getElementById('mode').value = lsGet(LS_KEYS.mode, 'binance');
+      document.getElementById('testnet').value = lsGet(LS_KEYS.testnet, 'true');
+      document.getElementById('refreshSec').value = lsGet(LS_KEYS.refreshSec, '10');
+
+      // theme
+      const theme = lsGet(LS_KEYS.theme, 'light');
+      applyTheme(theme);
+    }
+
+    function persistControls() {
+      lsSet(LS_KEYS.mode, document.getElementById('mode').value);
+      lsSet(LS_KEYS.testnet, document.getElementById('testnet').value);
+      lsSet(LS_KEYS.refreshSec, document.getElementById('refreshSec').value);
+    }
+
+    // ------------------------
+    // Theme
+    // ------------------------
+    function applyTheme(mode) {
+      const html = document.documentElement;
+      const body = document.body;
+      const dark = (mode === 'dark');
+      html.classList.toggle('dark', dark);
+      body.classList.toggle('bg-gray-900', dark);
+      body.classList.toggle('text-gray-100', dark);
+      // Cards
+      document.querySelectorAll('section, #controls').forEach(el => {
+        el.classList.toggle('bg-gray-800', dark);
+        el.classList.toggle('border-gray-700', dark);
+      });
+    }
+
+    document.getElementById('btnTheme').addEventListener('click', () => {
+      const cur = lsGet(LS_KEYS.theme, 'light');
+      const next = cur === 'dark' ? 'light' : 'dark';
+      lsSet(LS_KEYS.theme, next);
+      applyTheme(next);
+    });
+
+    // ------------------------
+    // HTMX helpers
+    // ------------------------
+    function collectParams() {
+      const form = document.querySelector('#controls form');
+      const fd = new FormData(form);
+      const values = {};
+      fd.forEach((v, k) => values[k] = v);
+      return values;
+    }
+
+    function setSectionInterval(id, sec) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.setAttribute('hx-trigger', sec > 0 ? `load, every ${sec}s` : 'load');
+    }
+
+    function applyIntervals() {
+      const sec = parseInt(document.getElementById('refreshSec').value || '10', 10);
+      ['balance','positions','orders','metrics'].forEach(id => setSectionInterval(id, sec));
+      persistControls();
+      refreshAll();
+    }
+
+    function refreshAll() {
+      const values = collectParams();
+      ['balance', 'positions', 'orders', 'metrics'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+          htmx.ajax('GET', el.getAttribute('hx-get'), {
+            target: '#' + id,
+            swap: 'outerHTML',
+            values
+          });
+        }
+      });
+    }
+
+    // Persist on changes
+    ['mode','testnet','refreshSec'].forEach(id => {
+      const el = document.getElementById(id);
+      el.addEventListener('change', () => {
+        persistControls();
+        if (id === 'refreshSec') applyIntervals();
+        else refreshAll();
+      });
+    });
+
+    // ------------------------
+    // Toasts
+    // ------------------------
+    function showToast(msg, kind='error') {
+      const root = document.getElementById('toast-root');
+      const div = document.createElement('div');
+      div.className =
+        'toast toast-enter max-w-sm w-80 px-3 py-2 rounded shadow border ' +
+        (kind === 'error'
+          ? 'bg-red-50 border-red-200 text-red-800'
+          : 'bg-emerald-50 border-emerald-200 text-emerald-800');
+
+      div.innerHTML = `<div class="text-sm">${escapeHtml(msg)}</div>`;
+      root.appendChild(div);
+
+      // animate in
+      requestAnimationFrame(() => div.classList.remove('toast-enter'));
+
+      // auto close
+      setTimeout(() => {
+        div.classList.add('toast-exit');
+        setTimeout(() => div.remove(), 180);
+      }, 3000);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, m => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+      }[m]));
+    }
+
+    // HTMX error hooks
+    document.body.addEventListener('htmx:responseError', (e) => {
+      const status = e.detail.xhr ? e.detail.xhr.status : '???';
+      showToast(`Ошибка загрузки (${status}). Проверь API/параметры.`, 'error');
+    });
+    document.body.addEventListener('htmx:sendError', () => {
+      showToast('Сеть недоступна (sendError).', 'error');
+    });
+    document.body.addEventListener('htmx:timeout', () => {
+      showToast('Таймаут запроса.', 'error');
+    });
+
+    // Online/offline hints
+    window.addEventListener('offline', () => showToast('Вы офлайн.', 'error'));
+    window.addEventListener('online',  () => showToast('Соединение восстановлено.', 'ok'));
+
+    // ------------------------
+    // Boot
+    // ------------------------
+    document.addEventListener('DOMContentLoaded', () => {
+      initControlsFromStorage();
+      applyIntervals(); // sets triggers + kicks first refresh
+    });
+  </script>
+
+  <noscript>
+    <div class="max-w-3xl mx-auto mt-6 p-4 bg-yellow-50 border border-yellow-200 rounded">
+      Для работы панели требуется JavaScript (HTMX).
+    </div>
+  </noscript>
+</body>
+</html>

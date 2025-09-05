@@ -1,0 +1,20 @@
+mode: binance           # binance | sim | ui
+binance:
+  testnet: true
+  recv_window: 5000
+  timeout: 20
+  max_retries: 5
+  backoff_base: 0.5
+  backoff_cap: 8
+sim:
+  starting_balance_usdt: 10000
+  fee_pct: 0.001
+ui:
+  enabled: false
+
+risk:
+  risk_pct_per_trade: 0.01
+  daily_max_loss_pct: 0.02
+  max_trades_per_day: 15
+  deadman_max_stale_sec: 90
+  tz_name: Asia/Almaty

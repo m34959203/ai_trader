@@ -1,0 +1,12 @@
+# deploy/crontab.txt
+# Установить: crontab deploy/crontab.txt
+# Логи cron лучше перенаправить в системный журнал
+
+# Каждый день в 02:30 UTC — бэкап (с nice/ionice), stderr/stdout в системный лог
+30 2 * * *  cd /opt/ai_trader && /usr/bin/ionice -c2 -n7 /usr/bin/nice -n 15 ./backup/backup.sh >> ./backups/cron.stdout 2>> ./backups/cron.stderr
+
+# Опционально: еженедельная проверка места
+0 4 * * 0   df -h >> /opt/ai_trader/backups/cron.stdout 2>&1
+
+# Опционально: очистка старых логов бэкапа (>60 дней)
+15 4 * * 0  find /opt/ai_trader/backups -type f -name "*.log" -mtime +60 -delete

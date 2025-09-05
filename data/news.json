@@ -1,0 +1,16 @@
+[
+  {
+    "title": "FOMC raises interest rates by 0.25%",
+    "link": "https://example.com/news/fomc-rate",
+    "published": "2025-08-29T06:00:00Z",
+    "summary": "The Federal Reserve announced a 25 basis point rate hike...",
+    "impact_guess": "high"
+  },
+  {
+    "title": "Bitcoin price consolidates near $60,000",
+    "link": "https://example.com/news/btc-consolidates",
+    "published": "2025-08-29T05:00:00Z",
+    "summary": "BTC/USD trades sideways after strong rally.",
+    "impact_guess": "low"
+  }
+]
