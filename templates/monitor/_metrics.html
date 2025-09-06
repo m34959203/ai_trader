@@ -2,22 +2,27 @@
 <div id="metrics"
      class="bg-white dark:bg-gray-800 shadow rounded border border-gray-200 dark:border-gray-700 p-4"
      role="region" aria-label="Метрики">
+
+  <!-- Заголовок и время расчёта -->
   <div class="flex items-center justify-between mb-3">
     <h2 class="text-lg sm:text-xl font-semibold">
       Метрики <span class="opacity-70">({{ symbol }} · {{ tf }})</span>
     </h2>
-
-    <!-- Время расчёта -->
-    <span class="text-xs text-gray-500 dark:text-gray-400">calculated at {{ calculated_at }}</span>
+    <span class="text-xs text-gray-500 dark:text-gray-400">
+      calculated at {{ calculated_at }}
+    </span>
   </div>
 
+  <!-- Ошибки -->
   {% if error %}
     <div class="p-3 rounded border border-yellow-200 bg-yellow-50 text-yellow-800 text-sm">
       {{ error }}
     </div>
   {% endif %}
 
+  <!-- Основные метрики -->
   <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-2">
+
     <!-- Sharpe (annualized) -->
     <div class="p-3 rounded border
       {% if metrics.sharpe is none %}
@@ -34,7 +39,7 @@
         {{ metrics.sharpe is not none and ('%.2f'|format(metrics.sharpe)) or '—' }}
       </div>
       <div class="text-xs opacity-80">
-        окно={{ window_days }}d · rf={{ (risk_free_annual*100)|round(2) }}% · days/yr={{ annualization_days }}
+        окно={{ window_days }}d · rf={{ (risk_free_annual * 100) | round(2) }}% · days/yr={{ annualization_days }}
       </div>
     </div>
 
@@ -51,16 +56,18 @@
       {% endif %}">
       <div class="text-sm font-medium">Volatility (annualized)</div>
       <div class="text-2xl font-bold leading-tight">
-        {{ metrics.vol is not none and ('%.2f%%'|format(metrics.vol*100)) or '—' }}
+        {{ metrics.vol is not none and ('%.2f%%'|format(metrics.vol * 100)) or '—' }}
       </div>
       <div class="text-xs opacity-80">
-        log-returns по close; окно={{ window_days }}d
+        log-returns по close · окно={{ window_days }}d
       </div>
     </div>
+
   </div>
 
+  <!-- Пороговые значения -->
   <div class="mt-3 text-xs text-gray-500 dark:text-gray-400">
-    Пороги: warn(Sharpe&lt;{{ thresholds.sharpe_warn }} · Vol&gt;{{ (thresholds.vol_warn*100)|round(2) }}%),
-    crit(Sharpe&lt;{{ thresholds.sharpe_crit }} · Vol&gt;{{ (thresholds.vol_crit*100)|round(2) }}%)
+    Пороги: warn(Sharpe&lt;{{ thresholds.sharpe_warn }} · Vol&gt;{{ (thresholds.vol_warn * 100) | round(2) }}%),
+    crit(Sharpe&lt;{{ thresholds.sharpe_crit }} · Vol&gt;{{ (thresholds.vol_crit * 100) | round(2) }}%)
   </div>
 </div>

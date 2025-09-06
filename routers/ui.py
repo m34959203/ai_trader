@@ -34,33 +34,22 @@ except Exception:  # pragma: no cover
     async def _get_db_session():  # type: ignore
         yield None
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Templates: абсолютный путь к корню проекта → templates/
+# Templates
 # ──────────────────────────────────────────────────────────────────────────────
 def _detect_templates_dir() -> str:
-    """
-    Жёстко вычисляем путь до корня проекта от текущего файла:
-      …/ai_trader/routers/ui.py → BASE_DIR = …/ai_trader
-      templates = BASE_DIR / "templates"
-    На случай необычной структуры оставляем пару запасных вариантов.
-    """
-    base_dir = Path(__file__).resolve().parents[1]  # корень проекта (ai_trader)
-    candidates: List[Path] = [
+    base_dir = Path(__file__).resolve().parents[1]
+    for p in [
         base_dir / "templates",
         base_dir / "src" / "templates",
-        Path.cwd() / "templates",          # запасной вариант
-        Path("templates"),                 # последний fallback (относительный)
-    ]
-    for p in candidates:
+        Path.cwd() / "templates",
+        Path("templates"),
+    ]:
         if p.is_dir():
             return str(p)
-    # если вообще ничего не нашли — вернём стандартное имя (Jinja всё равно бросит исключение)
     return str(base_dir / "templates")
 
-
 templates = Jinja2Templates(directory=_detect_templates_dir())
-
 router = APIRouter(prefix="/ui", tags=["ui"])
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -72,17 +61,14 @@ if DEFAULT_MODE not in ("binance", "sim"):
 
 DEFAULT_TESTNET = os.getenv("UI_EXEC_TESTNET", "1").strip().lower() in ("1", "true", "yes", "on")
 
-# Таймауты (сек) — увеличены, чтобы внешние API не отваливались по сети
 BAL_POS_TIMEOUT = float(os.getenv("UI_TIMEOUT_BAL_POS", "8.0"))
-ORDERS_TIMEOUT = float(os.getenv("UI_TIMEOUT_ORDERS", "6.0"))
+ORDERS_TIMEOUT  = float(os.getenv("UI_TIMEOUT_ORDERS", "6.0"))
 METRICS_TIMEOUT = float(os.getenv("UI_TIMEOUT_METRICS", "7.0"))
 
-# Дефолты для метрик (можно переопределить в .env)
 DEF_MET_SOURCE = os.getenv("UI_METRICS_SOURCE", "binance")
 DEF_MET_SYMBOL = os.getenv("UI_METRICS_SYMBOL", "BTCUSDT")
 DEF_MET_TF     = os.getenv("UI_METRICS_TF", "1h")
 
-# Безопасные заголовки
 _SEC_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
@@ -102,7 +88,6 @@ def _apply_headers(resp: Response, *dicts: Dict[str, str]) -> None:
         for k, v in d.items():
             resp.headers[k] = v
 
-
 def _render_fragment(
     template_name: str,
     request: Request,
@@ -111,45 +96,37 @@ def _render_fragment(
     status_code: int = 200,
 ) -> HTMLResponse:
     """
-    Новая сигнатура Starlette: TemplateResponse(request, name, context, ...)
-    'request' больше не нужно класть в контекст.
+    ВАЖНО: сигнатура TemplateResponse -> (name, context, ...)
+    request нужно класть в context как 'request'.
     """
-    response = templates.TemplateResponse(request, template_name, ctx, status_code=status_code)
+    context = {"request": request, **ctx}
+    response = templates.TemplateResponse(template_name, context, status_code=status_code)
     _apply_headers(response, _SEC_HEADERS, _NO_CACHE_HEADERS)
     return response
 
-
-def _error_fragment(request: Request, message: str) -> HTMLResponse:
+def _error_fragment(element_id: str, message: str) -> HTMLResponse:
     html = f"""
-    <div class="p-3 rounded bg-red-50 border border-red-200 text-red-700 text-sm">
-        <div class="font-semibold">Ошибка</div>
-        <div class="mt-1">{message}</div>
+    <div id="{element_id}" class="p-3 rounded bg-red-50 border border-red-200 text-red-700 text-sm">
+      <div class="font-semibold">Ошибка</div>
+      <div class="mt-1">{message}</div>
     </div>
     """.strip()
     response = HTMLResponse(content=html, status_code=200)
     _apply_headers(response, _SEC_HEADERS, _NO_CACHE_HEADERS)
     return response
 
-
 async def _with_timeout(coro, seconds: float):
     return await asyncio.wait_for(coro, timeout=seconds)
 
-
 def _unwrap_json(resp: Any) -> Dict[str, Any]:
-    """
-    Приводим JSONResponse/Response к dict.
-    Если это уже dict — возвращаем как есть.
-    """
     if isinstance(resp, Response):
         try:
-            # resp.body -> bytes
             return json.loads(resp.body.decode("utf-8"))
         except Exception:
             return {}
     if isinstance(resp, dict):
         return resp
     return {}
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Root dashboard
@@ -158,9 +135,8 @@ def _unwrap_json(resp: Any) -> Dict[str, Any]:
 async def dashboard(request: Request):
     return _render_fragment("monitor/index.html", request, {})
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Partials — баланс (устойчив к разным форматам полезной нагрузки)
+# Partials — баланс
 # ──────────────────────────────────────────────────────────────────────────────
 @router.get("/partials/balance", response_class=HTMLResponse)
 async def partial_balance(
@@ -171,56 +147,32 @@ async def partial_balance(
     try:
         raw = await _with_timeout(_get_balance(mode=mode, testnet=testnet), BAL_POS_TIMEOUT)
         payload = _unwrap_json(raw)
-
-        # Поддержка нескольких форм:
-        # 1) {"ok": True, "data": {"exchange": "...", "balance": {...}, "risk": {...}, "equity_usdt": ...}}
-        # 2) {"ok": True, "data": {...}} где поля лежат на верхнем уровне внутри data
-        # 3) просто {...} (фикстуры)
         data = payload.get("data") or payload
 
         balance_src = data.get("balance") or {}
-        risk_src = data.get("risk") or {}
+        risk_src    = data.get("risk") or {}
 
-        # Нормализуем минимально ожидаемый шаблоном набор полей
         bal = {
-            "exchange": (
-                data.get("exchange")
-                or payload.get("exchange")
-                or ("sim" if testnet else "binance")
-            ),
-            "equity_usdt": (
-                data.get("equity_usdt")
-                or balance_src.get("equity_usdt")
-                or balance_src.get("equity")
-                or 0.0
-            ),
+            "exchange": data.get("exchange") or payload.get("exchange") or ("sim" if testnet else "binance"),
+            "equity_usdt": data.get("equity_usdt") or balance_src.get("equity_usdt") or balance_src.get("equity") or 0.0,
             "risk": {
+                "daily_start_equity":  risk_src.get("daily_start_equity"),
+                "daily_max_loss_pct":  risk_src.get("daily_max_loss_pct"),
+                "max_trades_per_day":  risk_src.get("max_trades_per_day"),
                 "exposure": risk_src.get("exposure") or balance_src.get("exposure") or 0.0,
                 "leverage": risk_src.get("leverage") or balance_src.get("leverage") or 0.0,
             },
             "balance": balance_src if isinstance(balance_src, dict) else {},
         }
-
-        # Если шаблон ожидает строгие ключи – мы их обеспечили.
         return _render_fragment("monitor/_balance.html", request, {"bal": bal})
 
     except asyncio.TimeoutError:  # pragma: no cover
-        return _error_fragment(request, "Таймаут при получении баланса")
+        return _error_fragment("balance", "Таймаут при получении баланса")
     except Exception as e:  # pragma: no cover
-        # Фолбэк с гарантированным id="balance", чтобы пройти smoke-тест
-        html = f"""
-        <div id="balance" class="p-3 rounded bg-red-50 border border-red-200 text-red-700 text-sm">
-            <div class="font-semibold">Ошибка</div>
-            <div class="mt-1">Не удалось получить баланс: {e!s}</div>
-        </div>
-        """.strip()
-        response = HTMLResponse(content=html, status_code=200)
-        _apply_headers(response, _SEC_HEADERS, _NO_CACHE_HEADERS)
-        return response
-
+        return _error_fragment("balance", f"Не удалось получить баланс: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Partials — позиции (гарантируем контейнер id="positions" при пустом списке)
+# Partials — позиции
 # ──────────────────────────────────────────────────────────────────────────────
 @router.get("/partials/positions", response_class=HTMLResponse)
 async def partial_positions(
@@ -233,34 +185,12 @@ async def partial_positions(
         payload = _unwrap_json(raw)
         data = payload.get("data") or payload
         positions = data.get("positions") or payload.get("positions") or []
-
-        # Если список пуст — отдадим простой контейнер с id="positions"
-        if not positions:
-            html = """
-            <div id="positions" class="bg-white shadow rounded p-4">
-              <h2 class="text-xl font-semibold mb-2">Активные позиции</h2>
-              <p>Нет активных позиций</p>
-            </div>
-            """.strip()
-            response = HTMLResponse(content=html, status_code=200)
-            _apply_headers(response, _SEC_HEADERS, _NO_CACHE_HEADERS)
-            return response
-
         return _render_fragment("monitor/_positions.html", request, {"positions": positions})
 
     except asyncio.TimeoutError:  # pragma: no cover
-        return _error_fragment(request, "Таймаут при получении позиций")
+        return _error_fragment("positions", "Таймаут при получении позиций")
     except Exception as e:  # pragma: no cover
-        html = f"""
-        <div id="positions" class="p-3 rounded bg-red-50 border border-red-200 text-red-700 text-sm">
-            <div class="font-semibold">Ошибка</div>
-            <div class="mt-1">Не удалось получить позиции: {e!s}</div>
-        </div>
-        """.strip()
-        response = HTMLResponse(content=html, status_code=200)
-        _apply_headers(response, _SEC_HEADERS, _NO_CACHE_HEADERS)
-        return response
-
+        return _error_fragment("positions", f"Не удалось получить позиции: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Partials — последние ордера
@@ -272,17 +202,16 @@ async def partial_orders(
     db=Depends(_get_db_session),
 ):
     if not _HAS_DB or crud_orders is None or db is None:
-        # Без БД возвращаем пустой список, чтобы шаблон корректно отрисовался
-        return _render_fragment("monitor/_orders.html", request, {"orders": []})
+        return _render_fragment("monitor/_orders.html", request, {"orders": [], "updated_at": None})
 
     try:
         orders = await _with_timeout(crud_orders.get_last_orders(db, limit=limit), ORDERS_TIMEOUT)  # type: ignore[arg-type]
-        return _render_fragment("monitor/_orders.html", request, {"orders": orders})
+        ctx = {"orders": orders, "updated_at": pd.Timestamp.utcnow().isoformat()}
+        return _render_fragment("monitor/_orders.html", request, ctx)
     except asyncio.TimeoutError:  # pragma: no cover
-        return _error_fragment(request, "Таймаут при загрузке ордеров")
+        return _error_fragment("orders", "Таймаут при загрузке ордеров")
     except Exception as e:  # pragma: no cover
-        return _error_fragment(request, f"Не удалось загрузить ордера: {e!s}")
-
+        return _error_fragment("orders", f"Не удалось загрузить ордера: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Partials — метрики (Sharpe, σ)
@@ -293,7 +222,6 @@ def _to_df_ohlcv(rows: List[Any]) -> pd.DataFrame:
     data = []
     for r in rows:
         try:
-            # поддержка как ORM-объекта, так и словаря
             ts = int(getattr(r, "ts", None) or getattr(r, "timestamp", None) or r["ts"])
             close = float(getattr(r, "close", None) or r["close"])
             data.append({"ts": ts, "close": close})
@@ -301,9 +229,12 @@ def _to_df_ohlcv(rows: List[Any]) -> pd.DataFrame:
             continue
     if not data:
         return pd.DataFrame(columns=["ts", "close"])
-    df = pd.DataFrame(data).dropna().drop_duplicates(subset=["ts"]).sort_values("ts")
-    return df
-
+    return (
+        pd.DataFrame(data)
+        .dropna()
+        .drop_duplicates(subset=["ts"])
+        .sort_values("ts")
+    )
 
 def _compute_metrics_close(
     df: pd.DataFrame,
@@ -342,15 +273,13 @@ def _compute_metrics_close(
     vol = sigma_d * (annualization_days ** 0.5)
     return {"sharpe": sharpe, "vol": vol}
 
-
 @router.get("/partials/metrics", response_class=HTMLResponse)
 async def partial_metrics(
     request: Request,
-    # стали безопасными: есть дефолты
-    source: str = Query(DEF_MET_SOURCE, description="Источник в БД (напр. 'binance')"),
-    symbol: str = Query(DEF_MET_SYMBOL, description="Актив в БД (напр. 'BTCUSDT')"),
-    tf: str = Query(DEF_MET_TF, description="Таймфрейм в БД"),
-    limit: int = Query(3000, ge=50, le=20000, description="Сколько баров забрать"),
+    source: str = Query(DEF_MET_SOURCE),
+    symbol: str = Query(DEF_MET_SYMBOL),
+    tf: str = Query(DEF_MET_TF),
+    limit: int = Query(3000, ge=50, le=20000),
     window_days: int = Query(30, ge=5, le=365),
     annualization_days: int = Query(365, ge=200, le=365),
     risk_free_annual: float = Query(0.0, ge=0.0, le=0.2),
@@ -360,6 +289,8 @@ async def partial_metrics(
     vol_crit: float = Query(1.2),
     db=Depends(_get_db_session),
 ):
+    calculated_at = pd.Timestamp.utcnow().isoformat()
+
     if not _HAS_DB or crud is None or db is None:
         ctx = {
             "symbol": symbol,
@@ -372,6 +303,8 @@ async def partial_metrics(
                 "sharpe_warn": sharpe_warn, "sharpe_crit": sharpe_crit,
                 "vol_warn": vol_warn, "vol_crit": vol_crit,
             },
+            "calculated_at": calculated_at,
+            "error": None,
         }
         return _render_fragment("monitor/_metrics.html", request, ctx)
 
@@ -398,14 +331,15 @@ async def partial_metrics(
                 "sharpe_warn": sharpe_warn, "sharpe_crit": sharpe_crit,
                 "vol_warn": vol_warn, "vol_crit": vol_crit,
             },
+            "calculated_at": calculated_at,
+            "error": None,
         }
         return _render_fragment("monitor/_metrics.html", request, ctx)
 
     except asyncio.TimeoutError:  # pragma: no cover
-        return _error_fragment(request, "Таймаут при расчёте метрик")
+        return _error_fragment("metrics", "Таймаут при расчёте метрик")
     except Exception as e:  # pragma: no cover
-        return _error_fragment(request, f"Не удалось вычислить метрики: {e!s}")
-
+        return _error_fragment("metrics", f"Не удалось вычислить метрики: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Health

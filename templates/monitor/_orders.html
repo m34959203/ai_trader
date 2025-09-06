@@ -1,31 +1,74 @@
-<div class="bg-white shadow rounded p-4">
-  <h2 class="text-xl font-semibold mb-2">Последние ордера</h2>
+<div id="orders" class="bg-white shadow rounded p-4" role="region" aria-label="Последние ордера">
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="text-xl font-semibold">Последние ордера</h2>
+    {% if updated_at %}
+      <span class="text-xs text-gray-500">updated at {{ updated_at }}</span>
+    {% endif %}
+  </div>
+
   {% if orders and orders|length > 0 %}
-    <table class="min-w-full border">
-      <thead>
-        <tr>
-          <th class="border px-2 py-1">Время</th>
-          <th class="border px-2 py-1">Символ</th>
-          <th class="border px-2 py-1">Сторона</th>
-          <th class="border px-2 py-1">Qty</th>
-          <th class="border px-2 py-1">Статус</th>
-          <th class="border px-2 py-1">Причина</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for o in orders %}
-          <tr>
-            <td class="border px-2 py-1">{{ o.ts }}</td>
-            <td class="border px-2 py-1">{{ o.symbol }}</td>
-            <td class="border px-2 py-1">{{ o.side }}</td>
-            <td class="border px-2 py-1">{{ o.qty }}</td>
-            <td class="border px-2 py-1">{{ o.status }}</td>
-            <td class="border px-2 py-1">{{ o.reason }}</td>
+    <div class="overflow-x-auto">
+      <table class="min-w-full border border-gray-200 text-sm">
+        <thead class="bg-gray-50">
+          <tr class="text-left">
+            <th class="border px-3 py-2">Время</th>
+            <th class="border px-3 py-2">Символ</th>
+            <th class="border px-3 py-2">Сторона</th>
+            <th class="border px-3 py-2">Тип</th>
+            <th class="border px-3 py-2">Qty</th>
+            <th class="border px-3 py-2">Цена</th>
+            <th class="border px-3 py-2">Статус</th>
+            <th class="border px-3 py-2">Причина</th>
           </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {% for o in orders %}
+            {% set side = (o.side or o.get('side'))|default('-', true) %}
+            {% set status = (o.status or o.get('status'))|default('-', true) %}
+            <tr class="odd:bg-white even:bg-gray-50">
+              <td class="border px-3 py-2 whitespace-nowrap">
+                {# поддержка как ISO-строки, так и datetime #}
+                {% if o.ts is string %}
+                  {{ o.ts }}
+                {% else %}
+                  {{ o.ts|default('', true)|datetime('%Y-%m-%d %H:%M:%S') if o.ts else '—' }}
+                {% endif %}
+              </td>
+              <td class="border px-3 py-2">{{ o.symbol|default('-', true) }}</td>
+              <td class="border px-3 py-2">
+                <span class="inline-flex items-center rounded px-2 py-0.5 text-xs font-medium
+                  {% if side|lower == 'buy' %} bg-emerald-50 text-emerald-700 border border-emerald-200
+                  {% elif side|lower == 'sell' %} bg-rose-50 text-rose-700 border border-rose-200
+                  {% else %} bg-gray-100 text-gray-700 border border-gray-200 {% endif %}">
+                  {{ side|upper }}
+                </span>
+              </td>
+              <td class="border px-3 py-2">{{ o.type|default('-', true)|upper }}</td>
+              <td class="border px-3 py-2">{{ o.qty|default('-', true) }}</td>
+              <td class="border px-3 py-2">
+                {% if o.price is not none %} {{ '%.8f'|format(o.price) }} {% else %} — {% endif %}
+              </td>
+              <td class="border px-3 py-2">
+                <span class="inline-flex items-center rounded px-2 py-0.5 text-xs font-medium
+                  {% set st = status|lower %}
+                  {% if st in ['filled', 'closed'] %} bg-emerald-50 text-emerald-700 border border-emerald-200
+                  {% elif st in ['partially_filled', 'new', 'open'] %} bg-amber-50 text-amber-700 border border-amber-200
+                  {% elif st in ['canceled', 'rejected', 'expired'] %} bg-rose-50 text-rose-700 border border-rose-200
+                  {% else %} bg-gray-100 text-gray-700 border border-gray-200 {% endif %}">
+                  {{ status|upper }}
+                </span>
+              </td>
+              <td class="border px-3 py-2 max-w-[22rem] truncate" title="{{ o.reason|default('', true) }}">
+                {{ o.reason|default('—', true) }}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
-    <p>Нет ордеров</p>
+    <div class="rounded border border-gray-200 bg-gray-50 p-3 text-gray-600 text-sm">
+      Нет ордеров
+    </div>
   {% endif %}
 </div>

@@ -1,7 +1,23 @@
-<div class="bg-white shadow rounded p-4">
+<div id="balance" class="bg-white shadow rounded p-4">
   <h2 class="text-xl font-semibold mb-2">Баланс</h2>
-  <p><strong>Equity:</strong> {{ bal.equity_usdt or 'N/A' }} USDT</p>
-  <p><strong>Daily Start:</strong> {{ bal.risk.daily_start_equity }}</p>
-  <p><strong>Daily Max Loss:</strong> {{ bal.risk.daily_max_loss_pct * 100 }}%</p>
-  <p><strong>Trades Limit:</strong> {{ bal.risk.max_trades_per_day }}</p>
+
+  <p>
+    <strong>Equity:</strong>
+    {{ bal.equity_usdt or 'N/A' }} USDT
+  </p>
+
+  <p>
+    <strong>Daily Start:</strong>
+    {{ bal.risk.daily_start_equity }}
+  </p>
+
+  <p>
+    <strong>Daily Max Loss:</strong>
+    {{ (bal.risk.daily_max_loss_pct * 100) | round(2) }}%
+  </p>
+
+  <p>
+    <strong>Trades Limit:</strong>
+    {{ bal.risk.max_trades_per_day }}
+  </p>
 </div>

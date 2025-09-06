@@ -4,10 +4,15 @@
   <meta charset="UTF-8" />
   <title>AI-Trader Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- HTMX -->
-  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+
+  <!-- HTMX (обновлено) -->
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+
   <!-- Tailwind (CDN) -->
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet"/>
+  <link
+    href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css"
+    rel="stylesheet"
+  />
 
   <style>
     /* HTMX inline indicator */
@@ -96,14 +101,14 @@
       </form>
     </div>
 
-    <!-- 4-column grid (добавили Metrics) -->
+    <!-- 4-column grid (Balance / Positions / Orders / Metrics) -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
       <!-- Balance -->
       <section
         id="balance"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
         hx-get="/ui/partials/balance"
-        hx-trigger="load"
+        hx-trigger="load, refresh from:body"
         hx-include="#controls"
         hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
@@ -117,7 +122,7 @@
         id="positions"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
         hx-get="/ui/partials/positions"
-        hx-trigger="load"
+        hx-trigger="load, refresh from:body"
         hx-include="#controls"
         hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
@@ -131,21 +136,21 @@
         id="orders"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
         hx-get="/ui/partials/orders"
-        hx-trigger="load"
+        hx-trigger="load, refresh from:body"
         hx-include="#controls"
-        hx-params="*"
+        hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
         hx-swap="outerHTML"
       >
         <div class="text-sm text-gray-500">Загрузка журнала ордеров…</div>
       </section>
 
-      <!-- Metrics (новая карточка) -->
+      <!-- Metrics -->
       <section
         id="metrics"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
         hx-get="/ui/partials/metrics"
-        hx-trigger="load"
+        hx-trigger="load, refresh from:body"
         hx-include="#controls"
         hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
@@ -204,7 +209,8 @@
       html.classList.toggle('dark', dark);
       body.classList.toggle('bg-gray-900', dark);
       body.classList.toggle('text-gray-100', dark);
-      // Cards
+
+      // Темная тема для секций (включая подменённые HTMX)
       document.querySelectorAll('section, #controls').forEach(el => {
         el.classList.toggle('bg-gray-800', dark);
         el.classList.toggle('border-gray-700', dark);
@@ -221,18 +227,12 @@
     // ------------------------
     // HTMX helpers
     // ------------------------
-    function collectParams() {
-      const form = document.querySelector('#controls form');
-      const fd = new FormData(form);
-      const values = {};
-      fd.forEach((v, k) => values[k] = v);
-      return values;
-    }
-
     function setSectionInterval(id, sec) {
       const el = document.getElementById(id);
       if (!el) return;
-      el.setAttribute('hx-trigger', sec > 0 ? `load, every ${sec}s` : 'load');
+      // важно сохранять custom-триггер 'refresh from:body'
+      const base = 'load, refresh from:body';
+      el.setAttribute('hx-trigger', sec > 0 ? `${base}, every ${sec}s` : base);
     }
 
     function applyIntervals() {
@@ -242,21 +242,12 @@
       refreshAll();
     }
 
+    // Ключевой фикс: триггерим одно событие на body → все секции сами перезапросятся
     function refreshAll() {
-      const values = collectParams();
-      ['balance', 'positions', 'orders', 'metrics'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) {
-          htmx.ajax('GET', el.getAttribute('hx-get'), {
-            target: '#' + id,
-            swap: 'outerHTML',
-            values
-          });
-        }
-      });
+      htmx.trigger(document.body, 'refresh');
     }
 
-    // Persist on changes
+    // Persist + actions on changes
     ['mode','testnet','refreshSec'].forEach(id => {
       const el = document.getElementById(id);
       el.addEventListener('change', () => {
@@ -281,11 +272,8 @@
       div.innerHTML = `<div class="text-sm">${escapeHtml(msg)}</div>`;
       root.appendChild(div);
 
-      // animate in
-      requestAnimationFrame(() => div.classList.remove('toast-enter'));
-
-      // auto close
-      setTimeout(() => {
+      requestAnimationFrame(() => div.classList.remove('toast-enter')); // animate in
+      setTimeout(() => { // auto close
         div.classList.add('toast-exit');
         setTimeout(() => div.remove(), 180);
       }, 3000);
@@ -297,7 +285,9 @@
       }[m]));
     }
 
-    // HTMX error hooks
+    // ------------------------
+    // HTMX error & post-swap hooks
+    // ------------------------
     document.body.addEventListener('htmx:responseError', (e) => {
       const status = e.detail.xhr ? e.detail.xhr.status : '???';
       showToast(`Ошибка загрузки (${status}). Проверь API/параметры.`, 'error');
@@ -307,6 +297,12 @@
     });
     document.body.addEventListener('htmx:timeout', () => {
       showToast('Таймаут запроса.', 'error');
+    });
+
+    // После любого swap — повторно применяем тему к новому DOM
+    document.body.addEventListener('htmx:afterSwap', () => {
+      const theme = lsGet(LS_KEYS.theme, 'light');
+      applyTheme(theme);
     });
 
     // Online/offline hints

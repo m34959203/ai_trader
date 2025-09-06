@@ -1,25 +1,47 @@
-<div class="bg-white shadow rounded p-4">
-  <h2 class="text-xl font-semibold mb-2">Активные позиции</h2>
+<div id="positions" class="bg-white shadow rounded p-4" role="region" aria-label="Активные позиции">
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="text-xl font-semibold">Активные позиции</h2>
+    {% if updated_at %}
+      <span class="text-xs text-gray-500">updated at {{ updated_at }}</span>
+    {% endif %}
+  </div>
+
   {% if positions and positions|length > 0 %}
-    <table class="min-w-full border">
-      <thead>
-        <tr>
-          <th class="border px-2 py-1">Символ</th>
-          <th class="border px-2 py-1">Сторона</th>
-          <th class="border px-2 py-1">Количество</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for pos in positions %}
-          <tr>
-            <td class="border px-2 py-1">{{ pos.symbol }}</td>
-            <td class="border px-2 py-1">{{ pos.side }}</td>
-            <td class="border px-2 py-1">{{ pos.qty }}</td>
+    <div class="overflow-x-auto">
+      <table class="min-w-full border border-gray-200 text-sm">
+        <thead class="bg-gray-50">
+          <tr class="text-left">
+            <th class="border px-3 py-2">Символ</th>
+            <th class="border px-3 py-2">Сторона</th>
+            <th class="border px-3 py-2">Количество</th>
           </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {% for pos in positions %}
+            {% set side = (pos.side or pos.get('side'))|default('-', true) %}
+            <tr class="odd:bg-white even:bg-gray-50">
+              <td class="border px-3 py-2 whitespace-nowrap">{{ pos.symbol|default('-', true) }}</td>
+              <td class="border px-3 py-2">
+                <span class="inline-flex items-center rounded px-2 py-0.5 text-xs font-medium
+                  {% if side|lower == 'buy' %} bg-emerald-50 text-emerald-700 border border-emerald-200
+                  {% elif side|lower == 'sell' %} bg-rose-50 text-rose-700 border border-rose-200
+                  {% else %} bg-gray-100 text-gray-700 border border-gray-200 {% endif %}">
+                  {{ side|upper }}
+                </span>
+              </td>
+              <td class="border px-3 py-2">
+                {% if pos.qty is number %} {{ '%.8f'|format(pos.qty) }}
+                {% else %} {{ pos.qty|default('-', true) }}
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
-    <p>Нет активных позиций</p>
+    <div class="rounded border border-gray-200 bg-gray-50 p-3 text-gray-600 text-sm">
+      Нет активных позиций
+    </div>
   {% endif %}
 </div>

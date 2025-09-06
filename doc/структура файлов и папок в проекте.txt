@@ -1,20 +1,16 @@
 
-C:\Users\Дмитрий\Desktop\ai_trader\tests>cd C:\Users\Дмитрий\Desktop\ai_trader
-
-C:\Users\Дмитрий\Desktop\ai_trader>(.venv) C:\Users\Дмитрий\Desktop\ai_trader>pip install --upgrade httpx asgi-lifespan
-Непредвиденное появление: C:\Users\Дмитрий\Desktop\ai_trader.
-
 C:\Users\Дмитрий\Desktop\ai_trader>tree /f
 Структура папок
 Серийный номер тома: 7404-48E4
 C:.
-│   .coverage
 │   alembic.ini
 │   docker-compose.yml
 │   Dockerfile
 │   pytest.ini
+│   requirements-dev.txt
 │   requirements.txt
 │   run-dev.bat
+│   setup.py
 │
 ├───.pytest_cache
 │   │   .gitignore
@@ -23,7 +19,6 @@ C:.
 │   │
 │   └───v
 │       └───cache
-│               lastfailed
 │               nodeids
 │               stepwise
 │
@@ -38,10 +33,7 @@ C:.
 │
 ├───data
 │   │   ai_trader.db
-│   │   ai_trader.db-shm
-│   │   ai_trader.db-wal
 │   │   news.json
-│   │   trader.db
 │   │
 │   └───state
 │           daily_limits.json
@@ -92,36 +84,6 @@ C:.
 │           simulated.cpython-311.pyc
 │           ui_agent.cpython-311.pyc
 │           __init__.cpython-311.pyc
-│
-├───htmlcov
-│       .gitignore
-│       class_index.html
-│       coverage_html_cb_497bf287.js
-│       favicon_32_cb_58284776.png
-│       function_index.html
-│       index.html
-│       keybd_closed_cb_ce680311.png
-│       status.json
-│       style_cb_dca529e9.css
-│       z_145eef247bfb46b6_data_loader_py.html
-│       z_145eef247bfb46b6_main_py.html
-│       z_145eef247bfb46b6___init___py.html
-│       z_1f4cdc73c39a6604_crud_py.html
-│       z_1f4cdc73c39a6604_models_py.html
-│       z_1f4cdc73c39a6604_session_py.html
-│       z_1f4cdc73c39a6604___init___py.html
-│       z_51fcec635d35c76c_ohlcv_py.html
-│       z_51fcec635d35c76c___init___py.html
-│       z_5d746b4c5dd79dd0_alpha_vantage_py.html
-│       z_5d746b4c5dd79dd0_base_py.html
-│       z_5d746b4c5dd79dd0_binance_py.html
-│       z_5d746b4c5dd79dd0___init___py.html
-│       z_9b0341f23a4a319f_ohlcv_py.html
-│       z_9b0341f23a4a319f___init___py.html
-│       z_a44f0ac069e85531_conftest_py.html
-│       z_a44f0ac069e85531_test_ohlcv_py.html
-│       z_a44f0ac069e85531_test_paging_py.html
-│       z_a44f0ac069e85531_test_prices_endpoint_py.html
 │
 ├───logs
 ├───migrations
@@ -177,6 +139,7 @@ C:.
 ├───scripts
 │       demo_analyze.py
 │       init_db.py
+│       reset_db.py
 │
 ├───services
 │   │   protection.py
@@ -204,12 +167,21 @@ C:.
 │           __init__.cpython-311.pyc
 │
 ├───src
+│   │   conftest.py
 │   │   data_loader.py
 │   │   indicators.py
 │   │   main.py
 │   │   paper.py
 │   │   strategy.py
 │   │   __init__.py
+│   │
+│   ├───ai_trader.egg-info
+│   │       dependency_links.txt
+│   │       not-zip-safe
+│   │       PKG-INFO
+│   │       requires.txt
+│   │       SOURCES.txt
+│   │       top_level.txt
 │   │
 │   ├───analysis
 │   │   │   analyze_market.py
@@ -218,6 +190,8 @@ C:.
 │   │           analyze_market.cpython-311.pyc
 │   │
 │   └───__pycache__
+│           conftest.cpython-311-pytest-8.3.4.pyc
+│           conftest.cpython-311-pytest-8.4.1.pyc
 │           data_loader.cpython-311.pyc
 │           indicators.cpython-311.pyc
 │           main.cpython-311.pyc
