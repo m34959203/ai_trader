@@ -1,0 +1,5 @@
+risk_pct_per_trade: 0.10
+daily_max_loss_pct: 0.50
+max_trades_per_day: 50
+deadman_max_stale_sec: 300
+tz_name: "Asia/Almaty"

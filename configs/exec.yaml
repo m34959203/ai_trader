@@ -1,14 +1,21 @@
-mode: binance           # binance | sim | ui
+mode: binance
+
 binance:
   testnet: true
-  recv_window: 5000
-  timeout: 20
-  max_retries: 5
-  backoff_base: 0.5
-  backoff_cap: 8
+  base_url: https://testnet.binance.vision
+
+
+
+  recv_window: 10000     
+  timeout: 60             
+  max_retries: 7          
+  backoff_base: 0.75      
+  backoff_cap: 12         
+
 sim:
   starting_balance_usdt: 10000
   fee_pct: 0.001
+
 ui:
   enabled: false
 

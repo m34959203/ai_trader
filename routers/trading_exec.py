@@ -1,11 +1,11 @@
-# routers/trading_exec.py
 from __future__ import annotations
 
 import os
 import time
 import logging
 import inspect
-from typing import Optional, Literal, Dict, Any, List, Tuple
+import asyncio
+from typing import Optional, Literal, Dict, Any, List, Tuple, Callable
 
 from fastapi import APIRouter, Query, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
@@ -13,7 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from executors.api_binance import BinanceExecutor
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Опциональная специфичная ошибка Binance
+# ──────────────────────────────────────────────────────────────────────────────
 try:  # type: ignore
     from executors.api_binance import BinanceAPIError  # noqa: F401
     _HAS_BINANCE_ERROR = True
@@ -21,14 +23,18 @@ except Exception:  # pragma: no cover
     BinanceAPIError = RuntimeError  # type: ignore
     _HAS_BINANCE_ERROR = False
 
-# Ключи/конфиг
+# ──────────────────────────────────────────────────────────────────────────────
+# Ключи/конфиг (env-фолбэк при отсутствии utils.secrets)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from utils.secrets import get_binance_keys, load_exec_config  # type: ignore
 except Exception:
     def load_exec_config() -> Dict[str, Any]:
+        """Фолбэк: пустой конфиг, если нет utils.secrets.load_exec_config."""
         return {}
 
     def get_binance_keys(*, testnet: bool) -> Tuple[str, str]:
+        """Фолбэк: берём ключи из ENV, если нет utils.secrets.get_binance_keys."""
         if testnet:
             k = os.getenv("BINANCE_TESTNET_API_KEY") or os.getenv("BINANCE_API_KEY_TESTNET")
             s = os.getenv("BINANCE_TESTNET_API_SECRET") or os.getenv("BINANCE_API_SECRET_TESTNET")
@@ -42,7 +48,9 @@ except Exception:
             )
         return k, s
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Исполнители: sim (опционально)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from executors.simulated import SimulatedExecutor  # type: ignore
 except Exception:
@@ -93,7 +101,9 @@ except Exception:
         async def round_qty(self, symbol: str, qty: float) -> float:
             return float(qty)
 
-# DB: сессия и логирование ордеров
+# ──────────────────────────────────────────────────────────────────────────────
+# DB: сессия и логирование ордеров (опционально)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from db.session import get_session  # type: ignore
     from db import crud_orders  # type: ignore
@@ -101,7 +111,9 @@ except Exception:
     get_session = None  # type: ignore
     crud_orders = None  # type: ignore
 
+# ──────────────────────────────────────────────────────────────────────────────
 # RISK (опционально)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from utils.risk_config import load_risk_config  # type: ignore
     from state.daily_limits import (  # type: ignore
@@ -152,10 +164,24 @@ except Exception:
 
     HEARTBEAT_FILE = None  # type: ignore
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Router + logger
+# ──────────────────────────────────────────────────────────────────────────────
 router = APIRouter(prefix="/exec", tags=["exec"])
 LOG = logging.getLogger("ai_trader.exec")
 
-# ---------- helpers (ошибки) ----------
+# Жёсткие лимиты времени, чтобы UI не висел навсегда
+DEFAULT_OP_TIMEOUT = float(os.getenv("EXEC_OP_TIMEOUT_SEC", "20"))
+
+# Кеш исполнителей на процесс: (mode,testnet) -> executor
+_EXEC_CACHE: Dict[Tuple[str, bool], BinanceExecutor] = {}
+
+# Короткий кеш доступных USDT-символов по экземпляру исполнителя: id(ex) -> set[str]
+_USDT_SYMBOLS_CACHE: Dict[int, set[str]] = {}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# helpers (ошибки)
+# ──────────────────────────────────────────────────────────────────────────────
 def _err(reason: str, *, http: int = 400, code: Optional[int] = None,
          error: Optional[Dict[str, Any]] = None, data: Any = None) -> JSONResponse:
     payload: Dict[str, Any] = {"error": reason}
@@ -171,28 +197,61 @@ def _map_exc(e: Exception) -> JSONResponse:
     if _HAS_BINANCE_ERROR and isinstance(e, BinanceAPIError):  # type: ignore
         status = getattr(e, "status_code", 400) or 400
         code = getattr(e, "code", None)
-        msg = getattr(e, "msg", str(e))
+        msg = getattr(e, "msg", str(e)) or repr(e)
         return _err("binance_error", http=int(status), code=code, error={"message": msg})
-    return _err("exec_error", http=400, error={"message": str(e)})
+    return _err("exec_error", http=400, error={"message": (str(e) or repr(e))})
 
-# ---------- executors ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# executors
+# ──────────────────────────────────────────────────────────────────────────────
 def _get_binance_executor(testnet: bool) -> BinanceExecutor:
+    """Создаём (или берём из кеша) реальный бинансовский исполнитель."""
+    key = ("binance", bool(testnet))
+    if key in _EXEC_CACHE:
+        return _EXEC_CACHE[key]
+
     try:
         api_key, api_secret = get_binance_keys(testnet=testnet)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"config_error: {e}")
-    return BinanceExecutor(api_key=api_key, api_secret=api_secret, testnet=testnet)  # type: ignore[return-value]
+
+    cfg = load_exec_config() or {}
+    bin_cfg = dict(cfg.get("binance") or {})
+    # Явно уважаем значения из exec.yaml, но даём дефолты
+    config = {
+        "base_url": bin_cfg.get("base_url") or ("https://testnet.binance.vision" if testnet else "https://api.binance.com"),
+        "recv_window": int(bin_cfg.get("recv_window", 5000)),
+        "timeout": float(bin_cfg.get("timeout", 20.0)),
+        "max_retries": int(bin_cfg.get("max_retries", 5)),
+        "backoff_base": float(bin_cfg.get("backoff_base", 0.5)),
+        "backoff_cap": float(bin_cfg.get("backoff_cap", 8.0)),
+        "track_local_pos": bool(bin_cfg.get("track_local_pos", False)),
+    }
+
+    ex = BinanceExecutor(api_key=api_key, api_secret=api_secret, testnet=testnet, config=config)  # type: ignore[return-value]
+    _EXEC_CACHE[key] = ex
+    return ex
 
 def _select_executor(mode: Literal["binance", "sim"], testnet: bool):
     """
     ВАЖНО: SimulatedExecutor в разных реализациях может не принимать api_key/api_secret.
+    Также кешируем, чтобы не плодить клиентов на каждый запрос.
     """
+    key = (mode, bool(testnet))
+    if key in _EXEC_CACHE:
+        return _EXEC_CACHE[key]
+
     if mode == "sim":
         try:
-            return SimulatedExecutor(testnet=testnet)  # type: ignore[call-arg]
+            ex = SimulatedExecutor(testnet=testnet)  # type: ignore[call-arg]
         except TypeError:
-            return SimulatedExecutor()  # type: ignore[call-arg]
-    return _get_binance_executor(testnet=testnet)
+            ex = SimulatedExecutor()  # type: ignore[call-arg]
+        _EXEC_CACHE[key] = ex
+        return ex
+
+    ex = _get_binance_executor(testnet=testnet)
+    _EXEC_CACHE[key] = ex
+    return ex
 
 def _order_id_int(x: Optional[str]) -> Optional[int]:
     if x is None:
@@ -246,7 +305,7 @@ async def _safe_log_order(*, session: Any, **kwargs) -> None:
     """
     if crud_orders is None or session is None:
         return
-    log_fn = getattr(crud_orders, "log_order", None)
+    log_fn: Optional[Callable[..., Any]] = getattr(crud_orders, "log_order", None)
     if not callable(log_fn):
         return
     sig = inspect.signature(log_fn)
@@ -261,86 +320,275 @@ async def _safe_log_order(*, session: Any, **kwargs) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 _STABLES = {"USDT", "USDC", "FDUSD", "TUSD", "BUSD", "USD"}
 
+async def _get_all_tickers_prices(executor) -> Dict[str, float]:
+    """
+    Пытаемся получить все цены одним батчем. Поддерживаем:
+      - executor.client.get_all_tickers() -> Dict[str, Decimal] | List[{'symbol','price'}]
+      - executor.get_all_tickers()       -> Dict[str, Decimal] | List[{'symbol','price'}]
+    Возвращаем {SYMBOL: float(price)}. Пустой словарь — если не удалось.
+    """
+    prices: Dict[str, float] = {}
+
+    async def _normalize(res: Any) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if isinstance(res, dict):
+            for k, v in res.items():
+                try:
+                    out[str(k).upper()] = float(v)
+                except Exception:
+                    continue
+        elif isinstance(res, list):
+            for it in res:
+                try:
+                    s = str(it.get("symbol") or "").upper()
+                    p = it.get("price") or it.get("lastPrice") or it.get("markPrice")
+                    if s and p is not None:
+                        out[s] = float(p)
+                except Exception:
+                    continue
+        return out
+
+    for attr in ("client", None):  # сначала client, затем сам executor
+        target = getattr(executor, attr, executor) if attr else executor
+        fn = getattr(target, "get_all_tickers", None)
+        if callable(fn):
+            try:
+                res = await asyncio.wait_for(fn(), timeout=5.0)
+                norm = await _normalize(res)
+                if norm:
+                    prices.update(norm)
+                    break
+            except Exception as e:
+                LOG.warning("get_all_tickers (%s) failed: %r", "client" if attr else "exec", e)
+
+    return prices
+
+async def _get_usdt_symbols(executor) -> set[str]:
+    """
+    Возвращает множество доступных символов вида XXXUSDT для текущего исполнения.
+    Результат кешируется на время жизни процесса, чтобы не спамить exchangeInfo.
+    """
+    ex_id = id(executor)
+    cached = _USDT_SYMBOLS_CACHE.get(ex_id)
+    if cached is not None:
+        return cached
+
+    symbols: set[str] = set()
+    try:
+        client = getattr(executor, "client", None)
+        if client and hasattr(client, "get_exchange_info"):
+            async with asyncio.timeout(8.0):
+                info = await client.get_exchange_info()
+            items = info.get("symbols") if isinstance(info, dict) else None
+            if isinstance(items, list):
+                for it in items:
+                    try:
+                        if (it.get("quoteAsset") == "USDT") and (it.get("status") in (None, "TRADING", "BREAK")):
+                            s = str(it.get("symbol") or "").upper()
+                            if s.endswith("USDT"):
+                                symbols.add(s)
+                    except Exception:
+                        continue
+    except Exception as e:
+        LOG.warning("get_exchange_info failed: %r", e)
+
+    _USDT_SYMBOLS_CACHE[ex_id] = symbols
+    return symbols
+
+def _sum_stables(free_map: Dict[str, float], locked_map: Dict[str, float]) -> float:
+    """Сумма стейблов (free+locked) как «минимально достоверный» equity."""
+    return sum((free_map.get(ccy, 0.0) + locked_map.get(ccy, 0.0)) for ccy in _STABLES)
+
+# ai_trader/routers/trading_exec.py  (заменить существующую реализацию полностью)
 async def _estimate_equity_usdt(executor) -> float:
     """
-    Суммарная оценка equity в USDT. Устойчива к разным форматам баланса.
+    Устойчивая оценка equity в USDT для Testnet:
+      - Стейблы считаем напрямую (без сети).
+      - Для остальных активов конвертируем ТОЛЬКО через пары, которые реально есть в get_all_tickers().
+      - Никаких одиночных вызовов /ticker/price?symbol=... → исключаем 400 Invalid symbol.
+      - Никогда не бросаем исключений, на любой ошибке возвращаем текущее накопленное значение.
     """
     try:
-        bal = await executor.fetch_balance()
+        bal = await asyncio.wait_for(executor.fetch_balance(), timeout=min(10.0, DEFAULT_OP_TIMEOUT))
     except Exception:
         return 0.0
 
+    # 1) Собираем карты free/locked
     free_map: Dict[str, float] = {}
     locked_map: Dict[str, float] = {}
 
     try:
         if isinstance(bal, dict) and isinstance(bal.get("balances"), list):
             for b in bal.get("balances", []):
-                try:
-                    asset = str(b.get("asset") or "").strip().upper()
-                    if not asset:
-                        continue
-                    free = float(str(b.get("free") or "0") or 0)
-                    locked = float(str(b.get("locked") or "0") or 0)
-                    free_map[asset] = free_map.get(asset, 0.0) + free
-                    locked_map[asset] = locked_map.get(asset, 0.0) + locked
-                except Exception:
+                asset = str(b.get("asset") or "").strip().upper()
+                if not asset:
                     continue
-        elif isinstance(bal, dict) and (isinstance(bal.get("free"), dict) or isinstance(bal.get("locked"), dict)):
-            for k, v in dict(bal.get("free") or {}).items():
                 try:
-                    free_map[str(k).upper()] = free_map.get(str(k).upper(), 0.0) + float(str(v) or "0")
+                    free = float(b.get("free") or 0) or 0.0
                 except Exception:
-                    continue
-            for k, v in dict(bal.get("locked") or {}).items():
+                    free = 0.0
                 try:
-                    locked_map[str(k).upper()] = locked_map.get(str(k).upper(), 0.0) + float(str(v) or "0")
+                    locked = float(b.get("locked") or 0) or 0.0
                 except Exception:
-                    continue
-        elif isinstance(bal, dict):
-            for k, v in bal.items():
-                try:
-                    asset = str(k).upper()
-                    if asset in {"EXCHANGE", "TESTNET"}:
-                        continue
-                    free_map[asset] = free_map.get(asset, 0.0) + float(str(v) or "0")
-                except Exception:
-                    continue
+                    locked = 0.0
+                free_map[asset] = free_map.get(asset, 0.0) + free
+                locked_map[asset] = locked_map.get(asset, 0.0) + locked
         else:
-            return 0.0
+            # Фолбэк на всякий случай
+            for k, v in dict(bal or {}).items():
+                kk = str(k).upper()
+                if kk in {"EXCHANGE", "TESTNET", "RAW", "UPDATETIME", "BALANCES"}:
+                    continue
+                try:
+                    free_map[kk] = free_map.get(kk, 0.0) + float(v or 0)
+                except Exception:
+                    continue
     except Exception:
-        return 0.0
+        # не падаем
+        pass
 
+    # 2) Стейблы считаем сразу
     total = 0.0
     for ccy in _STABLES:
         total += free_map.get(ccy, 0.0) + locked_map.get(ccy, 0.0)
 
+    # 3) Если других активов нет — вернули сумму стейблов
     assets = (set(free_map.keys()) | set(locked_map.keys())) - _STABLES
+    assets = {a for a in assets if (free_map.get(a, 0.0) + locked_map.get(a, 0.0)) > 0.0}
+    if not assets:
+        return float(total)
 
-    async def _get_price(sym: str) -> Optional[float]:
+    # 4) Берём батч всех цен и строим множество существующих USDT-символов
+    prices_map: Dict[str, float] = {}
+    usdt_set: set[str] = set()
+    try:
+        # поддерживаем как client.get_all_tickers(), так и executor.get_all_tickers()
+        src = None
+        for attr in ("client", None):
+            target = getattr(executor, attr, executor) if attr else executor
+            fn = getattr(target, "get_all_tickers", None)
+            if callable(fn):
+                try:
+                    res = await asyncio.wait_for(fn(), timeout=5.0)
+                    if isinstance(res, dict):
+                        for s, p in res.items():
+                            ss = str(s).upper()
+                            try:
+                                prices_map[ss] = float(p)
+                                if ss.endswith("USDT"):
+                                    usdt_set.add(ss)
+                            except Exception:
+                                continue
+                        src = "dict"
+                        break
+                    elif isinstance(res, list):
+                        for it in res:
+                            try:
+                                ss = str(it.get("symbol") or "").upper()
+                                pp = float(it.get("price") or 0)
+                                prices_map[ss] = pp
+                                if ss.endswith("USDT"):
+                                    usdt_set.add(ss)
+                            except Exception:
+                                continue
+                        src = "list"
+                        break
+                except Exception:
+                    continue
+        if not src:
+            # если не получилось — тихо выходим с тем, что уже посчитали
+            return float(total)
+    except Exception:
+        return float(total)
+
+    # 5) Конвертируем только те активы, у которых есть пара к USDT в полученном батче
+    #   ограничим TOP-12 по объёму, чтобы не гонять тысячи активов фантомов
+    top_assets = sorted(
+        assets,
+        key=lambda a: free_map.get(a, 0.0) + locked_map.get(a, 0.0),
+        reverse=True,
+    )[:12]
+
+    add = 0.0
+    for a in top_assets:
+        symbol = f"{a}USDT"
+        if symbol not in usdt_set:
+            # пары нет на тестнете — пропускаем этот актив
+            continue
+        px = prices_map.get(symbol)
+        if not px or px <= 0:
+            continue
+        amount = free_map.get(a, 0.0) + locked_map.get(a, 0.0)
+        if amount <= 0:
+            continue
+        add += amount * px
+
+    return float(total + add)
+
+
+    # Берём TOP-N по величине, чтобы не долбить сеть по мелочи
+    top_assets = sorted(
+        [a for a in assets if (free_map.get(a, 0.0) + locked_map.get(a, 0.0)) > 0.0],
+        key=lambda a: free_map.get(a, 0.0) + locked_map.get(a, 0.0),
+        reverse=True,
+    )[:12]
+
+    # Кеш доступных USDT-символов (чтобы не ловить 400 Invalid symbol на Testnet)
+    usdt_symbols = await _get_usdt_symbols(executor)
+
+    prices = await _get_all_tickers_prices(executor)
+
+    async def _get_px(sym: str) -> Optional[float]:
+        # Сначала из батча
+        px = prices.get(sym)
+        if px is not None:
+            return float(px)
+        # Фолбэк: поштучно (только если символ существует)
+        if usdt_symbols and sym not in usdt_symbols:
+            return None
         for name in ("get_price", "get_ticker_price", "price"):
             m = getattr(executor, name, None)
             if callable(m):
                 try:
-                    v = await m(sym)
+                    v = await asyncio.wait_for(m(sym), timeout=2.0)
                     if isinstance(v, dict):
-                        for key in ("price", "last", "close", "markPrice"):
+                        for key in ("price", "last", "close", "markPrice", "lastPrice"):
                             if key in v:
                                 v = v[key]
                                 break
-                    return float(str(v))
+                    if v is None:
+                        continue
+                    return float(v)
                 except Exception:
                     continue
         return None
 
-    for asset in assets:
+    sem = asyncio.Semaphore(6)
+
+    async def _one(asset: str) -> float:
         amount = free_map.get(asset, 0.0) + locked_map.get(asset, 0.0)
         if amount <= 0:
-            continue
+            return 0.0
         symbol = f"{asset}USDT"
-        px = await _get_price(symbol)
-        if px is not None:
-            total += amount * px
+        # если заранее знаем, что пары нет — игнорируем актив
+        if usdt_symbols and (symbol not in usdt_symbols):
+            return 0.0
+        px = await _get_px(symbol)
+        return amount * float(px or 0.0)
+
+    async def _guarded(asset: str) -> float:
+        async with sem:
+            try:
+                return await _one(asset)
+            except Exception:
+                return 0.0
+
+    parts = await asyncio.gather(*[_guarded(a) for a in top_assets], return_exceptions=False)
+    total += sum(parts)
+
+    # если по каким-то причинам оценка нулевая – возвращаем хотя бы сумму стейблов
+    if total <= 0.0:
+        total = _sum_stables(free_map, locked_map)
 
     return float(total)
 
@@ -352,9 +600,9 @@ async def _entry_price_for_order(executor, *, symbol: str, order_type: str, prov
         m = getattr(executor, name, None)
         if callable(m):
             try:
-                v = await m(symbol)
+                v = await asyncio.wait_for(m(symbol), timeout=2.0)
                 if isinstance(v, dict):
-                    v = v.get("price") or v.get("last") or v.get("close")
+                    v = v.get("price") or v.get("last") or v.get("close") or v.get("markPrice") or v.get("lastPrice")
                 return float(v)
             except Exception:
                 continue
@@ -426,46 +674,53 @@ def _heartbeat_touch() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 async def list_positions_data(mode: Literal["binance", "sim"] = "binance", testnet: bool = True):
     ex = _select_executor(mode, testnet)
+    # list_positions обычно быстрый, но ограничим
     try:
-        return await ex.list_positions()
-    finally:
-        try:
-            await ex.close()
-        except Exception:
-            pass
+        async with asyncio.timeout(min(10.0, DEFAULT_OP_TIMEOUT)):
+            return await ex.list_positions()
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="positions timeout")
 
-async def balance_data(mode: Literal["binance", "sim"] = "binance", testnet: bool = True):
+# ai_trader/routers/trading_exec.py  (функция balance_data)
+async def balance_data(mode: Literal["binance", "sim"] = "binance", testnet: bool = True, fast: bool = False):
     ex = _select_executor(mode, testnet)
     try:
-        bal = await ex.fetch_balance()
-        try:
-            equity = await _estimate_equity_usdt(ex)
-        except Exception:
-            equity = None
-        risk_cfg = load_risk_config()
-        state = ensure_day(
-            load_state(getattr(risk_cfg, "tz_name", "Asia/Almaty")),
-            getattr(risk_cfg, "tz_name", "Asia/Almaty"),
-            current_equity=float(equity or 0.0),
-        )
-        # Разворачиваем баланс на верхний уровень, чтобы был ключ "exchange"
-        base = bal if isinstance(bal, dict) else {}
-        return {
-            **base,
-            "equity_usdt": equity,
-            "risk": {
-                "daily_start_equity": start_of_day_equity(state),
-                "daily_max_loss_pct": getattr(risk_cfg, "daily_max_loss_pct", 0.02),
-                "max_trades_per_day": getattr(risk_cfg, "max_trades_per_day", 15),
-            },
-        }
-    finally:
-        try:
-            await ex.close()
-        except Exception:
-            pass
+        async with asyncio.timeout(min(15.0, DEFAULT_OP_TIMEOUT)):
+            bal = await ex.fetch_balance()
+            equity: Optional[float] = None
+            if not fast:
+                try:
+                    equity = await _estimate_equity_usdt(ex)
+                except Exception:
+                    equity = 0.0  # ← вместо None
+            else:
+                equity = 0.0     # ← fast-режим тоже отдаём число
 
-# ---------- HEALTH ----------
+            risk_cfg = load_risk_config()
+            state = ensure_day(
+                load_state(getattr(risk_cfg, "tz_name", "Asia/Almaty")),
+                getattr(risk_cfg, "tz_name", "Asia/Almaty"),
+                current_equity=float(equity or 0.0),
+            )
+            base = bal if isinstance(bal, dict) else {}
+            out = {
+                **base,
+                "equity_usdt": float(equity or 0.0),  # ← всегда float
+                "risk": {
+                    "daily_start_equity": start_of_day_equity(state),
+                    "daily_max_loss_pct": getattr(risk_cfg, "daily_max_loss_pct", 0.02),
+                    "max_trades_per_day": getattr(risk_cfg, "max_trades_per_day", 15),
+                },
+            }
+            if fast:
+                out["note"] = "fast_balance: equity_usdt computed as 0.0 (fast)"
+            return out
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="balance timeout")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HEALTH
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/healthz")
 async def healthz(
     mode: Literal["binance", "sim"] = Query("binance"),
@@ -475,27 +730,25 @@ async def healthz(
     try:
         price = None
         try:
-            price = await ex.get_price("BTCUSDT")
+            async with asyncio.timeout(5.0):
+                price = await ex.get_price("BTCUSDT")
         except Exception:
             pass
         info_ok = True
         try:
             client = getattr(ex, "client", None)
             if client and hasattr(client, "get_exchange_info"):
-                await client.get_exchange_info()
+                async with asyncio.timeout(8.0):
+                    await client.get_exchange_info()
         except Exception:
             info_ok = False
-        # Плоский ответ
         return {"mode": mode, "testnet": testnet, "price_ok": price is not None, "exchange_info_ok": info_ok}
     except Exception as e:
         return _map_exc(e)
-    finally:
-        try:
-            await ex.close()
-        except Exception:
-            pass
 
-# ---------- CONFIG ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/config")
 async def exec_config(
     mode: Literal["binance", "sim"] = Query("binance"),
@@ -526,7 +779,9 @@ async def exec_config(
     except Exception as e:
         return _map_exc(e)
 
-# ---------- OPEN ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# OPEN
+# ──────────────────────────────────────────────────────────────────────────────
 @router.post("/open")
 async def open_order(
     mode: Literal["binance", "sim"] = Query("binance"),
@@ -587,7 +842,7 @@ async def open_order(
 
     # RISK-GATE
     try:
-        equity = await _estimate_equity_usdt(ex)
+        equity = await asyncio.wait_for(_estimate_equity_usdt(ex), timeout=min(10.0, DEFAULT_OP_TIMEOUT))
     except Exception:
         equity = 0.0
 
@@ -620,10 +875,6 @@ async def open_order(
                 client_order_id=p.get("client_order_id"),
                 raw={"risk": reason, "ts_ms": int(time.time() * 1000)},
             )
-        try:
-            await ex.close()
-        except Exception:
-            pass
         return _err("risk_blocked", http=409, data=reason)
 
     if not can_open_more_trades(state, getattr(risk_cfg, "max_trades_per_day", 15)):
@@ -643,10 +894,6 @@ async def open_order(
                 client_order_id=p.get("client_order_id"),
                 raw={"risk": reason, "ts_ms": int(time.time() * 1000)},
             )
-        try:
-            await ex.close()
-        except Exception:
-            pass
         return _err("risk_blocked", http=409, data=reason)
 
     # autosizing / SL-TP
@@ -695,39 +942,36 @@ async def open_order(
         pass
 
     if p.get("qty") is not None and float(p["qty"]) <= 0:
-        try:
-            await ex.close()
-        except Exception:
-            pass
         return _err("validation", http=422, error={"message": "qty computed is non-positive (check sl and risk config)"})
 
     # исполнение
     try:
-        open_with_protection = getattr(ex, "open_with_protection", None)
-        if callable(open_with_protection):
-            result = await open_with_protection(
-                symbol=p["symbol"],
-                side=p["side"],
-                qty=p.get("qty"),
-                entry_type=p["type"],
-                entry_price=p.get("price"),
-                sl_price=final_sl_price,
-                tp_price=final_tp_price,
-                client_order_id=p.get("client_order_id"),
-                quote_qty=p.get("quote_qty"),
-                timeInForce=p.get("timeInForce"),
-            )
-        else:
-            result = await ex.open_order(
-                symbol=p["symbol"],
-                side=p["side"],
-                type=p["type"],
-                qty=p.get("qty"),
-                price=p.get("price"),
-                timeInForce=p.get("timeInForce"),
-                client_order_id=p.get("client_order_id"),
-                quote_qty=p.get("quote_qty"),
-            )
+        async with asyncio.timeout(min(20.0, DEFAULT_OP_TIMEOUT + 5)):
+            open_with_protection = getattr(ex, "open_with_protection", None)
+            if callable(open_with_protection):
+                result = await open_with_protection(
+                    symbol=p["symbol"],
+                    side=p["side"],
+                    qty=p.get("qty"),
+                    entry_type=p["type"],
+                    entry_price=p.get("price"),
+                    sl_price=final_sl_price,
+                    tp_price=final_tp_price,
+                    client_order_id=p.get("client_order_id"),
+                    quote_qty=p.get("quote_qty"),
+                    timeInForce=p.get("timeInForce"),
+                )
+            else:
+                result = await ex.open_order(
+                    symbol=p["symbol"],
+                    side=p["side"],
+                    type=p["type"],
+                    qty=p.get("qty"),
+                    price=p.get("price"),
+                    timeInForce=p.get("timeInForce"),
+                    client_order_id=p.get("client_order_id"),
+                    quote_qty=p.get("quote_qty"),
+                )
 
         response = {
             "order_id": result.get("order_id"),
@@ -807,18 +1051,16 @@ async def open_order(
                     },
                 )
 
-        # Плоский ответ (без "ok/data")
         return response
 
+    except asyncio.TimeoutError:
+        return _err("exec_timeout", http=504, error={"message": "open order timeout"})
     except Exception as e:
         return _map_exc(e)
-    finally:
-        try:
-            await ex.close()
-        except Exception:
-            pass
 
-# ---------- CLOSE / CANCEL ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# CLOSE / CANCEL
+# ──────────────────────────────────────────────────────────────────────────────
 @router.post("/close")
 async def close_order(
     mode: Literal["binance", "sim"] = Query("binance"),
@@ -849,13 +1091,16 @@ async def close_order(
             try:
                 client = getattr(ex, "client", None)
                 if client and hasattr(client, "delete_order"):
-                    cancel_res = await client.delete_order(
-                        symbol=symbol,
-                        orderId=_order_id_int(order_id),
-                        origClientOrderId=client_order_id,
-                    )
+                    async with asyncio.timeout(min(10.0, DEFAULT_OP_TIMEOUT)):
+                        cancel_res = await client.delete_order(
+                            symbol=symbol,
+                            orderId=_order_id_int(order_id),
+                            origClientOrderId=client_order_id,
+                        )
                 else:
                     cancel_res = {"status": "CANCELED", "orderId": order_id, "clientOrderId": client_order_id}
+            except asyncio.TimeoutError:
+                return _err("exec_timeout", http=504, error={"message": "cancel timeout"})
             except Exception as e:
                 return _map_exc(e)
 
@@ -874,11 +1119,11 @@ async def close_order(
                     raw={"response": cancel_res, "ts_ms": int(time.time() * 1000)},
                 )
 
-            # Плоский ответ
             return {"symbol": symbol, "cancel": cancel_res}
 
         # Режим 2: «закрыть руками» встречным MARKET (не передаём side в метод)
-        result = await ex.close_order(symbol=symbol, qty=qty, type="market")
+        async with asyncio.timeout(min(15.0, DEFAULT_OP_TIMEOUT)):
+            result = await ex.close_order(symbol=symbol, qty=qty, type="market")
 
         if realized_pnl is not None:
             try:
@@ -906,13 +1151,10 @@ async def close_order(
 
         return result
 
+    except asyncio.TimeoutError:
+        return _err("exec_timeout", http=504, error={"message": "close timeout"})
     except Exception as e:
         return _map_exc(e)
-    finally:
-        try:
-            await ex.close()
-        except Exception:
-            pass
 
 @router.post("/cancel")
 async def cancel_order(
@@ -930,15 +1172,16 @@ async def cancel_order(
     _heartbeat_touch()
 
     try:
-        client = getattr(ex, "client", None)
-        if client and hasattr(client, "delete_order"):
-            result = await client.delete_order(
-                symbol=symbol,
-                orderId=_order_id_int(order_id),
-                origClientOrderId=client_order_id,
-            )
-        else:
-            result = {"status": "CANCELED", "orderId": order_id, "clientOrderId": client_order_id}
+        async with asyncio.timeout(min(10.0, DEFAULT_OP_TIMEOUT)):
+            client = getattr(ex, "client", None)
+            if client and hasattr(client, "delete_order"):
+                result = await client.delete_order(
+                    symbol=symbol,
+                    orderId=_order_id_int(order_id),
+                    origClientOrderId=client_order_id,
+                )
+            else:
+                result = {"status": "CANCELED", "orderId": order_id, "clientOrderId": client_order_id}
 
         if session is not None and crud_orders is not None:
             await _safe_log_order(
@@ -957,15 +1200,14 @@ async def cancel_order(
 
         return result
 
+    except asyncio.TimeoutError:
+        return _err("exec_timeout", http=504, error={"message": "cancel timeout"})
     except Exception as e:
         return _map_exc(e)
-    finally:
-        try:
-            await ex.close()
-        except Exception:
-            pass
 
-# ---------- POSITIONS ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# POSITIONS
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/positions")
 async def list_positions(
     mode: Literal["binance", "sim"] = Query("binance"),
@@ -973,21 +1215,43 @@ async def list_positions(
 ):
     try:
         positions = await list_positions_data(mode, testnet)
-        # ВОЗВРАЩАЕМ непосредственно список (без _ok-обёртки)
         return positions
     except Exception as e:
         return _map_exc(e)
-
 
 # ---------- BALANCE ----------
 @router.get("/balance")
 async def get_balance(
     mode: Literal["binance", "sim"] = Query("binance"),
     testnet: bool = Query(True),
+    fast: bool = Query(False, description="Если true — не считаем equity_usdt, только balances"),
 ):
     try:
-        data = await balance_data(mode, testnet)
-        # Плоский ответ: на верхнем уровне есть "exchange"
+        data = await balance_data(mode, testnet, fast=fast)
         return data
+    except Exception as e:
+        return _map_exc(e)
+
+
+# ai_trader/routers/trading_exec.py  (где-нибудь ниже перед OPEN/CLOSE)
+@router.get("/_debug/equity")
+async def debug_equity(
+    mode: Literal["binance", "sim"] = Query("binance"),
+    testnet: bool = Query(True),
+):
+    ex = _select_executor(mode, testnet)
+    try:
+        eq = await _estimate_equity_usdt(ex)
+        bal = await ex.fetch_balance()
+        nonzero = []
+        for b in (bal.get("balances") or []):
+            try:
+                t = float(b.get("free") or 0) + float(b.get("locked") or 0)
+                if t > 0:
+                    nonzero.append({"asset": b.get("asset"), "total": t})
+            except Exception:
+                continue
+        nonzero.sort(key=lambda x: x["total"], reverse=True)
+        return {"equity_usdt": eq, "top_assets": nonzero[:20]}
     except Exception as e:
         return _map_exc(e)

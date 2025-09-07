@@ -1,4 +1,3 @@
-# executors/api_binance.py
 from __future__ import annotations
 
 import hmac
@@ -105,8 +104,28 @@ class _BinanceSpotClient:
         self.backoff_base = float(backoff_base)
         self.backoff_cap = float(backoff_cap)
 
-        self._timeout = float(timeout)
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self._timeout)
+        # Безопасный таймаут (0.0 заменяем на дефолт)
+        _t = float(timeout) if float(timeout) > 0 else 20.0
+        # Раздельные таймауты и лимиты пула, чтобы не залипать на connect/pool
+        self._timeout = httpx.Timeout(
+            connect=min(10.0, _t),
+            read=_t,
+            write=min(10.0, _t),
+            pool=min(10.0, _t),
+        )
+        self._limits = httpx.Limits(
+            max_keepalive_connections=10,
+            max_connections=20,
+            keepalive_expiry=30.0,
+        )
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self._timeout,
+            limits=self._limits,
+            headers=None,
+            http2=False,
+            trust_env=True,
+        )
 
         # serverTime - local_time_ms drift
         self._time_offset_ms: int = 0
@@ -121,6 +140,10 @@ class _BinanceSpotClient:
         self._ticker_cache: Dict[str, Tuple[Decimal, float]] = {}  # symbol -> (price, ts)
         self._ticker_ttl: float = 5.0  # 5s
 
+        # Батч-кэш всех тикеров
+        self._all_tickers_cache: Dict[str, Tuple[Decimal, float]] = {}
+        self._all_tickers_ttl: float = 2.0
+
     async def close(self) -> None:
         try:
             await self._client.aclose()
@@ -129,7 +152,13 @@ class _BinanceSpotClient:
 
     def _recreate_client(self) -> None:
         try:
-            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self._timeout)
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=self._timeout,
+                limits=self._limits,
+                http2=False,
+                trust_env=True,
+            )
         except Exception as e:
             LOG.warning("Failed to recreate httpx client: %r", e)
 
@@ -162,7 +191,7 @@ class _BinanceSpotClient:
         if (now - self._last_sync_ts) < self._sync_interval_sec:
             return
         try:
-            resp = await self._client.get(f"{self.base_url}/api/v3/time")
+            resp = await self._client.get("/api/v3/time")
             resp.raise_for_status()
             data = resp.json()
             server_time = int(data.get("serverTime"))
@@ -201,32 +230,32 @@ class _BinanceSpotClient:
         sign: bool = True,
     ) -> Dict[str, Any]:
         headers = {"X-MBX-APIKEY": self.creds.api_key} if sign else None
-        url = f"{self.base_url}{path}"
 
-        if sign:
-            params = self._ts_params(params or {})
-            signature = self._sign(params)
-        else:
-            params = dict(params or {})
-            signature = None
-
-        if method == "GET":
-            qp = dict(params)
-            if sign:
-                qp["signature"] = signature
-            resp = await self._client.get(url, params=qp, headers=headers)
-        elif method == "POST":
-            body = dict(params)
-            if sign:
-                body["signature"] = signature
-            resp = await self._client.post(url, data=body, headers=headers)
-        elif method == "DELETE":
-            qp = dict(params)
-            if sign:
-                qp["signature"] = signature
-            resp = await self._client.delete(url, params=qp, headers=headers)
-        else:
-            raise ValueError("Unsupported HTTP method")
+        t0 = time.perf_counter()
+        try:
+            if method == "GET":
+                qp = dict(params or {})
+                if sign:
+                    qp = self._ts_params(qp)
+                    qp["signature"] = self._sign(qp)
+                resp = await self._client.get(path, params=qp, headers=headers)
+            elif method == "POST":
+                body = dict(params or {})
+                if sign:
+                    body = self._ts_params(body)
+                    body["signature"] = self._sign(body)
+                resp = await self._client.post(path, data=body, headers=headers)
+            elif method == "DELETE":
+                qp = dict(params or {})
+                if sign:
+                    qp = self._ts_params(qp)
+                    qp["signature"] = self._sign(qp)
+                resp = await self._client.delete(path, params=qp, headers=headers)
+            else:
+                raise ValueError("Unsupported HTTP method")
+        finally:
+            dt = time.perf_counter() - t0
+            LOG.debug("Binance %s %s took %.3fs", method, path, dt)
 
         if resp.status_code >= 400:
             raise self._parse_error(resp.status_code, resp.text, headers=dict(resp.headers))
@@ -306,6 +335,37 @@ class _BinanceSpotClient:
         self._ex_info_cache_ts = now
         return data
 
+    async def get_all_tickers(self) -> Dict[str, Decimal]:
+        """
+        Батч-метод: вернуть все цены (symbol->Decimal) с коротким TTL.
+        """
+        now = time.time()
+        if self._all_tickers_cache:
+            _, ts = next(iter(self._all_tickers_cache.values()))
+            if (now - ts) < self._all_tickers_ttl:
+                return {k: v for k, (v, _) in self._all_tickers_cache.items()}
+
+        data = await self._request_with_retries("GET", "/api/v3/ticker/price", params={}, sign=False)
+        prices: Dict[str, Decimal] = {}
+        for t in data or []:
+            try:
+                s = str(t.get("symbol")).upper()
+                p = Decimal(str(t.get("price")))
+                prices[s] = p
+            except Exception:
+                continue
+
+        self._all_tickers_cache = {k: (v, now) for k, v in prices.items()}
+        return prices
+
+    async def get_all_tickers_list(self) -> List[Dict[str, Any]]:
+        """
+        Альтернатива: список словарей {'symbol','price'} — удобно для потребителей,
+        которые ожидают list-формат.
+        """
+        d = await self.get_all_tickers()
+        return [{"symbol": k, "price": float(v)} for k, v in d.items()]
+
     async def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         info = await self.get_exchange_info()
         for s in info.get("symbols", []):
@@ -314,12 +374,28 @@ class _BinanceSpotClient:
         return None
 
     async def get_ticker_price(self, symbol: str) -> Optional[Decimal]:
+        """
+        Возвращает цену символа с приоритетом:
+        1) батч-кэш get_all_tickers,
+        2) локальный кэш конкретного символа,
+        3) сетевой запрос.
+        """
         now = time.time()
         sym = symbol.upper()
+
+        # 1) батч-кэш
+        if sym in self._all_tickers_cache:
+            price, ts = self._all_tickers_cache[sym]
+            if (now - ts) < self._all_tickers_ttl:
+                return price
+
+        # 2) локальный кэш
         if sym in self._ticker_cache:
             price, ts = self._ticker_cache[sym]
             if (now - ts) < self._ticker_ttl:
                 return price
+
+        # 3) сеть
         data = await self._request_with_retries("GET", "/api/v3/ticker/price", params={"symbol": sym}, sign=False)
         p = data.get("price")
         try:
@@ -423,10 +499,10 @@ class _BinanceSpotClient:
         data = await self._request_with_retries("GET", "/api/v3/openOrders", params=params, sign=True)
         return data if isinstance(data, list) else []
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Вспомогательная асинхронная пауза
+    # ──────────────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Вспомогательная асинхронная пауза
-# ──────────────────────────────────────────────────────────────────────────────
 async def _sleep_async(seconds: float) -> None:
     import asyncio
     await asyncio.sleep(seconds)
@@ -463,7 +539,6 @@ def _short_client_id(prefix: str = "cli") -> str:
     Формат: <prefix>-<ms>-<hex> (влезает в лимит).
     """
     ms = int(time.time() * 1000)
-    # 8 hex символов (4 байта) достаточно для уникальности при нагрузке тестнета
     return f"{prefix}-{ms}-{os.urandom(4).hex()}"[:36]
 
 
@@ -506,7 +581,11 @@ class BinanceExecutor(Executor):
 
         base = self.config.get("base_url") or ("https://testnet.binance.vision" if testnet else "https://api.binance.com")
         recv_window = int(self.config.get("recv_window", 5000))
-        timeout = float(self.config.get("timeout", 20.0))
+
+        timeout_cfg = float(self.config.get("timeout", 20.0))
+        if timeout_cfg <= 0:
+            timeout_cfg = 20.0
+
         max_retries = int(self.config.get("max_retries", 5))
         backoff_base = float(self.config.get("backoff_base", 0.5))
         backoff_cap = float(self.config.get("backoff_cap", 8.0))
@@ -515,7 +594,7 @@ class BinanceExecutor(Executor):
             self.creds,
             base_url=base,
             recv_window=recv_window,
-            timeout=timeout,
+            timeout=timeout_cfg,
             max_retries=max_retries,
             backoff_base=backoff_base,
             backoff_cap=backoff_cap,
@@ -648,11 +727,26 @@ class BinanceExecutor(Executor):
         p = await self.client.get_ticker_price(symbol)
         return float(p) if p is not None else None
 
+    async def price(self, symbol: str) -> Dict[str, Any]:
+        """
+        Совместимость с вызывающим кодом, который ожидает метод `price(...)`
+        и умеет разбирать словарь c ключом 'price'.
+        """
+        p = await self.get_price(symbol)
+        return {"symbol": symbol.upper(), "price": p} if p is not None else {"symbol": symbol.upper(), "price": None}
+
     async def get_ticker_price(self, symbol: str) -> Optional[float]:
         return await self.get_price(symbol)
 
     async def get_last_price(self, symbol: str) -> Optional[float]:
         return await self.get_price(symbol)
+
+    async def get_all_tickers(self) -> Dict[str, float]:
+        """
+        Проксируем батч-цены наружу (float), чтобы потребители могли использовать executor.get_all_tickers().
+        """
+        d = await self.client.get_all_tickers()
+        return {k: float(v) for k, v in d.items()}
 
     # ---------- helpers ----------
     @staticmethod

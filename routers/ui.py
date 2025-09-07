@@ -156,19 +156,20 @@ async def partial_balance(
     testnet: bool = Query(DEFAULT_TESTNET),
 ):
     def _demo_balance() -> Dict[str, Any]:
-        """Синтетический баланс для демо-режима (sim) — показываем всегда что-то осмысленное."""
         return {
             "exchange": "sim" if not testnet else "sim:testnet",
-            "equity_usdt": 10000.0,           # стартовый equity демо
+            "equity_usdt": 10000.0,
             "risk": {
                 "daily_start_equity": 10000.0,
-                "daily_max_loss_pct": 2.0,    # 2% в день
+                "daily_max_loss_pct": 0.02,
                 "max_trades_per_day": 50,
                 "exposure": 0.0,
                 "leverage": 1.0,
             },
-            "balance": {"equity": 10000.0, "exposure": 0.0, "leverage": 1.0},
-            "_demo": True,  # флажок в шаблон
+            "balances": [
+                {"asset": "USDT", "free": 10000.0, "locked": 0.0, "total": 10000.0}
+            ],
+            "_demo": True,
         }
 
     try:
@@ -178,8 +179,10 @@ async def partial_balance(
 
         balance_src = data.get("balance") or {}
         risk_src    = data.get("risk") or {}
+        balances_src = data.get("balances") or []
+        if isinstance(balance_src, dict) and "balances" in balance_src:
+            balances_src = balance_src["balances"]
 
-        # Пытаемся найти equity в разных возможных полях
         equity_candidates = [
             data.get("equity_usdt"),
             balance_src.get("equity_usdt") if isinstance(balance_src, dict) else None,
@@ -192,10 +195,8 @@ async def partial_balance(
         equity_usdt = next((v for v in equity_candidates if v is not None), None)
         equity_usdt = _to_float(equity_usdt)
 
-        # Если адаптер ничего не дал и это демо — подставляем синтетику
         if equity_usdt is None and mode == "sim":
-            demo = _demo_balance()
-            return _render_fragment("monitor/_balance.html", request, {"bal": demo})
+            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
 
         bal = {
             "exchange": (
@@ -219,23 +220,21 @@ async def partial_balance(
                     0.0,
                 ),
             },
+            "balances": balances_src,  # теперь передаём в шаблон
             "balance": balance_src if isinstance(balance_src, dict) else {},
             "_demo": False,
         }
 
-        # Если после всех попыток equity всё равно None — в демо покажем синтетику
         if bal["equity_usdt"] is None and mode == "sim":
-            demo = _demo_balance()
-            return _render_fragment("monitor/_balance.html", request, {"bal": demo})
+            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
 
         return _render_fragment("monitor/_balance.html", request, {"bal": bal})
 
-    except asyncio.TimeoutError:  # pragma: no cover
-        # даже при таймауте в демо-режиме показываем синтетический баланс, чтобы UI не пустовал
+    except asyncio.TimeoutError:
         if mode == "sim":
             return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
         return _error_fragment("balance", "Таймаут при получении баланса")
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         if mode == "sim":
             return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
         return _error_fragment("balance", f"Не удалось получить баланс: {e!s}")

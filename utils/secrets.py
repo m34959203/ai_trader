@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import yaml  # обязательная зависимость по проекту
 
@@ -45,24 +45,12 @@ def _redact(s: Optional[str]) -> str:
     return s[:3] + "…" + s[-3:]
 
 
-def _env_get_any(names: list[str]) -> Optional[str]:
+def _env_get_any(names: List[str]) -> Optional[str]:
     for n in names:
         v = os.getenv(n)
         if v:
             return v
     return None
-
-
-def _cfg_get(d: Dict[str, Any], path: str, default: Optional[Any] = None) -> Any:
-    """
-    d['binance']['testnet']['api_key']  => _cfg_get(d, 'binance.testnet.api_key')
-    """
-    cur: Any = d
-    for key in path.split("."):
-        if not isinstance(cur, dict) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
 
 
 def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -76,6 +64,28 @@ def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, An
         else:
             out[k] = v
     return out
+
+
+def _ensure_map(obj: Any) -> dict:
+    """
+    Мягкая нормализация раздела конфигурации: если раздел не dict (bool/str/num),
+    возвращаем пустую map, чтобы не падать на .items().
+    """
+    if obj is None or isinstance(obj, dict):
+        return obj or {}
+    return {}
+
+
+def _to_ms(value: Any, default_ms: int) -> int:
+    """
+    Конвертация seconds→ms (если значение < 1000 считаем секундами),
+    иначе воспринимаем как миллисекунды.
+    """
+    try:
+        v = float(value)
+        return int(v * 1000) if v < 1000 else int(v)
+    except Exception:
+        return default_ms
 
 
 # =============================================================================
@@ -152,13 +162,27 @@ def load_exec_config() -> Dict[str, Any]:
         if data:
             cfg_legacy = _merge_dicts(cfg_legacy, data)
 
-    return _merge_dicts(cfg_main, cfg_legacy) if cfg_legacy else cfg_main
+    cfg = _merge_dicts(cfg_main, cfg_legacy) if cfg_legacy else cfg_main
+
+    # ── Мягкая нормализация разделов (защита от 'bool'.items()) ──
+    if not isinstance(cfg, dict):
+        # Если верхний уровень не map — вернём пустой dict (и пусть API сообщит человеку)
+        return {}
+
+    for section in ("binance", "risk", "sim", "limits", "strategy", "ui"):
+        if section in cfg and not isinstance(cfg[section], dict):
+            cfg[section] = _ensure_map(cfg[section])
+            cfg.setdefault("_config_warnings", []).append(
+                f"exec.yaml: раздел '{section}' был не-объектом; автоматически нормализован в {{}}"
+            )
+
+    return cfg
 
 
 def _binance_node(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Возвращает секцию binance{} из exec.yaml (или пустую).
-    Поддерживает варианты:
+    Допустимые схемы:
       binance:
         api_key: ...
         api_secret: ...
@@ -170,7 +194,7 @@ def _binance_node(cfg: Dict[str, Any]) -> Dict[str, Any]:
         backoff_cap: ...
         testnet: { api_key, api_secret, base_url, ... }
         main|prod: { api_key, api_secret, base_url, ... }
-        profiles: { testnet: {...}, main: {...} }
+        profiles: { testnet: {...}, main|prod: {...} }
     """
     return (cfg.get("binance") or {}) if isinstance(cfg, dict) else {}
 
@@ -180,24 +204,20 @@ def _profile_view(node: Dict[str, Any], *, testnet: bool) -> Dict[str, Any]:
     Возвращает профильную ветку из binance{} с учётом поддерживаемых схем.
     Профильные поля перекрывают корневые.
     """
-    # 1) внутри 'profiles'
     prof_key = "testnet" if testnet else "main"
     profiles = node.get("profiles") if isinstance(node, dict) else None
     prof = {}
     if isinstance(profiles, dict):
         prof = profiles.get(prof_key) or profiles.get("prod") or {}
 
-    # 2) плоская схема: binance.testnet / binance.main|prod
     if not prof:
         if testnet:
             prof = node.get("testnet") or {}
         else:
             prof = node.get("main") or node.get("prod") or {}
 
-    # 3) root уровень — дефолты (api_key, api_secret, base_url, etc.)
+    # Корневые дефолты
     root = dict(node)
-
-    # Безопасно удалить вложенные карты, чтобы они не попали «как есть»
     for k in ("profiles", "testnet", "main", "prod"):
         if isinstance(root.get(k), dict):
             root.pop(k)
@@ -212,13 +232,7 @@ def _profile_view(node: Dict[str, Any], *, testnet: bool) -> Dict[str, Any]:
 
 def get_binance_config(*, testnet: bool) -> Dict[str, Any]:
     """
-    Полезно для инициализации executors.api_binance.BinanceExecutor:
-    возвращает объединённый конфиг для текущего профиля из единого exec.yaml
-    (без секретов из ENV).
-
-    Возвращаемые поля (если заданы в YAML):
-      - base_url, recv_window, timeout, max_retries, backoff_base, backoff_cap, ticker_ttl, exchange_info_ttl, ...
-      - api_key, api_secret (если храните их в YAML — не рекомендуется для прод)
+    Возвращает объединённый конфиг профиля Binance из exec.yaml (без секретов из ENV).
     """
     cfg = load_exec_config()
     node = _binance_node(cfg)
@@ -227,12 +241,15 @@ def get_binance_config(*, testnet: bool) -> Dict[str, Any]:
 
 def get_binance_base_url(*, testnet: bool) -> str:
     """
-    Выбор base_url: приоритет exec.yaml → дефолт Binance.
+    Выбор base_url: приоритет exec.yaml → ENV → дефолт.
     """
     prof = get_binance_config(testnet=testnet)
     url = prof.get("base_url")
     if isinstance(url, str) and url.strip():
         return url.strip()
+    env_url = os.getenv("BINANCE_BASE")
+    if env_url and env_url.strip():
+        return env_url.strip()
     return "https://testnet.binance.vision" if testnet else "https://api.binance.com"
 
 
@@ -245,13 +262,13 @@ def get_binance_keys(*, testnet: bool) -> Tuple[str, str]:
       2) exec.yaml (единый файл, разные допустимые структуры, см. _profile_view)
       3) -> RuntimeError с понятным сообщением
     """
-    # 0) Подгружаем .env автоматически (если есть dotenv)
+    # Подгружаем .env автоматически (если есть dotenv)
     load_env_files(prefer_test=testnet)
 
     # 1) ENV с поддержкой алиасов
     if testnet:
-        api_key = _env_get_any(["BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY_TESTNET", "BINANCE_KEY_TESTNET"])
-        api_sec = _env_get_any(["BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET_TESTNET", "BINANCE_SECRET_TESTNET"])
+        api_key = _env_get_any(["BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY_TESTNET", "BINANCE_KEY_TESTNET", "BINANCE_API_KEY"])
+        api_sec = _env_get_any(["BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET_TESTNET", "BINANCE_SECRET_TESTNET", "BINANCE_API_SECRET"])
     else:
         api_key = _env_get_any(["BINANCE_API_KEY", "BINANCE_KEY"])
         api_sec = _env_get_any(["BINANCE_API_SECRET", "BINANCE_SECRET"])
@@ -259,12 +276,11 @@ def get_binance_keys(*, testnet: bool) -> Tuple[str, str]:
     # 2) Единый exec.yaml (если в ENV не нашли)
     if not api_key or not api_sec:
         prof = get_binance_config(testnet=testnet)
-        # Приоритет: узел профиля → корень
         api_key = api_key or prof.get("api_key")
         api_sec = api_sec or prof.get("api_secret")
 
     if not api_key or not api_sec:
-        env_hint = "BINANCE_TESTNET_API_KEY/SECRET" if testnet else "BINANCE_API_KEY/SECRET"
+        env_hint = "BINANCE_TESTNET_API_KEY/SECRET или BINANCE_API_KEY/SECRET" if testnet else "BINANCE_API_KEY/SECRET"
         cfg_hint = "binance.[profiles.testnet|testnet].api_key(.api_secret) или binance.api_key(.api_secret)"
         raise RuntimeError(
             "Binance API keys not found. "
@@ -273,6 +289,54 @@ def get_binance_keys(*, testnet: bool) -> Tuple[str, str]:
         )
 
     return str(api_key), str(api_sec)
+
+
+def get_ccxt_kwargs(*, testnet: bool) -> Dict[str, Any]:
+    """
+    Готовые kwargs для ccxt.binance с корректными URL для spot testnet
+    и подхватом настроек из exec.yaml (recv_window, timeout и т.п.).
+    """
+    api_key, api_secret = get_binance_keys(testnet=testnet)
+    prof = get_binance_config(testnet=testnet)
+
+    recv_window_ms = _to_ms(prof.get("recv_window", 20000), 20000)
+    timeout_ms = _to_ms(prof.get("timeout", 20), 20000)  # 20 сек по умолчанию
+    base_url = get_binance_base_url(testnet=testnet)
+
+    kwargs: Dict[str, Any] = {
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+        "timeout": timeout_ms,
+        "options": {
+            "defaultType": "spot",
+            "adjustForTimeDifference": True,
+            "recvWindow": recv_window_ms,
+        },
+    }
+
+    if testnet:
+        # ccxt для spot сам не переключает URL → принудительно задаём testnet
+        kwargs["urls"] = {
+            "api": {
+                "public": f"{base_url}/api",
+                "private": f"{base_url}/api",
+            }
+        }
+    return kwargs
+
+
+def get_retry_policy() -> Dict[str, Any]:
+    """
+    Возвращает политику повторов для сетевых ошибок (используется в вызовах executors.api_binance).
+    """
+    cfg = load_exec_config()
+    b = cfg.get("binance", {}) if isinstance(cfg, dict) else {}
+    return {
+        "max_retries": int(b.get("max_retries", 5)),
+        "backoff_base": float(b.get("backoff_base", 0.5)),
+        "backoff_cap": float(b.get("backoff_cap", 8.0)),
+    }
 
 
 # =============================================================================
@@ -284,7 +348,6 @@ def current_exec_profile(*, mode: str, testnet: bool) -> Dict[str, Any]:
     Возвращает информацию для эндпоинта /exec/config (без секретов).
     Показывает, откуда будут браться ключи, базовые runtime-параметры и найден ли exec.yaml.
     """
-    # Подтягиваем env (помогает для корректного статуса)
     load_env_files(prefer_test=testnet)
     cfg = load_exec_config()
     prof = get_binance_config(testnet=testnet) if mode == "binance" else {}
@@ -295,8 +358,8 @@ def current_exec_profile(*, mode: str, testnet: bool) -> Dict[str, Any]:
     red_key, red_sec = "", ""
 
     if testnet:
-        k_env = _env_get_any(["BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY_TESTNET", "BINANCE_KEY_TESTNET"])
-        s_env = _env_get_any(["BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET_TESTNET", "BINANCE_SECRET_TESTNET"])
+        k_env = _env_get_any(["BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY_TESTNET", "BINANCE_KEY_TESTNET", "BINANCE_API_KEY"])
+        s_env = _env_get_any(["BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET_TESTNET", "BINANCE_SECRET_TESTNET", "BINANCE_API_SECRET"])
     else:
         k_env = _env_get_any(["BINANCE_API_KEY", "BINANCE_KEY"])
         s_env = _env_get_any(["BINANCE_API_SECRET", "BINANCE_SECRET"])
@@ -315,7 +378,6 @@ def current_exec_profile(*, mode: str, testnet: bool) -> Dict[str, Any]:
         if s_cfg and not sec_ok:
             sec_ok, sec_src, red_sec = True, "exec.yaml", _redact(s_cfg)
 
-    # Небезопасные поля из профиля (без секретов), полезны для диагностики
     runtime_cfg = {
         "base_url": prof.get("base_url") or get_binance_base_url(testnet=testnet),
         "recv_window": prof.get("recv_window"),
@@ -338,6 +400,7 @@ def current_exec_profile(*, mode: str, testnet: bool) -> Dict[str, Any]:
             "api_secret_source": sec_src or "missing",
         },
         "config_loaded": bool(cfg),
+        "warnings": cfg.get("_config_warnings", []),
         "runtime": runtime_cfg,
     }
 
