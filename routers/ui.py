@@ -24,7 +24,7 @@ from routers.trading_exec import (
 _HAS_DB = True
 try:
     from db import crud_orders  # type: ignore
-    from db import crud         # type: ignore  # для OHLCV (метрики)
+    from db import crud         # type: ignore
     from db.session import get_session as _get_db_session  # type: ignore
 except Exception:  # pragma: no cover
     _HAS_DB = False
@@ -95,16 +95,15 @@ def _render_fragment(
     *,
     status_code: int = 200,
 ) -> HTMLResponse:
-    """
-    ВАЖНО: сигнатура TemplateResponse -> (name, context, ...)
-    request нужно класть в context как 'request'.
-    """
     context = {"request": request, **ctx}
     response = templates.TemplateResponse(template_name, context, status_code=status_code)
     _apply_headers(response, _SEC_HEADERS, _NO_CACHE_HEADERS)
     return response
 
 def _error_fragment(element_id: str, message: str) -> HTMLResponse:
+    """
+    Возвращает фрагмент ошибки с гарантированным id — важно для HTMX swap.
+    """
     html = f"""
     <div id="{element_id}" class="p-3 rounded bg-red-50 border border-red-200 text-red-700 text-sm">
       <div class="font-semibold">Ошибка</div>
@@ -128,6 +127,18 @@ def _unwrap_json(resp: Any) -> Dict[str, Any]:
         return resp
     return {}
 
+def _to_float(v: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+def _to_int(v: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Root dashboard
 # ──────────────────────────────────────────────────────────────────────────────
@@ -144,31 +155,89 @@ async def partial_balance(
     mode: Literal["binance", "sim"] = Query(DEFAULT_MODE),
     testnet: bool = Query(DEFAULT_TESTNET),
 ):
+    def _demo_balance() -> Dict[str, Any]:
+        """Синтетический баланс для демо-режима (sim) — показываем всегда что-то осмысленное."""
+        return {
+            "exchange": "sim" if not testnet else "sim:testnet",
+            "equity_usdt": 10000.0,           # стартовый equity демо
+            "risk": {
+                "daily_start_equity": 10000.0,
+                "daily_max_loss_pct": 2.0,    # 2% в день
+                "max_trades_per_day": 50,
+                "exposure": 0.0,
+                "leverage": 1.0,
+            },
+            "balance": {"equity": 10000.0, "exposure": 0.0, "leverage": 1.0},
+            "_demo": True,  # флажок в шаблон
+        }
+
     try:
         raw = await _with_timeout(_get_balance(mode=mode, testnet=testnet), BAL_POS_TIMEOUT)
         payload = _unwrap_json(raw)
-        data = payload.get("data") or payload
+        data = payload.get("data") or payload or {}
 
         balance_src = data.get("balance") or {}
         risk_src    = data.get("risk") or {}
 
+        # Пытаемся найти equity в разных возможных полях
+        equity_candidates = [
+            data.get("equity_usdt"),
+            balance_src.get("equity_usdt") if isinstance(balance_src, dict) else None,
+            balance_src.get("equity") if isinstance(balance_src, dict) else None,
+            data.get("equity"),
+            data.get("total"),
+            balance_src.get("total") if isinstance(balance_src, dict) else None,
+            balance_src.get("free") if isinstance(balance_src, dict) else None,
+        ]
+        equity_usdt = next((v for v in equity_candidates if v is not None), None)
+        equity_usdt = _to_float(equity_usdt)
+
+        # Если адаптер ничего не дал и это демо — подставляем синтетику
+        if equity_usdt is None and mode == "sim":
+            demo = _demo_balance()
+            return _render_fragment("monitor/_balance.html", request, {"bal": demo})
+
         bal = {
-            "exchange": data.get("exchange") or payload.get("exchange") or ("sim" if testnet else "binance"),
-            "equity_usdt": data.get("equity_usdt") or balance_src.get("equity_usdt") or balance_src.get("equity") or 0.0,
+            "exchange": (
+                data.get("exchange")
+                or payload.get("exchange")
+                or (f"{mode}:testnet" if testnet else mode)
+            ),
+            "equity_usdt": equity_usdt,
             "risk": {
-                "daily_start_equity":  risk_src.get("daily_start_equity"),
-                "daily_max_loss_pct":  risk_src.get("daily_max_loss_pct"),
-                "max_trades_per_day":  risk_src.get("max_trades_per_day"),
-                "exposure": risk_src.get("exposure") or balance_src.get("exposure") or 0.0,
-                "leverage": risk_src.get("leverage") or balance_src.get("leverage") or 0.0,
+                "daily_start_equity": _to_float(risk_src.get("daily_start_equity")),
+                "daily_max_loss_pct": _to_float(risk_src.get("daily_max_loss_pct")),
+                "max_trades_per_day": _to_int(risk_src.get("max_trades_per_day")),
+                "exposure": _to_float(
+                    (risk_src.get("exposure") if isinstance(risk_src, dict) else None)
+                    or (balance_src.get("exposure") if isinstance(balance_src, dict) else None),
+                    0.0,
+                ),
+                "leverage": _to_float(
+                    (risk_src.get("leverage") if isinstance(risk_src, dict) else None)
+                    or (balance_src.get("leverage") if isinstance(balance_src, dict) else None),
+                    0.0,
+                ),
             },
             "balance": balance_src if isinstance(balance_src, dict) else {},
+            "_demo": False,
         }
+
+        # Если после всех попыток equity всё равно None — в демо покажем синтетику
+        if bal["equity_usdt"] is None and mode == "sim":
+            demo = _demo_balance()
+            return _render_fragment("monitor/_balance.html", request, {"bal": demo})
+
         return _render_fragment("monitor/_balance.html", request, {"bal": bal})
 
     except asyncio.TimeoutError:  # pragma: no cover
+        # даже при таймауте в демо-режиме показываем синтетический баланс, чтобы UI не пустовал
+        if mode == "sim":
+            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
         return _error_fragment("balance", "Таймаут при получении баланса")
     except Exception as e:  # pragma: no cover
+        if mode == "sim":
+            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
         return _error_fragment("balance", f"Не удалось получить баланс: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -187,9 +256,9 @@ async def partial_positions(
         positions = data.get("positions") or payload.get("positions") or []
         return _render_fragment("monitor/_positions.html", request, {"positions": positions})
 
-    except asyncio.TimeoutError:  # pragma: no cover
+    except asyncio.TimeoutError:
         return _error_fragment("positions", "Таймаут при получении позиций")
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         return _error_fragment("positions", f"Не удалось получить позиции: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -208,13 +277,13 @@ async def partial_orders(
         orders = await _with_timeout(crud_orders.get_last_orders(db, limit=limit), ORDERS_TIMEOUT)  # type: ignore[arg-type]
         ctx = {"orders": orders, "updated_at": pd.Timestamp.utcnow().isoformat()}
         return _render_fragment("monitor/_orders.html", request, ctx)
-    except asyncio.TimeoutError:  # pragma: no cover
+    except asyncio.TimeoutError:
         return _error_fragment("orders", "Таймаут при загрузке ордеров")
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         return _error_fragment("orders", f"Не удалось загрузить ордера: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Partials — метрики (Sharpe, σ)
+# Partials — метрики
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_df_ohlcv(rows: List[Any]) -> pd.DataFrame:
     if not rows:
@@ -336,9 +405,9 @@ async def partial_metrics(
         }
         return _render_fragment("monitor/_metrics.html", request, ctx)
 
-    except asyncio.TimeoutError:  # pragma: no cover
+    except asyncio.TimeoutError:
         return _error_fragment("metrics", "Таймаут при расчёте метрик")
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         return _error_fragment("metrics", f"Не удалось вычислить метрики: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────

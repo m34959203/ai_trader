@@ -5,29 +5,40 @@
   <title>AI-Trader Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
-  <!-- HTMX (обновлено) -->
-  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  <!-- HTMX -->
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
 
-  <!-- Tailwind (CDN) -->
-  <link
-    href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css"
-    rel="stylesheet"
-  />
+  <!-- Tailwind -->
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet"/>
 
   <style>
-    /* HTMX inline indicator */
     .htmx-indicator { display: none; }
     .htmx-request .htmx-indicator,
     .htmx-request.htmx-indicator { display: inline-block; }
 
-    /* Toasts */
-    .toast {
-      pointer-events: auto;
-      transform: translateY(0);
-      transition: opacity .2s ease, transform .2s ease;
-    }
+    .toast { pointer-events: auto; transform: translateY(0); transition: opacity .2s ease, transform .2s ease; }
     .toast-enter { opacity: 0; transform: translateY(6px); }
     .toast-exit  { opacity: 0; transform: translateY(-6px); }
+
+    .tooltip {
+      position: fixed; max-width: 280px; font-size: 12px; line-height: 1.35;
+      padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(0,0,0,.08);
+      background: #111827; color: #F9FAFB; box-shadow: 0 6px 20px rgba(0,0,0,.18);
+      z-index: 1000; pointer-events: none; opacity: 0; transform: translateY(4px);
+      transition: opacity .12s ease, transform .12s ease;
+    }
+    .tooltip.show { opacity: 1; transform: translateY(0); }
+    .tooltip a { color: #A5B4FC; text-decoration: underline; }
+    .tip-icon {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 18px; height: 18px; border-radius: 9999px; font-size: 12px; line-height: 1;
+      background: #EEF2FF; color: #3730A3; border: 1px solid #C7D2FE; user-select: none;
+    }
+
+    .error-message {
+      display: none; padding: 10px; margin: 10px 0; border-radius: 6px;
+      background-color: #fef2f2; border: 1px solid #fecaca; color: #dc2626;
+    }
   </style>
 </head>
 
@@ -36,30 +47,28 @@
     <!-- Header -->
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-2xl font-bold">AI-Trader Dashboard</h1>
-
       <div class="flex items-center space-x-3">
-        <!-- Live indicator -->
-        <span class="htmx-indicator text-sm text-gray-600" aria-live="polite">
-          Обновление…
-        </span>
-
-        <!-- Dark mode toggle -->
-        <button
-          type="button"
-          id="btnTheme"
-          class="px-3 py-1.5 rounded border text-sm hover:bg-gray-100"
-          title="Переключить тему"
-          aria-label="Переключить тему"
-        >🌓</button>
+        <span class="htmx-indicator text-sm text-gray-600" aria-live="polite">Обновление…</span>
+        <button type="button" id="btnTheme"
+                class="px-3 py-1.5 rounded border text-sm hover:bg-gray-100"
+                title="Переключить тему" aria-label="Переключить тему">🌓</button>
       </div>
     </div>
 
+    <!-- Global Error Message -->
+    <div id="global-error" class="error-message"></div>
+
     <!-- Controls -->
-    <div id="controls" class="bg-white border border-gray-200 rounded-md p-4 mb-6 shadow-sm">
+    <div id="controls" class="bg-white border border-gray-200 rounded-md p-4 mb-6 shadow-sm"
+         data-tooltip="Эти параметры передаются в каждый запрос партиалов (balance/positions/orders/metrics). 
+         Измени режим исполнения и testnet — и нажми «Обновить сейчас» или дождись автообновления.">
       <form class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end" onsubmit="return false;">
         <!-- Exec mode -->
         <label class="block">
-          <span class="block text-sm font-medium mb-1">Режим исполнения</span>
+          <span class="block text-sm font-medium mb-1">Режим исполнения
+            <span class="tip-icon align-middle ml-1" tabindex="0"
+                  data-tooltip="binance — реальные REST/WebSocket-данные биржи; sim — симулятор без реальных сделок.">i</span>
+          </span>
           <select id="mode" name="mode" class="w-full border-gray-300 rounded-md">
             <option value="binance">binance</option>
             <option value="sim">sim</option>
@@ -68,7 +77,10 @@
 
         <!-- Testnet -->
         <label class="block">
-          <span class="block text-sm font-medium mb-1">Testnet</span>
+          <span class="block text-sm font-medium mb-1">Testnet
+            <span class="tip-icon align-middle ml-1" tabindex="0"
+                  data-tooltip="true — использовать тестовую среду Binance (нужны отдельные API-ключи). false — основная сеть.">i</span>
+          </span>
           <select id="testnet" name="testnet" class="w-full border-gray-300 rounded-md">
             <option value="true">true</option>
             <option value="false">false</option>
@@ -77,10 +89,13 @@
 
         <!-- Auto refresh -->
         <label class="block">
-          <span class="block text-sm font-medium mb-1">Интервал обновления</span>
+          <span class="block text-sm font-medium mb-1">Интервал обновления
+            <span class="tip-icon align-middle ml-1" tabindex="0"
+                  data-tooltip="Периодический опрос всех карточек. 0 — отключить автообновление.">i</span>
+          </span>
           <select id="refreshSec" class="w-full border-gray-300 rounded-md">
             <option value="5">каждые 5s</option>
-            <option value="10">каждые 10s</option>
+            <option value="10" selected>каждые 10s</option>
             <option value="15">каждые 15s</option>
             <option value="30">каждые 30s</option>
             <option value="0">выкл.</option>
@@ -89,73 +104,67 @@
 
         <!-- Buttons -->
         <div class="flex space-x-2">
-          <button
-            type="button"
-            class="px-3 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 w-full"
-            onclick="refreshAll()"
-            title="Запросить все партиалы заново"
-          >
+          <button type="button"
+                  class="px-3 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 w-full"
+                  onclick="refreshAll()"
+                  title="Запросить все партиалы заново">
             Обновить сейчас
           </button>
         </div>
       </form>
     </div>
 
-    <!-- 4-column grid (Balance / Positions / Orders / Metrics) -->
+    <!-- 4-column grid -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
       <!-- Balance -->
-      <section
-        id="balance"
+      <section id="balance-container"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
         hx-get="/ui/partials/balance"
-        hx-trigger="load, refresh from:body"
+        hx-trigger="load, refresh"
         hx-include="#controls"
         hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
         hx-swap="outerHTML"
-      >
+        data-tooltip="Текущий equity в USDT и лимиты риск-менеджмента.">
         <div class="text-sm text-gray-500">Загрузка баланса…</div>
       </section>
 
       <!-- Positions -->
-      <section
-        id="positions"
+      <section id="positions-container"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
         hx-get="/ui/partials/positions"
-        hx-trigger="load, refresh from:body"
+        hx-trigger="load, refresh"
         hx-include="#controls"
         hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
         hx-swap="outerHTML"
-      >
+        data-tooltip="Список открытых позиций.">
         <div class="text-sm text-gray-500">Загрузка позиций…</div>
       </section>
 
       <!-- Orders -->
-      <section
-        id="orders"
+      <section id="orders-container"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
         hx-get="/ui/partials/orders"
-        hx-trigger="load, refresh from:body"
+        hx-trigger="load, refresh"
         hx-include="#controls"
         hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
         hx-swap="outerHTML"
-      >
+        data-tooltip="Последние ордера из БД.">
         <div class="text-sm text-gray-500">Загрузка журнала ордеров…</div>
       </section>
 
       <!-- Metrics -->
-      <section
-        id="metrics"
+      <section id="metrics-container"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
         hx-get="/ui/partials/metrics"
-        hx-trigger="load, refresh from:body"
+        hx-trigger="load, refresh"
         hx-include="#controls"
         hx-params="mode,testnet"
         hx-indicator=".htmx-indicator"
         hx-swap="outerHTML"
-      >
+        data-tooltip="Sharpe и волатильность BTCUSDT/1h.">
         <div class="text-sm text-gray-500">Загрузка метрик…</div>
       </section>
     </div>
@@ -170,152 +179,110 @@
   <div id="toast-root" class="fixed z-50 top-4 right-4 space-y-2 pointer-events-none"></div>
 
   <script>
-    // ------------------------
-    // Persistence (localStorage)
-    // ------------------------
-    const LS_KEYS = {
-      mode: 'ui.mode',
-      testnet: 'ui.testnet',
-      refreshSec: 'ui.refreshSec',
-      theme: 'ui.theme', // 'light' | 'dark'
-    };
-
-    function lsGet(k, def) { try { const v = localStorage.getItem(k); return v === null ? def : v; } catch { return def; } }
-    function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
-
-    function initControlsFromStorage() {
-      document.getElementById('mode').value = lsGet(LS_KEYS.mode, 'binance');
-      document.getElementById('testnet').value = lsGet(LS_KEYS.testnet, 'true');
+    // ------------------------ Persistence ------------------------
+    const LS_KEYS = { mode:'ui.mode', testnet:'ui.testnet', refreshSec:'ui.refreshSec', theme:'ui.theme' };
+    const lsGet=(k,d)=>{ try{ const v=localStorage.getItem(k); return v===null?d:v }catch{return d} }
+    const lsSet=(k,v)=>{ try{ localStorage.setItem(k,v) }catch{} }
+    function initControlsFromStorage(){
+      document.getElementById('mode').value     = lsGet(LS_KEYS.mode, 'binance');
+      document.getElementById('testnet').value  = lsGet(LS_KEYS.testnet, 'true');
       document.getElementById('refreshSec').value = lsGet(LS_KEYS.refreshSec, '10');
-
-      // theme
-      const theme = lsGet(LS_KEYS.theme, 'light');
-      applyTheme(theme);
+      applyTheme(lsGet(LS_KEYS.theme, 'light'));
     }
-
-    function persistControls() {
-      lsSet(LS_KEYS.mode, document.getElementById('mode').value);
-      lsSet(LS_KEYS.testnet, document.getElementById('testnet').value);
+    function persistControls(){
+      lsSet(LS_KEYS.mode,     document.getElementById('mode').value);
+      lsSet(LS_KEYS.testnet,  document.getElementById('testnet').value);
       lsSet(LS_KEYS.refreshSec, document.getElementById('refreshSec').value);
     }
 
-    // ------------------------
-    // Theme
-    // ------------------------
-    function applyTheme(mode) {
-      const html = document.documentElement;
-      const body = document.body;
-      const dark = (mode === 'dark');
-      html.classList.toggle('dark', dark);
-      body.classList.toggle('bg-gray-900', dark);
-      body.classList.toggle('text-gray-100', dark);
-
-      // Темная тема для секций (включая подменённые HTMX)
-      document.querySelectorAll('section, #controls').forEach(el => {
-        el.classList.toggle('bg-gray-800', dark);
-        el.classList.toggle('border-gray-700', dark);
+    // ------------------------ Theme ------------------------
+    function applyTheme(mode){
+      const html=document.documentElement, body=document.body, dark=(mode==='dark');
+      html.classList.toggle('dark',dark);
+      body.classList.toggle('bg-gray-900',dark);
+      body.classList.toggle('text-gray-100',dark);
+      document.querySelectorAll('section, #controls').forEach(el=>{
+        el.classList.toggle('bg-gray-800',dark);
+        el.classList.toggle('border-gray-700',dark);
       });
     }
-
-    document.getElementById('btnTheme').addEventListener('click', () => {
-      const cur = lsGet(LS_KEYS.theme, 'light');
-      const next = cur === 'dark' ? 'light' : 'dark';
-      lsSet(LS_KEYS.theme, next);
-      applyTheme(next);
+    document.getElementById('btnTheme').addEventListener('click',()=>{
+      const cur=lsGet(LS_KEYS.theme,'light'); const next=(cur==='dark'?'light':'dark');
+      lsSet(LS_KEYS.theme,next); applyTheme(next);
     });
 
-    // ------------------------
-    // HTMX helpers
-    // ------------------------
-    function setSectionInterval(id, sec) {
-      const el = document.getElementById(id);
-      if (!el) return;
-      // важно сохранять custom-триггер 'refresh from:body'
-      const base = 'load, refresh from:body';
-      el.setAttribute('hx-trigger', sec > 0 ? `${base}, every ${sec}s` : base);
+    // ------------------------ Intervals & refresh ------------------------
+    function setSectionInterval(id, sec){
+      const el=document.getElementById(id); if(!el) return;
+      const base='load, refresh';
+      el.setAttribute('hx-trigger', sec>0 ? `${base}, every ${sec}s` : base);
     }
-
-    function applyIntervals() {
-      const sec = parseInt(document.getElementById('refreshSec').value || '10', 10);
-      ['balance','positions','orders','metrics'].forEach(id => setSectionInterval(id, sec));
+    function applyIntervals(){
+      const sec=parseInt(document.getElementById('refreshSec').value||'10',10);
+      ['balance-container','positions-container','orders-container','metrics-container'].forEach(id=>setSectionInterval(id,sec));
       persistControls();
       refreshAll();
     }
-
-    // Ключевой фикс: триггерим одно событие на body → все секции сами перезапросятся
-    function refreshAll() {
-      htmx.trigger(document.body, 'refresh');
-    }
-
-    // Persist + actions on changes
-    ['mode','testnet','refreshSec'].forEach(id => {
-      const el = document.getElementById(id);
-      el.addEventListener('change', () => {
-        persistControls();
-        if (id === 'refreshSec') applyIntervals();
-        else refreshAll();
+    function refreshAll(){
+      ['balance-container','positions-container','orders-container','metrics-container'].forEach(id=>{
+        const el=document.getElementById(id);
+        if (el && window.htmx && htmx.trigger) { htmx.trigger(el,'refresh'); }
       });
+    }
+
+    // controls -> change
+    ['mode','testnet','refreshSec'].forEach(id=>{
+      const el=document.getElementById(id);
+      if (!el) return;
+      el.addEventListener('change',()=>{ (id==='refreshSec') ? applyIntervals() : (persistControls(), refreshAll()); });
     });
 
-    // ------------------------
-    // Toasts
-    // ------------------------
-    function showToast(msg, kind='error') {
-      const root = document.getElementById('toast-root');
-      const div = document.createElement('div');
-      div.className =
-        'toast toast-enter max-w-sm w-80 px-3 py-2 rounded shadow border ' +
-        (kind === 'error'
-          ? 'bg-red-50 border-red-200 text-red-800'
-          : 'bg-emerald-50 border-emerald-200 text-emerald-800');
+    // ------------------------ Tooltips ------------------------
+    (function initTooltips(){
+      const tip = document.createElement('div'); tip.className = 'tooltip'; document.body.appendChild(tip);
+      let timerHide=null, currentTarget=null;
+      const show=(el,x,y)=>{
+        tip.innerHTML=(el.getAttribute('data-tooltip')||'').replace(/\n\s+/g,' ').trim();
+        const rect=tip.getBoundingClientRect(), off=12, vw=innerWidth, vh=innerHeight;
+        let left=x+off, top=y+off;
+        if (left+rect.width+16>vw) left=vw-rect.width-16; if (top+rect.height+16>vh) top=vh-rect.height-16;
+        if (left<8) left=8; if (top<8) top=8; tip.style.left=left+'px'; tip.style.top=top+'px'; tip.classList.add('show');
+      };
+      const hideSoon=()=>{ clearTimeout(timerHide); timerHide=setTimeout(()=>tip.classList.remove('show'),100); };
+      document.body.addEventListener('mousemove', e=>{ if (currentTarget) show(currentTarget,e.clientX,e.clientY); });
+      document.body.addEventListener('mouseover', e=>{ const el=e.target.closest('[data-tooltip]'); if (!el) return; currentTarget=el; show(el,e.clientX,e.clientY); });
+      document.body.addEventListener('mouseout', e=>{ if (currentTarget && !e.relatedTarget?.closest('[data-tooltip]')) { currentTarget=null; hideSoon(); } });
+      document.body.addEventListener('focusin', e=>{ const el=e.target.closest('[data-tooltip]'); if (!el) return; currentTarget=el; const r=el.getBoundingClientRect(); show(el,r.right,r.top); });
+      document.body.addEventListener('focusout', e=>{ if (currentTarget && !e.relatedTarget?.closest('[data-tooltip]')) { currentTarget=null; hideSoon(); } });
+      document.body.addEventListener('htmx:afterSwap', ()=>{ currentTarget=null; tip.classList.remove('show'); });
+    })();
 
-      div.innerHTML = `<div class="text-sm">${escapeHtml(msg)}</div>`;
-      root.appendChild(div);
-
-      requestAnimationFrame(() => div.classList.remove('toast-enter')); // animate in
-      setTimeout(() => { // auto close
-        div.classList.add('toast-exit');
-        setTimeout(() => div.remove(), 180);
-      }, 3000);
+    // ------------------------ HTMX hooks ------------------------
+    function showToast(msg, kind='error'){
+      const root=document.getElementById('toast-root'); if (!root) return;
+      const div=document.createElement('div');
+      div.className='toast toast-enter max-w-sm w-80 px-3 py-2 rounded shadow border '+
+        (kind==='error'?'bg-red-50 border-red-200 text-red-800':'bg-emerald-50 border-emerald-200 text-emerald-800');
+      div.innerHTML=`<div class="text-sm">${String(msg)}</div>`; root.appendChild(div);
+      requestAnimationFrame(()=>div.classList.remove('toast-enter'));
+      setTimeout(()=>{ div.classList.add('toast-exit'); setTimeout(()=>div.remove(),180); },3000);
     }
+    const showGlobalError=(m)=>{ const e=document.getElementById('global-error'); if(!e) return; e.textContent=m; e.style.display='block'; setTimeout(()=>e.style.display='none',5000); };
 
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, m => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
-      }[m]));
-    }
-
-    // ------------------------
-    // HTMX error & post-swap hooks
-    // ------------------------
-    document.body.addEventListener('htmx:responseError', (e) => {
+    document.addEventListener('htmx:responseError', e=>{
       const status = e.detail.xhr ? e.detail.xhr.status : '???';
-      showToast(`Ошибка загрузки (${status}). Проверь API/параметры.`, 'error');
+      showToast(`Ошибка загрузки (${status}). Проверь API/параметры.`,'error'); showGlobalError(`Ошибка загрузки (${status}).`);
     });
-    document.body.addEventListener('htmx:sendError', () => {
-      showToast('Сеть недоступна (sendError).', 'error');
-    });
-    document.body.addEventListener('htmx:timeout', () => {
-      showToast('Таймаут запроса.', 'error');
-    });
+    document.addEventListener('htmx:sendError', ()=>{ showToast('Сеть недоступна (sendError).','error'); showGlobalError('Ошибка сети.'); });
+    document.addEventListener('htmx:timeout',   ()=> showToast('Таймаут запроса.','error'));
+    document.addEventListener('htmx:swapError', ()=> showToast('Ошибка при обновлении содержимого.','error'));
+    document.addEventListener('htmx:afterSwap', ()=>{ applyTheme(lsGet(LS_KEYS.theme,'light')); });
 
-    // После любого swap — повторно применяем тему к новому DOM
-    document.body.addEventListener('htmx:afterSwap', () => {
-      const theme = lsGet(LS_KEYS.theme, 'light');
-      applyTheme(theme);
-    });
+    window.addEventListener('offline', ()=>{ showToast('Вы офлайн.','error'); showGlobalError('Нет подключения к интернету.'); });
+    window.addEventListener('online',  ()=> showToast('Соединение восстановлено.','ok'));
 
-    // Online/offline hints
-    window.addEventListener('offline', () => showToast('Вы офлайн.', 'error'));
-    window.addEventListener('online',  () => showToast('Соединение восстановлено.', 'ok'));
-
-    // ------------------------
-    // Boot
-    // ------------------------
-    document.addEventListener('DOMContentLoaded', () => {
-      initControlsFromStorage();
-      applyIntervals(); // sets triggers + kicks first refresh
-    });
+    // boot
+    document.addEventListener('DOMContentLoaded', ()=>{ initControlsFromStorage(); applyIntervals(); });
   </script>
 
   <noscript>

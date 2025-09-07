@@ -1,23 +1,44 @@
-<div id="balance" class="bg-white shadow rounded p-4">
-  <h2 class="text-xl font-semibold mb-2">Баланс</h2>
+<section id="balance-container"
+  class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
+  hx-get="/ui/partials/balance"
+  hx-trigger="refresh"
+  hx-include="#controls"
+  hx-params="mode,testnet"
+  hx-indicator=".htmx-indicator"
+  hx-swap="outerHTML">
 
-  <p>
-    <strong>Equity:</strong>
-    {{ bal.equity_usdt or 'N/A' }} USDT
-  </p>
+  {% if bal %}
+    <h2 class="text-lg font-semibold mb-2">Баланс ({{ bal.exchange }})</h2>
 
-  <p>
-    <strong>Daily Start:</strong>
-    {{ bal.risk.daily_start_equity }}
-  </p>
+    <div class="space-y-1">
+      <div><span class="font-medium">Equity USDT:</span>
+        {% if bal.equity_usdt is not none %}
+          {{ '%.2f'|format(bal.equity_usdt) }}
+        {% else %}
+          — 
+          <span class="text-xs text-gray-500">
+            нет данных от бэкенда{% if bal.exchange == 'sim' %} (симулятор){% endif %}
+          </span>
+        {% endif %}
+      </div>
 
-  <p>
-    <strong>Daily Max Loss:</strong>
-    {{ (bal.risk.daily_max_loss_pct * 100) | round(2) }}%
-  </p>
+      <div class="mt-3 font-medium">Лимиты риска:</div>
+      <ul class="list-disc ml-5 text-sm">
+        <li>Начальный equity: {{ bal.risk.daily_start_equity if bal.risk.daily_start_equity is not none else '—' }}</li>
+        <li>Макс. убыток (%): {{ bal.risk.daily_max_loss_pct if bal.risk.daily_max_loss_pct is not none else '—' }}</li>
+        <li>Макс. сделок в день: {{ bal.risk.max_trades_per_day if bal.risk.max_trades_per_day is not none else '—' }}</li>
+        <li>Экспозиция: {{ bal.risk.exposure if bal.risk.exposure is not none else 0 }}</li>
+        <li>Плечо: {{ bal.risk.leverage if bal.risk.leverage is not none else 0 }}</li>
+      </ul>
 
-  <p>
-    <strong>Trades Limit:</strong>
-    {{ bal.risk.max_trades_per_day }}
-  </p>
-</div>
+      {% if bal.exchange == 'sim' and bal.equity_usdt is none %}
+        <div class="mt-3 text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded p-2">
+          Сим-режим не вернул equity. Проверьте, что симулятор отдаёт поле <code>equity_usdt</code>
+          (или <code>equity</code>/<code>cash</code>) в ответе <code>/trading_exec/get_balance</code>.
+        </div>
+      {% endif %}
+    </div>
+  {% else %}
+    <p class="text-gray-500">Баланс не получен</p>
+  {% endif %}
+</section>
