@@ -7,28 +7,30 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import AsyncIterator, Optional, Callable, Awaitable, Tuple
 
+from dotenv import load_dotenv, dotenv_values
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
-    create_async_engine,
-    async_sessionmaker,
     AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import event, text
-from dotenv import load_dotenv, dotenv_values
-
 
 # ──────────────────────────────────────────────────────────────────────────────
-# .env: ищем configs/.env, затем .env в корне проекта; чиним BOM/пробелы
+# Пути/окружение
 # ──────────────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../ai_trader
 
 
 def _load_env_robust() -> Optional[Path]:
+    """
+    Ищем .env сначала в configs/.env, затем в корне проекта.
+    Чиним BOM и лишние пробелы в ключах.
+    """
     for p in (PROJECT_ROOT / "configs" / ".env", PROJECT_ROOT / ".env"):
         if p.exists():
             load_dotenv(p.as_posix(), override=True, encoding="utf-8")
-            # Доп. починка (BOM/пробелы в ключах)
             for k, v in (dotenv_values(p, encoding="utf-8") or {}).items():
                 if k is None or v is None:
                     continue
@@ -38,7 +40,6 @@ def _load_env_robust() -> Optional[Path]:
 
 
 ENV_PATH = _load_env_robust()
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV helpers
@@ -63,9 +64,9 @@ def env_str(name: str, default: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Конфигурация БД (нормализация + фолбэк)
+# Конфигурация БД
 #  - SQLite (aiosqlite) по умолчанию в data/ai_trader.db (АБСОЛЮТНЫЙ путь)
-#  - Поддержка PostgreSQL/TimescaleDB (asyncpg): postgresql+asyncpg://user:pass@host:5432/db
+#  - PostgreSQL/TimescaleDB (asyncpg)
 # ──────────────────────────────────────────────────────────────────────────────
 def _default_db_url() -> str:
     """Абсолютный путь к SQLite внутри проекта; гарантируем существование каталога."""
@@ -76,11 +77,10 @@ def _default_db_url() -> str:
 
 def _normalize_db_url(raw: Optional[str]) -> str:
     """
-    Чиним популярные кейсы и отбрасываем явный мусор.
+    Нормализация популярных вариантов:
       - sqlite:// → sqlite+aiosqlite://
-      - если после замены '+' на '.' в 'dialect+driver' больше одной точки → фолбэк
-      - для SQLite приводим путь к АБСОЛЮТНОМУ и создаём каталог
-      - поддерживаем :memory:
+      - для SQLite — абсолютный путь; поддержка :memory:
+      - грубая валидация «dialect+driver»; при мусоре → дефолтная SQLite
     """
     if not raw:
         return _default_db_url()
@@ -93,15 +93,13 @@ def _normalize_db_url(raw: Optional[str]) -> str:
     elif url.startswith("sqlite://") and not url.startswith("sqlite+aiosqlite://"):
         url = url.replace("sqlite://", "sqlite+aiosqlite://")
 
-    # Грубая валидация «головы» URL до ://
-    head = url.split("://", 1)[0]  # например: sqlite+aiosqlite
+    # Грубая валидация головы URL
+    head = url.split("://", 1)[0]  # например sqlite+aiosqlite
     if head.replace("+", ".").count(".") > 1:
-        # слишком много точек → точно мусор → фолбэк на дефолтную SQLite
         return _default_db_url()
 
-    # Для SQLite: обеспечить абсолютный путь (не для :memory:)
+    # SQLite: абсолютный путь (кроме :memory:)
     if head.startswith("sqlite+aiosqlite"):
-        # выровнять на тройной слэш
         if url.startswith("sqlite+aiosqlite://:memory:"):
             return url.replace("sqlite+aiosqlite://:memory:", "sqlite+aiosqlite:///:memory:")
 
@@ -126,33 +124,32 @@ def _normalize_db_url(raw: Optional[str]) -> str:
 DB_URL = _normalize_db_url(os.getenv("DB_URL"))
 DB_ECHO = env_bool("DB_ECHO", False)
 
-# Определение диалекта из URL (после нормализации)
+# Диалектные флаги (после нормализации)
 IS_SQLITE = DB_URL.startswith("sqlite+aiosqlite://")
 IS_POSTGRES = DB_URL.startswith("postgresql+asyncpg://") or DB_URL.startswith("postgres+asyncpg://")
 
-# PostgreSQL тюнинги (применим только если используется postgres)
+# PostgreSQL тюнинг
 PG_STATEMENT_TIMEOUT_MS = env_int("PG_STATEMENT_TIMEOUT_MS", 0)  # 0 = off
-PG_LOCK_TIMEOUT_MS = env_int("PG_LOCK_TIMEOUT_MS", 0)            # 0 = off
+PG_LOCK_TIMEOUT_MS = env_int("PG_LOCK_TIMEOUT_MS", 0)
 PG_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS = env_int("PG_IDLE_IN_XACT_TIMEOUT_MS", 0)
 PG_TIMEZONE = env_str("PG_TIMEZONE", "UTC")
-PG_ENABLE_TIMESCALE = env_bool("PG_ENABLE_TIMESCALE", False)     # CREATE EXTENSION IF NOT EXISTS timescaledb;
+PG_ENABLE_TIMESCALE = env_bool("PG_ENABLE_TIMESCALE", False)
 
-# SQLite тюнинги/PRAGMA
+# SQLite PRAGMA/кэш
 SQLITE_WAL = env_bool("SQLITE_WAL", True)
 SQLITE_SYNC_NORMAL = env_bool("SQLITE_SYNC_NORMAL", True)
 SQLITE_FOREIGN_KEYS = env_bool("SQLITE_FOREIGN_KEYS", True)
 SQLITE_TEMP_STORE = os.getenv("SQLITE_TEMP_STORE", "memory").strip().lower()  # memory|file
-SQLITE_CACHE_SIZE = os.getenv("SQLITE_CACHE_SIZE", "-20000")  # отрицательное => КБ (напр. -20000 ~ 20MB)
+SQLITE_CACHE_SIZE = os.getenv("SQLITE_CACHE_SIZE", "-20000")  # отрицательное => КБ
 
-# Периодические снапшоты SQLite (работают только для файловой БД)
+# Периодические снапшоты SQLite (для файловой БД)
 SQLITE_SNAPSHOT_ENABLED = env_bool("SQLITE_SNAPSHOT_ENABLED", False)
 SQLITE_SNAPSHOT_DIR = Path(env_str("SQLITE_SNAPSHOT_DIR", (PROJECT_ROOT / "data" / "sqlite_snaps").as_posix()))
-SQLITE_SNAPSHOT_INTERVAL_SEC = env_int("SQLITE_SNAPSHOT_INTERVAL_SEC", 3600)  # по умолчанию – час
-SQLITE_SNAPSHOT_RETENTION = env_int("SQLITE_SNAPSHOT_RETENTION", 14)          # дней хранения
-
+SQLITE_SNAPSHOT_INTERVAL_SEC = env_int("SQLITE_SNAPSHOT_INTERVAL_SEC", 3600)
+SQLITE_SNAPSHOT_RETENTION = env_int("SQLITE_SNAPSHOT_RETENTION", 14)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Базовая мета-модель
+# Declarative Base
 # ──────────────────────────────────────────────────────────────────────────────
 class Base(DeclarativeBase):
     """Базовый класс моделей. Наследуйтесь от него в db.models*."""
@@ -160,11 +157,14 @@ class Base(DeclarativeBase):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Создание движка с разными тюнингами для SQLite/PostgreSQL (с фолбэком)
+# Создание движка
 # ──────────────────────────────────────────────────────────────────────────────
 def _build_engine() -> AsyncEngine:
-    # ВАЖНО: объявляем global до любого обращения к именам
-    global DB_URL, IS_SQLITE, IS_POSTGRES
+    """
+    Создаёт AsyncEngine с безопасным фолбэком на локальную SQLite при ошибке URL.
+    Вешает диалект-специфичные слушатели connect() (PRAGMA/SET ...).
+    """
+    global DB_URL, IS_SQLITE, IS_POSTGRES  # переопределяем при фолбэке
 
     kwargs = dict(
         future=True,
@@ -175,7 +175,7 @@ def _build_engine() -> AsyncEngine:
     try:
         engine_ = create_async_engine(DB_URL, **kwargs)
     except Exception:
-        # страховка от ошибок парсинга/регистрации диалекта
+        # страховка от ошибок парсинга/драйвера
         safe_url = _default_db_url()
         DB_URL = safe_url
         os.environ["DB_URL"] = safe_url
@@ -183,7 +183,6 @@ def _build_engine() -> AsyncEngine:
         IS_POSTGRES = False
         engine_ = create_async_engine(safe_url, **kwargs)
 
-    # Навешиваем слушатели исходя из фактического backend-а движка
     backend = engine_.url.get_backend_name()
 
     if backend.startswith("sqlite"):
@@ -228,12 +227,11 @@ def _build_engine() -> AsyncEngine:
 engine: AsyncEngine = _build_engine()
 
 # Основная фабрика сессий
-AsyncSessionLocal = async_sessionmaker(
+AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
     engine,
     expire_on_commit=False,
     class_=AsyncSession,
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI DI
@@ -247,7 +245,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Стартап-инициализация: схема/PRAGMA/расширения + лёгкая миграция ohlcv
+# Стартап-инициализация: PRAGMA/расширения + лёгкая миграция ohlcv + create_all
 # ──────────────────────────────────────────────────────────────────────────────
 def _is_memory_sqlite(url: str) -> bool:
     return url.endswith(":memory:") or url.endswith(":memory:?cache=shared")
@@ -256,21 +254,18 @@ def _is_memory_sqlite(url: str) -> bool:
 async def apply_startup_pragmas_and_schema() -> None:
     """
     Вызывайте один раз на старте приложения (например, в lifespan FastAPI).
-    Делает:
       • SQLite: PRAGMA journal_mode=WAL (если не :memory:), synchronous, FK, temp_store, cache_size.
-      • PostgreSQL: SET timezone/statement_timeout/lock_timeout на соединении;
-                    опционально CREATE EXTENSION IF NOT EXISTS timescaledb.
-      • Лёгкая миграция SQLite-таблицы ohlcv (добавляем source/asset/tf и уникальный индекс).
-      • Создаёт таблицы (Base.metadata.create_all) для обоих диалектов, если не используете Alembic.
+      • PostgreSQL: SET timezone/statement_timeout/lock_timeout; опц. TimescaleDB.
+      • Лёгкая миграция SQLite-таблицы ohlcv: добавление source/asset/tf + уникальный индекс (source,asset,tf,ts).
+      • Создание таблиц: Base.metadata.create_all (если не используете Alembic).
     """
-    # Создаём директорию для файловой SQLite (на случай, если окружение менялось после импорта)
+    # Гарантируем каталог для файловой SQLite
     if IS_SQLITE and DB_URL.startswith("sqlite+aiosqlite:///"):
         path_str = DB_URL.replace("sqlite+aiosqlite:///", "")
         if path_str and not path_str.startswith(":memory:"):
             Path(path_str).parent.mkdir(parents=True, exist_ok=True)
 
     async with engine.begin() as conn:
-        # Диалект-специфика
         if IS_SQLITE:
             # PRAGMA
             if not _is_memory_sqlite(DB_URL) and SQLITE_WAL:
@@ -287,62 +282,52 @@ async def apply_startup_pragmas_and_schema() -> None:
             except Exception:
                 pass
 
-            # --- SQLite: прогрев схемы/миграция ohlcv --------------------------------
+            # Лёгкая миграция ohlcv (если таблица уже есть)
             try:
-                # Есть ли таблица?
                 res = await conn.exec_driver_sql(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='ohlcv';"
                 )
                 row = await res.first()
                 if row:
-                    # Какие колонки уже есть?
                     cols_res = await conn.exec_driver_sql("PRAGMA table_info('ohlcv');")
                     cols = [r[1] for r in await cols_res.fetchall()]  # r[1] = name
-                    to_add = []
+                    alter_stmts = []
                     if "source" not in cols:
-                        to_add.append("ALTER TABLE ohlcv ADD COLUMN source TEXT DEFAULT 'binance'")
+                        alter_stmts.append("ALTER TABLE ohlcv ADD COLUMN source TEXT DEFAULT 'binance'")
                     if "asset" not in cols:
-                        to_add.append("ALTER TABLE ohlcv ADD COLUMN asset TEXT DEFAULT ''")
+                        alter_stmts.append("ALTER TABLE ohlcv ADD COLUMN asset TEXT DEFAULT ''")
                     if "tf" not in cols:
-                        to_add.append("ALTER TABLE ohlcv ADD COLUMN tf TEXT DEFAULT '1h'")
-
-                    for stmt in to_add:
+                        alter_stmts.append("ALTER TABLE ohlcv ADD COLUMN tf TEXT DEFAULT '1h'")
+                    for stmt in alter_stmts:
                         try:
                             await conn.exec_driver_sql(stmt + ";")
                         except Exception:
-                            # если колонка уже есть (гонка) — пропускаем
-                            pass
+                            pass  # гонка/повтор — игнор
 
-                    # Уникальный индекс для upsert'а на (source, asset, tf, ts)
                     await conn.exec_driver_sql(
                         "CREATE UNIQUE INDEX IF NOT EXISTS idx_ohlcv_unique ON ohlcv (source, asset, tf, ts);"
                     )
             except Exception:
-                # не валим старт — это best-effort миграция
-                pass
+                pass  # best-effort миграция
 
         if IS_POSTGRES:
-            # Опционально включим TimescaleDB (если требуется)
             if PG_ENABLE_TIMESCALE:
                 try:
                     await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb;"))
                 except Exception:
-                    # на некоторых managed-провайдерах расширение включается иначе — игнорируем ошибку
                     pass
-
-            # Принудительная таймзона в рамках этого соединения (на случай, если слушатель не сработал)
             if PG_TIMEZONE:
                 try:
                     await conn.execute(text(f"SET TIME ZONE '{PG_TIMEZONE}';"))
                 except Exception:
                     pass
 
-        # Схема (если не используете Alembic — это создаст таблицы)
+        # Создание таблиц (если без Alembic)
         await conn.run_sync(Base.metadata.create_all)
 
 
+# Синоним
 async def init_db_schema() -> None:
-    """Синоним apply_startup_pragmas_and_schema()."""
     await apply_startup_pragmas_and_schema()
 
 
@@ -369,7 +354,7 @@ async def db_healthcheck() -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Удобный контекст для unit-тестов (in-memory SQLite)
+# Утилиты для unit-тестов (in-memory SQLite)
 # ──────────────────────────────────────────────────────────────────────────────
 def make_test_engine_and_session(
     url: str = "sqlite+aiosqlite:///:memory:",
@@ -391,7 +376,7 @@ def make_test_engine_and_session(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Периодические снапшоты SQLite (VACUUM INTO) + чекпоинт WAL
+# Периодические снапшоты SQLite (VACUUM INTO) + checkpoint WAL
 # ──────────────────────────────────────────────────────────────────────────────
 _snapshot_task: Optional[asyncio.Task] = None
 
@@ -402,9 +387,8 @@ async def _sqlite_take_snapshot_once(
     retention_days: int,
 ) -> Optional[Path]:
     """
-    Делает «горячий» снапшот файловой SQLite через VACUUM INTO (SQLite >= 3.27).
-    Также выполняет WAL checkpoint(TRUNCATE), чтобы ограничивать рост -wal файла.
-    Возвращает путь к созданному .db (или None, если не SQLite/не файловая БД).
+    «Горячий» снапшот файловой SQLite через VACUUM INTO (SQLite ≥ 3.27).
+    Делает wal_checkpoint(TRUNCATE) перед VACUUM, чистит старые снапшоты.
     """
     if not IS_SQLITE or _is_memory_sqlite(DB_URL):
         return None
@@ -420,10 +404,7 @@ async def _sqlite_take_snapshot_once(
         except Exception:
             pass
 
-        try:
-            await conn.exec_driver_sql(f"VACUUM INTO '{out_path.as_posix()}';")
-        except Exception as e:
-            raise e
+        await conn.exec_driver_sql(f"VACUUM INTO '{out_path.as_posix()}';")
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, retention_days))
     for f in dest_dir.glob(f"{db_path.stem}.*.db"):
@@ -456,6 +437,7 @@ async def _sqlite_snapshot_loop(
                 continue
             break
     finally:
+        # На выходе ещё раз чекпоинт
         try:
             async with engine.begin() as conn:
                 await conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -471,7 +453,7 @@ def start_sqlite_snapshot_task(
 ) -> Optional[Callable[[], Awaitable[None]]]:
     """
     Запускает фоновую задачу периодических снапшотов SQLite.
-    Возвращает асинхронный "stop" колбэк, который корректно останавливает задачу.
+    Возвращает асинхронный stop()-колбэк для корректной остановки.
     Ничего не делает для PostgreSQL или in-memory SQLite.
     """
     global _snapshot_task
@@ -525,4 +507,8 @@ __all__ = [
     "db_healthcheck",
     "make_test_engine_and_session",
     "start_sqlite_snapshot_task",
+    # Дополнительно экспортируем диалектные флаги — удобно для логов/диагностики
+    "IS_SQLITE",
+    "IS_POSTGRES",
+    "DB_URL",
 ]

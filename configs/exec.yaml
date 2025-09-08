@@ -10,7 +10,13 @@ binance:
   timeout: 60             
   max_retries: 7          
   backoff_base: 0.75      
-  backoff_cap: 12         
+  backoff_cap: 12   
+
+ohlcv_storage:
+  enabled: true
+  symbols: [BTCUSDT]
+  intervals: [1h]
+      
 
 sim:
   starting_balance_usdt: 10000

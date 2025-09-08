@@ -447,16 +447,19 @@ async def _estimate_equity_usdt(executor) -> float:
         # не падаем
         pass
 
-    # 2) Стейблы считаем сразу
+    # 2) Стейблы — сразу в USDT
     total = 0.0
     for ccy in _STABLES:
-        total += free_map.get(ccy, 0.0) + locked_map.get(ccy, 0.0)
+        if ccy in free_map or ccy in locked_map:
+            free = free_map.get(ccy, 0.0)
+            locked = locked_map.get(ccy, 0.0)
+            total += free + locked
 
-    # 3) Если других активов нет — вернули сумму стейблов
-    assets = (set(free_map.keys()) | set(locked_map.keys())) - _STABLES
-    assets = {a for a in assets if (free_map.get(a, 0.0) + locked_map.get(a, 0.0)) > 0.0}
-    if not assets:
-        return float(total)
+        # 3) Если других активов нет — вернули сумму стейблов
+        assets = (set(free_map.keys()) | set(locked_map.keys())) - _STABLES
+        assets = {a for a in assets if (free_map.get(a, 0.0) + locked_map.get(a, 0.0)) > 0.0}
+        if not assets:
+            return float(total)
 
     # 4) Берём батч всех цен и строим множество существующих USDT-символов
     prices_map: Dict[str, float] = {}
@@ -681,20 +684,35 @@ async def list_positions_data(mode: Literal["binance", "sim"] = "binance", testn
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="positions timeout")
 
-# ai_trader/routers/trading_exec.py  (функция balance_data)
+# ai_trader/routers/trading_exec.py
 async def balance_data(mode: Literal["binance", "sim"] = "binance", testnet: bool = True, fast: bool = False):
     ex = _select_executor(mode, testnet)
     try:
         async with asyncio.timeout(min(15.0, DEFAULT_OP_TIMEOUT)):
             bal = await ex.fetch_balance()
-            equity: Optional[float] = None
+            equity: float = 0.0
+
             if not fast:
                 try:
                     equity = await _estimate_equity_usdt(ex)
                 except Exception:
-                    equity = 0.0  # ← вместо None
+                    equity = 0.0
             else:
-                equity = 0.0     # ← fast-режим тоже отдаём число
+                equity = 0.0
+
+            # 🔥 Fallback: если equity == 0, пробуем взять просто free USDT из bal
+            if (equity is None) or (equity == 0.0):
+                if isinstance(bal, dict):
+                    if isinstance(bal.get("balances"), list):
+                        for b in bal["balances"]:
+                            if str(b.get("asset")).upper() == "USDT":
+                                try:
+                                    equity = float(b.get("free", 0.0)) + float(b.get("locked", 0.0))
+                                except Exception:
+                                    pass
+                                break
+                    elif "USDT" in bal.get("free", {}):
+                        equity = float(bal["free"].get("USDT", 0.0))
 
             risk_cfg = load_risk_config()
             state = ensure_day(
@@ -705,7 +723,7 @@ async def balance_data(mode: Literal["binance", "sim"] = "binance", testnet: boo
             base = bal if isinstance(bal, dict) else {}
             out = {
                 **base,
-                "equity_usdt": float(equity or 0.0),  # ← всегда float
+                "equity_usdt": float(equity or 0.0),
                 "risk": {
                     "daily_start_equity": start_of_day_equity(state),
                     "daily_max_loss_pct": getattr(risk_cfg, "daily_max_loss_pct", 0.02),

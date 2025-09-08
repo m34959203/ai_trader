@@ -22,6 +22,40 @@ from fastapi.responses import StreamingResponse, JSONResponse, Response, PlainTe
 # Загрузка котировок (единый интерфейс)
 from .data_loader import get_prices
 
+# БД
+from db.session import engine, Base, apply_startup_pragmas_and_schema, shutdown_engine
+
+# Роутеры (опционально через try/except чтобы не падать на отсутствующем модуле)
+try:
+    from routers.ohlcv_read import router as ohlcv_read_router  # /ohlcv/prices/query
+    _HAS_OHLCV_READ = True
+except Exception:
+    _HAS_OHLCV_READ = False
+
+try:
+    from routers.ohlcv import router as ohlcv_router            # базовые /ohlcv эндпоинты
+    _HAS_OHLCV = True
+except Exception:
+    _HAS_OHLCV = False
+
+try:
+    from routers.trading import router as trading_router        # стратегии/бумажная торговля
+    _HAS_TRADING = True
+except Exception:
+    _HAS_TRADING = False
+
+try:
+    from routers.trading_exec import router as exec_router      # /exec*
+    _HAS_EXEC = True
+except Exception:
+    _HAS_EXEC = False
+
+try:
+    from routers.ui import router as ui_router                  # /ui/*
+    _HAS_UI = True
+except Exception:
+    _HAS_UI = False
+
 # Аналитика (Спринт 2)
 try:
     from .analysis.analyze_market import analyze_market, DEFAULT_CONFIG, AnalysisConfig  # type: ignore
@@ -30,31 +64,13 @@ except Exception:  # pragma: no cover
     DEFAULT_CONFIG = None  # type: ignore
     AnalysisConfig = None  # type: ignore
 
-# БД (схема)
-from db import models          # noqa: F401  # регистрирует таблицы OHLCV
-from db import models_orders   # noqa: F401  # регистрирует таблицу orders
-from db.session import engine, Base
-
-# Роутеры
-from routers.ohlcv import router as ohlcv_router            # /prices/store, /ohlcv, /ohlcv.csv, /ohlcv/count, /ohlcv/stats
-from routers.trading import router as trading_router        # /strategy/*, /paper/*
-from routers.trading_exec import router as exec_router      # /exec/*
-
-# UI (опционально)
-try:
-    from routers.ui import router as ui_router              # /ui/*
-    _HAS_UI = True
-except Exception:  # pragma: no cover
-    _HAS_UI = False
-
-# Сверка (опционально)
+# Потоки рынка / сверка (опционально)
 try:
     from services.reconcile import reconcile_positions, reconcile_periodic  # type: ignore
     _HAS_RECONCILE = True
 except Exception:  # pragma: no cover
     _HAS_RECONCILE = False
 
-# Потоки рынка (опционально)
 try:
     from services.stream_router import StreamRouter, StreamConfig  # type: ignore
     from sources.binance_ws import BinanceWS  # type: ignore
@@ -62,6 +78,20 @@ try:
     _HAS_STREAMS = True
 except Exception:  # pragma: no cover
     _HAS_STREAMS = False
+
+# Фоновые задачи загрузки OHLCV/автотредера (опционально, если есть)
+try:
+    from tasks.ohlcv_loader import background_loop as ohlcv_bg
+    _HAS_OHLCV_BG = True
+except Exception:
+    _HAS_OHLCV_BG = False
+
+try:
+    from tasks.auto_trader import background_loop as auto_bg
+    _HAS_AUTO_BG = True
+except Exception:
+    _HAS_AUTO_BG = False
+
 
 APP_VERSION = os.getenv("APP_VERSION", "0.10.2")
 
@@ -106,10 +136,10 @@ LOG = logging.getLogger("ai_trader.app")
 # Флаги/конфиг
 # ──────────────────────────────────────────────────────────────────────────────
 FEATURES: Dict[str, bool] = {
-    "ohlcv_storage": env_bool("FEATURE_OHLCV", True),
+    "ohlcv_storage": env_bool("FEATURE_OHLCV", True) and (_HAS_OHLCV or _HAS_OHLCV_READ),
     "signals":       env_bool("FEATURE_SIGNALS", True),
-    "paper_trading": env_bool("FEATURE_PAPER", True),
-    "execution_api": env_bool("FEATURE_EXEC", True),
+    "paper_trading": env_bool("FEATURE_PAPER", True) and _HAS_TRADING,
+    "execution_api": env_bool("FEATURE_EXEC", True) and _HAS_EXEC,
     "ui":            env_bool("FEATURE_UI", True) and _HAS_UI,
     "market_ws":     env_bool("FEATURE_MARKET_WS", True) and _HAS_STREAMS,
     "user_ws":       env_bool("FEATURE_USER_WS", True) and _HAS_STREAMS,
@@ -149,9 +179,50 @@ PRAGMA_FK          = env_bool("SQLITE_FOREIGN_KEYS", True)
 # ──────────────────────────────────────────────────────────────────────────────
 # Lifespan: PRAGMA + schema + сверка + WS-задачи
 # ──────────────────────────────────────────────────────────────────────────────
+async def _consume_market_stream(app: FastAPI) -> None:
+    """Читает бары из StreamRouter, обновляет last_event_ts и складывает последние N баров в ring."""
+    assert app.state.stream_router is not None
+    RING_MAX = 1024
+    async for bar in app.state.stream_router.run():
+        app.state.market_last_event_ts = int(time.time())
+        try:
+            app.state.market_ring.append({
+                "asset": bar.asset, "tf": bar.tf, "ts": bar.ts,
+                "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close, "volume": bar.volume,
+            })
+            if len(app.state.market_ring) > RING_MAX:
+                app.state.market_ring = app.state.market_ring[-RING_MAX:]
+        except Exception:
+            pass
+
+async def _consume_user_stream(app: FastAPI) -> None:
+    """Подписка на user data stream (executionReport, account updates)."""
+    assert app.state.user_ws is not None
+    async for evt in app.state.user_ws.start_user():
+        app.state.user_last_event_ts = int(time.time())
+        t = evt.get("type")
+        if t == "executionReport":
+            data = evt.get("data", {})
+            logging.getLogger("ai_trader.exec_report").debug("ExecReport: %s", data)
+
+async def _ws_watchdog(app: FastAPI, heartbeat_sec: int) -> None:
+    """Логирует лаги по событиям в потоках. Не вмешивается в reconnect (это делает клиент)."""
+    interval = max(5, int(heartbeat_sec // 3))
+    while True:
+        await asyncio.sleep(interval)
+        now = int(time.time())
+        if app.state.market_ws_task:
+            lag = now - int(getattr(app.state, "market_last_event_ts", 0) or 0)
+            if lag > heartbeat_sec:
+                LOG.warning("Market WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
+        if app.state.user_ws_task:
+            lag = now - int(getattr(app.state, "user_last_event_ts", 0) or 0)
+            if lag > heartbeat_sec:
+                LOG.warning("User WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup: PRAGMA/схема
     async with engine.begin() as conn:
         if PRAGMA_WAL:
             await conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
@@ -160,6 +231,12 @@ async def lifespan(app: FastAPI):
         if PRAGMA_FK:
             await conn.exec_driver_sql("PRAGMA foreign_keys=ON;")
         await conn.run_sync(Base.metadata.create_all)
+
+    # Дополнительно — штатная инициализация из session.py (таймзона PG, миграции SQLite и т.п.)
+    try:
+        await apply_startup_pragmas_and_schema()
+    except Exception as e:  # pragma: no cover
+        LOG.warning("Startup DB init helper failed: %r", e)
 
     # Разовая сверка при старте (если включена и доступен модуль)
     if RECONCILE_AT_START and _HAS_RECONCILE and FEATURES.get("execution_api", False):
@@ -192,24 +269,6 @@ async def lifespan(app: FastAPI):
     app.state.market_last_event_ts = 0  # unix sec
     app.state.user_last_event_ts   = 0  # unix sec
     app.state.market_ring: List[Dict[str, Any]] = []
-
-    # Периодическая сверка
-    if RECONCILE_PERIODIC and _HAS_RECONCILE and FEATURES.get("execution_api", False):
-        try:
-            app.state.reconcile_task = asyncio.create_task(
-                reconcile_periodic(
-                    interval_sec=max(5, int(RECONCILE_INT_SEC)),
-                    mode=("sim" if RECONCILE_MODE.strip().lower() == "sim" else "binance"),
-                    testnet=RECONCILE_TESTNET,
-                    auto_fix=RECONCILE_AUTO_FIX,
-                    abs_tol=RECONCILE_ABS_TOL,
-                    journal_limit=RECONCILE_JOURNAL_N,
-                    symbols=[s.strip().upper() for s in RECONCILE_SYMBOLS.split(",")] if RECONCILE_SYMBOLS else None,
-                )
-            )
-            LOG.info("Reconcile periodic task started: every %ds", int(RECONCILE_INT_SEC))
-        except Exception as e:  # pragma: no cover
-            LOG.warning("Failed to start reconcile periodic task: %r", e)
 
     # ── MARKET WS TASK ─────────────────────────────────────────────────────
     if FEATURES.get("market_ws", False) and _HAS_STREAMS:
@@ -304,62 +363,10 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         try:
-            await engine.dispose()
+            await shutdown_engine()
         except Exception:  # pragma: no cover
             pass
         LOG.info("Shutdown complete")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Фоновые корутины (market/user/keepalive)
-# ──────────────────────────────────────────────────────────────────────────────
-async def _consume_market_stream(app: FastAPI) -> None:
-    """
-    Читает бары из StreamRouter, обновляет last_event_ts и складывает последние N баров в ring.
-    """
-    assert app.state.stream_router is not None
-    RING_MAX = 1024
-    async for bar in app.state.stream_router.run():
-        app.state.market_last_event_ts = int(time.time())
-        try:
-            app.state.market_ring.append({
-                "asset": bar.asset, "tf": bar.tf, "ts": bar.ts,
-                "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close, "volume": bar.volume,
-            })
-            if len(app.state.market_ring) > RING_MAX:
-                app.state.market_ring = app.state.market_ring[-RING_MAX:]
-        except Exception:
-            pass
-        # Здесь можно: писать OHLCV в БД, дергать обработчики сигналов и т.п.
-
-async def _consume_user_stream(app: FastAPI) -> None:
-    """
-    Подписка на user data stream (executionReport, account updates). Keepalive внутри BinanceWS.
-    """
-    assert app.state.user_ws is not None
-    async for evt in app.state.user_ws.start_user():
-        app.state.user_last_event_ts = int(time.time())
-        t = evt.get("type")
-        if t == "executionReport":
-            data = evt.get("data", {})
-            logging.getLogger("ai_trader.exec_report").debug("ExecReport: %s", data)
-        # outboundAccountPosition / balanceUpdate / accountUpdate — при необходимости
-
-async def _ws_watchdog(app: FastAPI, heartbeat_sec: int) -> None:
-    """
-    Логирует лаги по событиям в потоках. Не вмешивается в reconnect (это делает клиент).
-    """
-    interval = max(5, int(heartbeat_sec // 3))
-    while True:
-        await asyncio.sleep(interval)
-        now = int(time.time())
-        if app.state.market_ws_task:
-            lag = now - int(getattr(app.state, "market_last_event_ts", 0) or 0)
-            if lag > heartbeat_sec:
-                LOG.warning("Market WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
-        if app.state.user_ws_task:
-            lag = now - int(getattr(app.state, "user_last_event_ts", 0) or 0)
-            if lag > heartbeat_sec:
-                LOG.warning("User WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -411,6 +418,16 @@ app = FastAPI(
     docs_url=docs_url,
     redoc_url=redoc_url,
 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background tasks at startup (если модули существуют)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _start_background_tasks():
+    if _HAS_OHLCV_BG:
+        asyncio.create_task(ohlcv_bg())
+    if _HAS_AUTO_BG:
+        asyncio.create_task(auto_bg())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Middlewares: TrustedHost + CORS + GZip
@@ -501,7 +518,7 @@ async def readyz() -> PlainTextResponse:
 async def version() -> Dict[str, Any]:
     return {"version": APP_VERSION}
 
-# Мини-favicon (1×1 PNG), чтобы не видеть 404
+# Мини-favicon (1×1 PNG)
 @app.get("/favicon.ico")
 def favicon() -> Response:
     png_bytes = (
@@ -589,7 +606,7 @@ async def prices(
 # ──────────────────────────────────────────────────────────────────────────────
 # /analyze: единый анализ рынка (использует get_prices + analyze_market)
 # ──────────────────────────────────────────────────────────────────────────────
-if FEATURES["signals"]:
+if env_bool("FEATURE_SIGNALS", True) and analyze_market is not None:
     @app.get("/analyze", tags=["strategy"])
     async def analyze(
         source: Literal["ccxt", "yfinance", "stooq", "alphavantage"] = Query("ccxt"),
@@ -603,9 +620,6 @@ if FEATURES["signals"]:
         buy_th: Optional[int] = Query(None, ge=1, le=99),
         sell_th: Optional[int] = Query(None, ge=1, le=99),
     ) -> JSONResponse:
-        """
-        Стандартизованный анализ рынка: быстрый TF + (опционально) медленный TF для подтверждения.
-        """
         if analyze_market is None:
             raise HTTPException(status_code=500, detail="Analysis module not available")
 
@@ -634,7 +648,7 @@ if FEATURES["signals"]:
         if df_fast is None or df_fast.empty:
             raise HTTPException(status_code=400, detail="No data for fast timeframe")
 
-        # 2) Нормализация под ожидания analyze_market → DatetimeIndex(UTC)
+        # 2) Нормализация → DatetimeIndex(UTC)
         df_fast = _normalize_prices_df(df_fast)
         df_slow = _normalize_prices_df(df_slow) if df_slow is not None else None
         if df_fast is None or not isinstance(df_fast.index, pd.DatetimeIndex):
@@ -674,18 +688,23 @@ if FEATURES["signals"]:
         return JSONResponse(out, headers={"Cache-Control": "no-store"})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Роутеры: OHLCV + Trading + Execution + UI
+# Подключение роутеров
 # ──────────────────────────────────────────────────────────────────────────────
-if FEATURES["ohlcv_storage"]:
-    app.include_router(ohlcv_router, tags=["ohlcv"])
+if _HAS_OHLCV:
+    # routers/ohlcv.py обычно уже содержит prefix="/ohlcv"
+    app.include_router(ohlcv_router)
 
-if FEATURES["signals"] or FEATURES["paper_trading"]:
+if _HAS_OHLCV_READ:
+    # этот — только для дополнительного эндпоинта /ohlcv/prices/query
+    app.include_router(ohlcv_read_router, prefix="/ohlcv")
+
+if _HAS_TRADING:
     app.include_router(trading_router, tags=["strategy", "paper"])
 
-if FEATURES["execution_api"]:
+if _HAS_EXEC:
     app.include_router(exec_router, tags=["exec"])
 
-if FEATURES["ui"] and _HAS_UI:
+if _HAS_UI and FEATURES["ui"]:
     app.include_router(ui_router, tags=["ui"])
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -707,19 +726,13 @@ async def root() -> Dict[str, Any]:
 
     if FEATURES["ohlcv_storage"]:
         endpoints += [
-            "/prices/store",
             "/ohlcv",
-            "/ohlcv.csv",
-            "/ohlcv/count",
-            "/ohlcv/stats",
+            "/ohlcv/prices/query",
         ]
     if FEATURES["signals"] or FEATURES["paper_trading"]:
         endpoints += [
-            "/strategy/signals",
-            "/paper/backtest",
+            "/analyze",
         ]
-        if FEATURES["signals"]:
-            endpoints.append("/analyze")
     if FEATURES["execution_api"]:
         endpoints += [
             "/exec/open",
@@ -734,8 +747,8 @@ async def root() -> Dict[str, Any]:
     # Небольшие runtime-поля для проверки фоновых задач
     now_ts = int(time.time())
     ws_state = {
-        "market_enabled": bool(app.state.market_ws_task),
-        "user_enabled": bool(app.state.user_ws_task),
+        "market_enabled": bool(getattr(app.state, "market_ws_task", None)),
+        "user_enabled": bool(getattr(app.state, "user_ws_task", None)),
         "market_last_event_ago": (now_ts - int(getattr(app.state, "market_last_event_ts", 0) or 0)) if getattr(app.state, "market_last_event_ts", 0) else None,
         "user_last_event_ago": (now_ts - int(getattr(app.state, "user_last_event_ts", 0) or 0)) if getattr(app.state, "user_last_event_ts", 0) else None,
     }
