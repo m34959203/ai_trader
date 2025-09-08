@@ -20,3 +20,5 @@ data/
 *.model
 *.h5venv/
 venv/
+venv/
+.venv/
