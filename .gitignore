@@ -19,3 +19,4 @@ data/
 *.pth
 *.model
 *.h5venv/
+venv/
