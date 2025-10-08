@@ -81,6 +81,14 @@ try:
 except Exception:
     _HAS_AUTOPILOT = False
 
+try:
+    from monitoring.resource_monitor import ResourceMonitor, ResourceMonitorConfig  # type: ignore
+    _HAS_RESOURCE_MONITOR = True
+except Exception:  # pragma: no cover
+    ResourceMonitor = None  # type: ignore
+    ResourceMonitorConfig = None  # type: ignore
+    _HAS_RESOURCE_MONITOR = False
+
 # Аналитика
 try:
     from .analysis.analyze_market import analyze_market, DEFAULT_CONFIG, AnalysisConfig  # type: ignore
@@ -359,6 +367,9 @@ async def lifespan(app: FastAPI):
     app.state.ohlcv_bg_task  = None
     app.state.auto_bg_task   = None
     app.state.watchdog_task  = None
+    app.state.resource_monitor_task = None
+    app.state.resource_monitor = None
+    app.state.resource_monitor_config = None
     app.state._watchdog      = None
 
     app.state.stream_router = None
@@ -481,12 +492,38 @@ async def lifespan(app: FastAPI):
     app.state._watchdog = EventLoopWatchdog(interval=5.0, max_consecutive_misses=12)
     app.state.watchdog_task = asyncio.create_task(app.state._watchdog.run(), name="loop_watchdog")
 
+    if _HAS_RESOURCE_MONITOR:
+        try:
+            monitor_cfg = ResourceMonitorConfig.from_env()
+            app.state.resource_monitor_config = monitor_cfg
+            if monitor_cfg.enabled:
+                app.state.resource_monitor = ResourceMonitor(monitor_cfg)
+                app.state.resource_monitor_task = asyncio.create_task(
+                    app.state.resource_monitor.run(),
+                    name="resource_monitor",
+                )
+                LOG.info(
+                    "Resource monitor started: interval=%.1fs, exit_on_crit=%s",
+                    float(monitor_cfg.interval_sec),
+                    bool(monitor_cfg.exit_on_crit),
+                )
+            else:
+                LOG.info("Resource monitor disabled via configuration/env")
+        except Exception as e:  # pragma: no cover
+            LOG.warning("Failed to start resource monitor: %r", e)
+
     LOG.info("Startup complete: DB schema ensured, version=%s, features=%s", APP_VERSION, FEATURES)
     try:
         yield
     finally:
         # Shutdown
         try:
+            try:
+                monitor = getattr(app.state, "resource_monitor", None)
+                if monitor is not None:
+                    monitor.stop()
+            except Exception:
+                pass
             tasks = [
                 getattr(app.state, "keepalive_task", None),
                 getattr(app.state, "user_ws_task", None),
@@ -495,6 +532,7 @@ async def lifespan(app: FastAPI):
                 getattr(app.state, "ohlcv_bg_task", None),
                 getattr(app.state, "auto_bg_task", None),
                 getattr(app.state, "watchdog_task", None),
+                getattr(app.state, "resource_monitor_task", None),
             ]
             for t in tasks:
                 if t is not None:
