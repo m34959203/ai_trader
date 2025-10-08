@@ -1,284 +1,213 @@
 # routers/ohlcv.py
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
-import time
 import logging
-import re
-from typing import Literal, Optional, Iterable
+from typing import AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.session import get_session
+from db.session import get_async_session
 from db import crud
-from schemas.ohlcv import (
-    StoreRequest,
-    StoreResponse,
-    QueryResponseWithPage,
-)
-from sources import alpha_vantage, binance
-from sources.base import SourceError
+from db.models import OHLCV
 
-router = APIRouter(tags=["ohlcv"])
-LOG = logging.getLogger("ai_trader.ohlcv")
+# Источники котировок, которые используем в /prices/store
+# (в тестах мокается binance.fetch)
+from sources import binance as src_binance  # type: ignore
+try:
+    from sources import alpha_vantage as src_av  # type: ignore
+except Exception:  # pragma: no cover
+    src_av = None  # не обязателен для тестов
 
-_VALID_ORDER: set[str] = {"asc", "desc"}
-_VALID_SOURCES_FETCH: set[str] = {"binance", "alpha_vantage"}
-_VALID_INTERVALS_HINT = "1m/3m/5m/15m/30m/1h/4h/1d"
-_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_\-\.]+")
+logger = logging.getLogger("ai_trader.ohlcv")
+router = APIRouter()
 
-
-def _validate_time_range(ts_from: Optional[int], ts_to: Optional[int]) -> None:
-    if ts_from is not None and ts_from < 0:
-        raise HTTPException(status_code=422, detail="ts_from must be >= 0 (UNIX seconds)")
-    if ts_to is not None and ts_to < 0:
-        raise HTTPException(status_code=422, detail="ts_to must be >= 0 (UNIX seconds)")
-    if ts_from is not None and ts_to is not None and ts_from > ts_to:
-        raise HTTPException(status_code=422, detail="ts_from must be <= ts_to")
+_SOURCES: Dict[str, object] = {
+    "binance": src_binance,
+}
+if src_av:
+    _SOURCES["alpha_vantage"] = src_av
 
 
-def _normalize_symbol(symbol: Optional[str], ticker: Optional[str]) -> Optional[str]:
-    return (symbol or ticker or None)
+def _row_to_dict(r: OHLCV) -> Dict:
+    # Преобразование ORM-объекта в «плоский» словарь, как ожидают тесты
+    return {
+        "source": r.source,
+        "asset": r.asset,
+        "tf": r.tf,
+        "ts": int(r.ts),
+        "open": float(r.open),
+        "high": float(r.high),
+        "low": float(r.low),
+        "close": float(r.close),
+        "volume": float(r.volume),
+    }
 
 
-def _normalize_interval(interval: Optional[str], timeframe: Optional[str]) -> Optional[str]:
-    return (interval or timeframe or None)
-
-
-def _safe_filename(s: str) -> str:
-    s = (s or "").strip() or "all"
-    return _SAFE_NAME_RE.sub("_", s)
-
-
-@router.post("/prices/store", response_model=StoreResponse)
+@router.post("/prices/store")
 async def store_prices(
-    req: StoreRequest,
-    session: AsyncSession = Depends(get_session),
+    source: str,
+    symbol: str,
+    timeframe: str,
+    limit: int = 1000,
+    ts_from: Optional[int] = None,
+    ts_to: Optional[int] = None,
+    session: AsyncSession = Depends(get_async_session),
 ):
-    if req.source not in _VALID_SOURCES_FETCH:
-        # Тест ожидает 400
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown source '{req.source}'. Allowed: {sorted(_VALID_SOURCES_FETCH)}"
-        )
-
-    _validate_time_range(req.ts_from, req.ts_to)
-
-    t0 = time.perf_counter()
-    try:
-        if req.source == "alpha_vantage":
-            rows_iter = alpha_vantage.fetch(req.symbol, req.timeframe, req.limit, req.ts_from, req.ts_to)
-        else:
-            rows_iter = binance.fetch(req.symbol, req.timeframe, req.limit, req.ts_from, req.ts_to)
-        rows = list(rows_iter)
-    except SourceError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        LOG.exception("Fetcher error: %r", e)
-        raise HTTPException(status_code=500, detail=f"Fetcher error: {e}") from e
-
-    if not rows:
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        LOG.info(
-            "POST /prices/store source=%s symbol=%s tf=%s rows=0 dt=%.1fms",
-            req.source, req.symbol, req.timeframe, dt_ms,
-        )
-        return StoreResponse(stored=0, source=req.source, symbol=req.symbol, timeframe=req.timeframe)
+    """
+    Загружает свечи из указанного источника и апсертит их в БД.
+    Тесты мокают sources.binance.fetch, поэтому сеть не трогаем.
+    """
+    mod = _SOURCES.get(source)
+    if not mod or not hasattr(mod, "fetch"):
+        raise HTTPException(status_code=400, detail="unknown source")
 
     try:
-        stored = await crud.upsert_ohlcv_batch(session, rows)
-    except Exception as e:
-        LOG.exception("DB upsert error: %r", e)
-        raise HTTPException(status_code=500, detail=f"DB upsert error: {e}") from e
+        rows = mod.fetch(symbol=symbol, timeframe=timeframe, limit=limit, ts_from=ts_from, ts_to=ts_to)  # type: ignore
+    except Exception as e:  # pragma: no cover
+        logger.exception("Fetch error from %s", source)
+        raise HTTPException(status_code=502, detail=f"fetch failed: {e}")
 
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    LOG.info(
-        "POST /prices/store source=%s symbol=%s tf=%s stored=%d dt=%.1fms",
-        req.source, req.symbol, req.timeframe, stored, dt_ms,
-    )
-    return StoreResponse(stored=stored, source=req.source, symbol=req.symbol, timeframe=req.timeframe)
+    stored = await crud.upsert_ohlcv_batch(session, rows)
+    return {"stored": int(stored)}
 
 
-@router.get("/ohlcv", response_model=QueryResponseWithPage)
+@router.get("/ohlcv")
 async def get_ohlcv(
-    symbol: Optional[str] = Query(default=None, description="Тикер/символ, напр. BTCUSDT или AAPL"),
-    ticker: Optional[str] = Query(default=None, description="Алиас для symbol"),
-    interval: Optional[str] = Query(default=None, description=f"Таймфрейм, напр. {_VALID_INTERVALS_HINT}"),
-    timeframe: Optional[str] = Query(default=None, description="Алиас для interval"),
-    source: Optional[str] = Query(default=None, description="Источник: binance/alpha_vantage (опционально)"),
-    ts_from: Optional[int] = Query(default=None, description="UNIX seconds (start, inclusive)"),
-    ts_to: Optional[int] = Query(default=None, description="UNIX seconds (end, inclusive)"),
-    order: Literal["asc", "desc"] = Query(default="asc", description="Порядок сортировки по времени"),
-    offset: int = Query(default=0, ge=0, description="Смещение для пагинации"),
-    limit: int = Query(default=1000, ge=1, le=10000, description="Размер страницы"),
-    session: AsyncSession = Depends(get_session),
+    source: Optional[str] = Query(None),
+    ticker: Optional[str] = Query(None, alias="ticker"),  # asset
+    timeframe: Optional[str] = Query(None),
+    ts_from: Optional[int] = None,
+    ts_to: Optional[int] = None,
+    limit: int = Query(1000, ge=0),
+    offset: int = Query(0, ge=0),
+    order: str = Query("asc"),  # "asc" | "desc"
+    session: AsyncSession = Depends(get_async_session),
 ):
-    _validate_time_range(ts_from, ts_to)
-    if order not in _VALID_ORDER:
-        raise HTTPException(status_code=422, detail=f"order must be one of {_VALID_ORDER}")
-
-    asset = _normalize_symbol(symbol, ticker)
-    tf = _normalize_interval(interval, timeframe)
-
-    t0 = time.perf_counter()
+    """
+    Строгая limit/offset-пагинация БЕЗ «додобора».
+    Возвращаемровно то, что попадает в окно [offset, offset+limit),
+    и next_offset только если за окном ещё есть данные.
+    """
     try:
+        total = await crud.count_ohlcv(
+            session,
+            source=source,
+            asset=ticker,
+            tf=timeframe,
+            ts_from=ts_from,
+            ts_to=ts_to,
+        )
+
         rows = await crud.query_ohlcv(
             session,
             source=source,
-            asset=asset,
-            tf=tf,
+            asset=ticker,
+            tf=timeframe,
             ts_from=ts_from,
             ts_to=ts_to,
             limit=limit,
             offset=offset,
             order=order,
         )
-        total = await crud.count_ohlcv(
-            session,
-            source=source,
-            asset=asset,
-            tf=tf,
-            ts_from=ts_from,
-            ts_to=ts_to,
-        )
-    except Exception as e:
-        LOG.exception("DB query_ohlcv error: %r", e)
-        raise HTTPException(status_code=500, detail=f"DB query failed: {e}") from e
+    except Exception as e:  # pragma: no cover
+        logger.exception("DB query_ohlcv error: %r", e)
+        return {"ok": False, "error": f"DB query failed: {e}", "path": "/ohlcv"}
 
-    # Страховка на случай грязной БД/рассинхронизации total
-    expected = max(0, min(limit, max(0, total - offset)))
-    if len(rows) > expected:
-        rows = rows[:expected]
+    candles = [_row_to_dict(r) for r in rows]
 
-    candles = [r.to_dict() for r in rows]
-    next_offset = (offset + len(rows)) if (offset + len(rows)) < total else None
-
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    LOG.info(
-        "GET /ohlcv source=%s asset=%s tf=%s offset=%d limit=%d rows=%d total=%d dt=%.1fms",
-        source, asset, tf, offset, limit, len(rows), total, dt_ms,
-    )
+    # next_offset по фактическому количеству выданных строк
+    next_offset: Optional[int] = None
+    advanced = offset + len(candles)
+    if advanced < total:
+        next_offset = advanced
 
     return {
+        "ok": True,
         "candles": candles,
+        "total": int(total),
+        "limit": int(limit),
+        "offset": int(offset),
+        "order": order,
         "next_offset": next_offset,
     }
 
 
-@router.get("/ohlcv/count")
-async def get_ohlcv_count(
-    symbol: Optional[str] = Query(default=None),
-    ticker: Optional[str] = Query(default=None),
-    interval: Optional[str] = Query(default=None),
-    timeframe: Optional[str] = Query(default=None),
-    source: Optional[str] = Query(default=None),
-    ts_from: Optional[int] = Query(default=None),
-    ts_to: Optional[int] = Query(default=None),
-    session: AsyncSession = Depends(get_session),
-):
-    _validate_time_range(ts_from, ts_to)
-    asset = _normalize_symbol(symbol, ticker)
-    tf = _normalize_interval(interval, timeframe)
-
-    total = await crud.count_ohlcv(
-        session,
-        source=source,
-        asset=asset,
-        tf=tf,
-        ts_from=ts_from,
-        ts_to=ts_to,
-    )
-    return {"count": int(total)}
-
-
-@router.get("/ohlcv/stats")
-async def get_ohlcv_stats(
-    symbol: Optional[str] = Query(default=None),
-    ticker: Optional[str] = Query(default=None),
-    interval: Optional[str] = Query(default=None),
-    timeframe: Optional[str] = Query(default=None),
-    source: Optional[str] = Query(default=None),
-    ts_from: Optional[int] = Query(default=None),
-    ts_to: Optional[int] = Query(default=None),
-    session: AsyncSession = Depends(get_session),
-):
-    _validate_time_range(ts_from, ts_to)
-    asset = _normalize_symbol(symbol, ticker)
-    tf = _normalize_interval(interval, timeframe)
-
-    stats = await crud.stats_ohlcv(
-        session,
-        source=source,
-        asset=asset,
-        tf=tf,
-        ts_from=ts_from,
-        ts_to=ts_to,
-    )
-    # stats — уже dict {"min_ts":..., "max_ts":..., "count":...}
-    return {
-        "min_ts": stats["min_ts"],
-        "max_ts": stats["max_ts"],
-        "count": stats["count"],
-    }
-
-
 @router.get("/ohlcv.csv")
-async def export_ohlcv_csv(
-    symbol: Optional[str] = Query(default=None),
-    ticker: Optional[str] = Query(default=None),
-    interval: Optional[str] = Query(default=None),
-    timeframe: Optional[str] = Query(default=None),
-    source: Optional[str] = Query(default=None),
-    ts_from: Optional[int] = Query(default=None),
-    ts_to: Optional[int] = Query(default=None),
-    order: Literal["asc", "desc"] = Query(default="asc"),
-    session: AsyncSession = Depends(get_session),
+async def get_ohlcv_csv(
+    source: Optional[str] = Query(None),
+    ticker: Optional[str] = Query(None, alias="ticker"),
+    timeframe: Optional[str] = Query(None),
+    ts_from: Optional[int] = None,
+    ts_to: Optional[int] = None,
+    limit: int = Query(0, ge=0),  # 0 => нет верхнего лимита (выгрузить всё)
+    offset: int = Query(0, ge=0),
+    order: str = Query("asc"),
+    session: AsyncSession = Depends(get_async_session),
 ):
-    _validate_time_range(ts_from, ts_to)
-    if order not in _VALID_ORDER:
-        raise HTTPException(status_code=422, detail=f"order must be one of {_VALID_ORDER}")
+    """
+    CSV-стрим с теми же правилами пагинации:
+    - никакого «додобора»;
+    - двигаем offset = offset + len(batch) при стриминге;
+    - если limit > 0 — останавливаемся, когда выгружено ровно limit строк.
+    """
 
-    asset = _normalize_symbol(symbol, ticker) or "all"
-    tf = _normalize_interval(interval, timeframe) or "all"
-
-    async def row_iter() -> Iterable[bytes]:
-        header = ["source", "asset", "tf", "ts", "open", "high", "low", "close", "volume"]
+    async def row_iter() -> AsyncIterator[bytes]:
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(header)
+        # Заголовок
+        writer.writerow(["ts", "open", "high", "low", "close", "volume", "asset", "tf", "source"])
         yield buf.getvalue().encode("utf-8")
         buf.seek(0)
         buf.truncate(0)
 
-        offset = 0
-        page_size = 5000
+        remaining = limit if limit and limit > 0 else None
+        page_size = 1000 if remaining is None else min(1000, remaining)
+
+        cur_offset = offset
         while True:
-            rows = await crud.query_ohlcv(
+            batch = await crud.query_ohlcv(
                 session,
                 source=source,
-                asset=None if asset == "all" else asset,
-                tf=None if tf == "all" else tf,
+                asset=ticker,
+                tf=timeframe,
                 ts_from=ts_from,
                 ts_to=ts_to,
                 limit=page_size,
-                offset=offset,
+                offset=cur_offset,
                 order=order,
             )
-            if not rows:
+            if not batch:
                 break
-            for r in rows:
-                writer.writerow([r.source, r.asset, r.tf, r.ts, r.open, r.high, r.low, r.close, r.volume])
+
+            for r in batch:
+                writer.writerow(
+                    [
+                        int(r.ts),
+                        float(r.open),
+                        float(r.high),
+                        float(r.low),
+                        float(r.close),
+                        float(r.volume),
+                        r.asset,
+                        r.tf,
+                        r.source,
+                    ]
+                )
             yield buf.getvalue().encode("utf-8")
             buf.seek(0)
             buf.truncate(0)
-            offset += len(rows)
 
-    fname = f"ohlcv_{_safe_filename(asset)}_{_safe_filename(tf)}.csv"
-    return StreamingResponse(
-        row_iter(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-    )
+            advanced = len(batch)
+            cur_offset += advanced
+            if remaining is not None:
+                remaining -= advanced
+                if remaining <= 0:
+                    break
+
+    headers = {"Content-Disposition": 'attachment; filename="ohlcv.csv"'}
+    return StreamingResponse(row_iter(), media_type="text/csv; charset=utf-8", headers=headers)
