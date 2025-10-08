@@ -7,11 +7,11 @@ AI-Trader · Market Analysis Module (enhanced)
 Public API (stable):
     - AnalysisConfig (dataclass)
     - DEFAULT_CONFIG (instance)
-    - analyze_market(df_1h, df_4h=None, config=DEFAULT_CONFIG) -> dict
+    - analyze_market(df_1h, df_4h=None, *, symbol=None, config=DEFAULT_CONFIG) -> dict
 """
 
 import asyncio
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Tuple, Optional, Final
 
 import numpy as np
@@ -20,9 +20,19 @@ import pandas as pd
 # Индикаторы проекта
 from src.ai.adaptive import DEFAULT_ENGINE
 from src.indicators import (
-    ema, rsi as rsi_ind, macd as macd_ind, bollinger_bands as bb_ind,
-    atr as atr_ind, adx as adx_ind
+    ema,
+    rsi as rsi_ind,
+    macd as macd_ind,
+    bollinger_bands as bb_ind,
+    atr as atr_ind,
+    adx as adx_ind,
+    force_index as force_ind,
+    money_flow_index as mfi_ind,
+    on_balance_volume as obv_ind,
+    awesome_oscillator as ao_ind,
+    candlestick_patterns,
 )
+from src.analysis.news_sentiment import collect_recent_news, AggregatedNews
 
 __all__ = ["AnalysisConfig", "DEFAULT_CONFIG", "analyze_market"]
 
@@ -53,6 +63,10 @@ class AnalysisConfig:
     adx_period: int = 14
     adx_trend_threshold: float = 20.0  # <=> sideways if ADX < threshold
 
+    # Volume-driven indicators
+    force_index_period: int = 13
+    mfi_period: int = 14
+
     # Candles
     hammer_shadow_ratio: float = 2.0   # lower (bull) / upper (bear) ≥ 2×body
     star_shadow_ratio: float = 2.0
@@ -76,6 +90,10 @@ class AnalysisConfig:
     score_mtf_agree: int = 12
     score_mtf_conflict: int = 15       # penalty
     score_adx_trend_bonus: int = 6     # bonus if ADX >= threshold & aligned
+    score_mfi_zone: int = 4            # бонус/штраф за зоны MFI
+    score_force_trend: int = 4         # подтверждение Force Index
+    score_obv_confirmation: int = 3    # подтверждение по OBV
+    score_ao_momentum: int = 3         # подтверждение по Awesome Oscillator
 
     # Decision thresholds
     buy_threshold: int = 60
@@ -95,6 +113,19 @@ class AnalysisConfig:
 
     # MTF controls
     mtf_require_confirmation: bool = False  # if True: downgrade to flat if 4h conflicts strongly
+
+    # News sentiment integration
+    news_enabled: bool = True
+    news_lookback_hours: int = 12
+    news_sentiment_weight: int = 8
+    news_min_items: int = 1
+    news_allow_remote: bool = False
+    news_symbol_aliases: Tuple[Tuple[str, Tuple[str, ...]], ...] = field(
+        default_factory=lambda: (
+            ("BTCUSDT", ("BTC", "Bitcoin", "BTC/USD")),
+            ("ETHUSDT", ("ETH", "Ethereum", "ETH/USD")),
+        )
+    )
 
 
 DEFAULT_CONFIG: Final[AnalysisConfig] = AnalysisConfig()
@@ -171,13 +202,18 @@ def _compute_indicators(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataFrame:
 
     bb_df = bb_ind(out["close"], cfg.bb_period, cfg.bb_nstd)
     out["bb_upper"] = bb_df["bb_upper"]
-    out["bb_mid"]   = bb_df["bb_mid"]
+    out["bb_mid"] = bb_df["bb_mid"]
     out["bb_lower"] = bb_df["bb_lower"]
 
     out["atr"] = atr_ind(out["high"], out["low"], out["close"], cfg.atr_period)
 
     adx_df = adx_ind(out["high"], out["low"], out["close"], cfg.adx_period)
     out["+di"], out["-di"], out["adx"] = adx_df["pdi"], adx_df["ndi"], adx_df["adx"]
+
+    out["force_index"] = force_ind(out["close"], out["volume"], cfg.force_index_period)
+    out["mfi"] = mfi_ind(out["high"], out["low"], out["close"], out["volume"], cfg.mfi_period)
+    out["obv"] = obv_ind(out["close"], out["volume"])
+    out["ao"] = ao_ind(out["high"], out["low"])
 
     # «Тёплый старт» индикаторов — один раз
     out = out.dropna()
@@ -187,57 +223,46 @@ def _compute_indicators(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Candles (lightweight patterns)
+# Candles (pattern aggregation)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _engulfing_sig(df: pd.DataFrame) -> pd.Series:
-    o, c = df["open"], df["close"]
-    po, pc = o.shift(1), c.shift(1)
-    body, pbody = (c - o), (pc - po)
-    bull = (pbody < 0) & (body > 0) & (o <= pc) & (c >= po)
-    bear = (pbody > 0) & (body < 0) & (o >= pc) & (c <= po)
-    return bull.astype(int) - bear.astype(int)
+def _candle_signals(df: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.Series, Dict[str, bool]]:
+    pats = candlestick_patterns(
+        df,
+        hammer_ratio=cfg.hammer_shadow_ratio,
+        star_ratio=cfg.star_shadow_ratio,
+        doji_frac=cfg.doji_body_frac,
+    )
+    weights = (
+        pats["bullish_engulfing"].astype(int)
+        - pats["bearish_engulfing"].astype(int)
+        + pats["hammer"].astype(int)
+        + pats["inverted_hammer"].astype(int)
+        - pats["shooting_star"].astype(int)
+        + 2 * pats["morning_star"].astype(int)
+        - 2 * pats["evening_star"].astype(int)
+    )
+    weights = weights.fillna(0)
+    latest = pats.iloc[-1] if len(pats) else pd.Series(dtype=bool)
+    snapshot = {col: bool(latest.get(col, False)) for col in pats.columns}
+    return weights, snapshot
 
 
-def _hammer_star_sig(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.Series:
-    o, c, h, l = df["open"], df["close"], df["high"], df["low"]
-    body = (c - o).abs()
-    rng = (h - l).replace(0.0, np.nan)
-    up = (h - np.maximum(c, o)).clip(lower=0.0)
-    lo = (np.minimum(c, o) - l).clip(lower=0.0)
-    hammer = (lo >= cfg.hammer_shadow_ratio * body) & (up <= 0.25 * (h - l))
-    star   = (up >= cfg.star_shadow_ratio   * body) & (lo <= 0.25 * (h - l))
-    out = hammer.astype(int) - star.astype(int)
-    return out.fillna(0)
-
-
-def _harami_sig(df: pd.DataFrame) -> pd.Series:
-    o, c = df["open"], df["close"]
-    po, pc = o.shift(1), c.shift(1)
-    low, high = np.minimum(o, c), np.maximum(o, c)
-    plow, phigh = np.minimum(po, pc), np.maximum(po, pc)
-    inside = (low >= plow) & (high <= phigh)
-    prev_dir = np.sign(pc - po)
-    bull = (prev_dir < 0) & inside
-    bear = (prev_dir > 0) & inside
-    return bull.astype(int) - bear.astype(int)
-
-
-def _doji_sig(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.Series:
-    o, c, h, l = df["open"], df["close"], df["high"], df["low"]
-    body = (c - o).abs()
-    rng = (h - l).replace(0.0, np.nan)
-    doji = (body <= cfg.doji_body_frac * rng)
-    return doji.fillna(False).astype(int)  # 1=doji
-
-
-def _candle_score(df: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.Series, pd.Series]:
-    engulf = _engulfing_sig(df)         # weight 2
-    hs     = _hammer_star_sig(df, cfg)  # weight 1
-    har    = _harami_sig(df)            # weight 1
-    score = engulf * 2 + hs * 1 + har * 1
-    doji = _doji_sig(df, cfg)
-    return score, doji
+def _candle_reasons(snapshot: Dict[str, bool]) -> List[str]:
+    label_map = {
+        "hammer": "молот",
+        "inverted_hammer": "перевёрнутый молот",
+        "shooting_star": "падающая звезда",
+        "bullish_engulfing": "бычье поглощение",
+        "bearish_engulfing": "медвежье поглощение",
+        "morning_star": "утренняя звезда",
+        "evening_star": "вечерняя звезда",
+        "doji": "доджи",
+    }
+    active = [label_map[name] for name, state in snapshot.items() if state and name in label_map]
+    if not active:
+        return []
+    return ["Свечные сигналы: " + ", ".join(active)]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -404,11 +429,16 @@ def _closest_level_penalty(
     return 0, None
 
 
-def _rule_signal(df: pd.DataFrame, cfg: AnalysisConfig, levels: List[Dict]) -> Tuple[str, int, List[str]]:
+def _rule_signal(
+    df: pd.DataFrame,
+    cfg: AnalysisConfig,
+    levels: List[Dict],
+) -> Tuple[str, int, List[str], Dict[str, object]]:
     row = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else row
     reasons: List[str] = []
     score = int(cfg.base_score)
+    extras: Dict[str, object] = {"base_score": score}
 
     # ADX regime (trend vs sideways)
     adx = float(row["adx"])
@@ -465,17 +495,61 @@ def _rule_signal(df: pd.DataFrame, cfg: AnalysisConfig, levels: List[Dict]) -> T
         reasons.append("Пробой нижней Bollinger")
         score -= int(cfg.score_bb_break)
 
-    # Candles (aggregate) + Doji note
-    cscore, doji = _candle_score(df, cfg)
-    cs = int(cscore.iloc[-1])
+    # MFI zones (volume-based oscillator)
+    mfi_val = float(row.get("mfi", np.nan))
+    if np.isfinite(mfi_val):
+        if mfi_val < 20:
+            reasons.append(f"MFI {mfi_val:.1f} < 20 (потенциал разворота)")
+            score += int(cfg.score_mfi_zone)
+        elif mfi_val > 80:
+            reasons.append(f"MFI {mfi_val:.1f} > 80 (перекупленность)")
+            score -= int(cfg.score_mfi_zone)
+
+    # Force Index trend confirmation
+    fi_now = float(row.get("force_index", 0.0))
+    fi_prev = float(prev.get("force_index", fi_now)) if hasattr(prev, "get") else fi_now
+    if fi_now > 0 and fi_now >= fi_prev:
+        reasons.append("Force Index > 0 (покупатели доминируют)")
+        score += int(cfg.score_force_trend)
+    elif fi_now < 0 and fi_now <= fi_prev:
+        reasons.append("Force Index < 0 (продавцы доминируют)")
+        score -= int(cfg.score_force_trend)
+
+    # OBV slope confirmation
+    obv_now = float(row.get("obv", 0.0))
+    obv_prev = float(prev.get("obv", obv_now)) if hasattr(prev, "get") else obv_now
+    obv_slope = obv_now - obv_prev
+    if obv_slope > 0:
+        reasons.append("OBV растёт (подтверждение объёмом)")
+        score += int(cfg.score_obv_confirmation)
+    elif obv_slope < 0:
+        reasons.append("OBV падает (отток объёма)")
+        score -= int(cfg.score_obv_confirmation)
+
+    # Awesome Oscillator momentum
+    ao_now = float(row.get("ao", 0.0))
+    ao_prev = float(prev.get("ao", ao_now)) if hasattr(prev, "get") else ao_now
+    if ao_now > 0 and ao_now >= ao_prev:
+        reasons.append("Awesome Oscillator > 0 (бычий импульс)")
+        score += int(cfg.score_ao_momentum)
+    elif ao_now < 0 and ao_now <= ao_prev:
+        reasons.append("Awesome Oscillator < 0 (медвежий импульс)")
+        score -= int(cfg.score_ao_momentum)
+
+    # Candles
+    cscore, candle_snapshot = _candle_signals(df, cfg)
+    extras["candles"] = candle_snapshot
+    cs = int(cscore.iloc[-1]) if len(cscore) else 0
+    candle_reasons = _candle_reasons(candle_snapshot)
+    reasons.extend(candle_reasons)
     if cs > 0:
-        reasons.append("Свечной сигнал: бычий (engulf/hammer/harami)")
+        reasons.append("Свечной блок: бычий перевес")
         score += int(cfg.score_candle)
     elif cs < 0:
-        reasons.append("Свечной сигнал: медвежий (engulf/star/harami)")
+        reasons.append("Свечной блок: медвежий перевес")
         score -= int(cfg.score_candle)
-    if int(doji.iloc[-1]) == 1:
-        reasons.append("Свечной: doji (неопределённость)")
+    if candle_snapshot.get("doji"):
+        reasons.append("Свечной: доджи (неопределённость)")
 
     # Initial decision from raw score (предварительный)
     score = max(0, min(100, int(score)))
@@ -521,7 +595,19 @@ def _rule_signal(df: pd.DataFrame, cfg: AnalysisConfig, levels: List[Dict]) -> T
     if len(reasons) > cfg.max_reasons:
         reasons = reasons[: cfg.max_reasons] + ["…"]
 
-    return decision, int(score), reasons
+    extras["indicators"] = {
+        "rsi": float(row.get("rsi", np.nan)),
+        "mfi": mfi_val,
+        "force_index": fi_now,
+        "obv": obv_now,
+        "ao": ao_now,
+        "adx": adx,
+        "macd": float(row.get("macd", np.nan)),
+        "macd_signal": float(row.get("macd_signal", np.nan)),
+    }
+    extras["raw_score"] = int(score)
+
+    return decision, int(score), reasons, extras
 
 
 def _align_timeframes(df_fast: pd.DataFrame, df_slow: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
@@ -538,6 +624,8 @@ def _align_timeframes(df_fast: pd.DataFrame, df_slow: pd.DataFrame) -> Tuple[pd.
 def analyze_market(
     df_1h: pd.DataFrame,
     df_4h: Optional[pd.DataFrame] = None,
+    *,
+    symbol: Optional[str] = None,
     config: AnalysisConfig = DEFAULT_CONFIG,
 ) -> Dict:
     """
@@ -569,7 +657,8 @@ def analyze_market(
     levels = _compute_levels(df1, cfg)
     trend = _infer_trend(df1)
     vol   = _vol_state(df1, cfg)
-    sig, score, reasons = _rule_signal(df1, cfg, levels)
+    sig, score, reasons, extras = _rule_signal(df1, cfg, levels)
+    extras["score_after_indicators"] = int(score)
     latest_row = df1.iloc[-1]
     if sig in {"buy", "sell"}:
         DEFAULT_ENGINE.record_example(latest_row, 1 if sig == "buy" else 0)
@@ -632,13 +721,58 @@ def analyze_market(
                     else:
                         sig = "flat"
 
+    extras["score_after_mtf"] = int(score)
+
+    news_blob: Optional[AggregatedNews] = None
+    if symbol and cfg.news_enabled:
+        alias_map = dict(cfg.news_symbol_aliases)
+        extra_aliases = {k: list(v) for k, v in alias_map.items()}
+        news_blob = collect_recent_news(
+            symbol,
+            lookback_hours=cfg.news_lookback_hours,
+            extra_aliases=extra_aliases,
+            allow_remote=cfg.news_allow_remote,
+        )
+        if news_blob.items and len(news_blob.items) >= cfg.news_min_items:
+            delta = int(round(news_blob.normalized * cfg.news_sentiment_weight))
+            if delta != 0:
+                score = max(0, min(100, score + delta))
+                label = news_blob.sentiment_label
+                if label == "bullish":
+                    reasons.append(
+                        f"Новости: позитивный фон (score={news_blob.normalized:.2f}, +{delta})"
+                    )
+                elif label == "bearish":
+                    reasons.append(
+                        f"Новости: негативный фон (score={news_blob.normalized:.2f}, {delta})"
+                    )
+                else:
+                    reasons.append(
+                        f"Новости: нейтральный фон (score={news_blob.normalized:.2f})"
+                    )
+            else:
+                reasons.append("Новости: фон нейтральный")
+        extras["news_sentiment"] = {
+            "score": news_blob.score if news_blob else 0.0,
+            "normalized": news_blob.normalized if news_blob else 0.0,
+            "label": news_blob.sentiment_label if news_blob else "neutral",
+            "counts": news_blob.counts if news_blob else {"positive": 0, "negative": 0, "neutral": 0},
+        }
+        extras["score_after_news"] = int(score)
+    else:
+        extras.setdefault("score_after_news", int(score))
+
     # ── Финальная нормализация по тренду ───────────────────────────────────────
+    extras.setdefault("score_after_news", int(score))
     if trend == "up":
         final_sig = "buy" if score >= cfg.buy_threshold else "flat"
     elif trend == "down":
         final_sig = "sell" if score >= cfg.sell_threshold else "flat"
     else:
         final_sig = "flat"
+
+    final_score = int(max(0, min(100, score)))
+    extras["final_score"] = final_score
 
     # Final payload (JSON-friendly)
     out_levels = [
@@ -650,15 +784,45 @@ def analyze_market(
         "trend": trend,
         "volatility": vol,
         "signal": final_sig,
-        "confidence": int(max(0, min(100, score))),
+        "confidence": final_score,
+        "signal_score": final_score,
         "reasons": list(reasons),
         "levels": out_levels,
     }
     if mtf is not None:
         result["mtf"] = mtf
     adaptive = DEFAULT_ENGINE.adjust(result, df=df1)
-    result.setdefault("meta", {})
-    result["meta"]["adaptive"] = asdict(adaptive)
+    meta = result.setdefault("meta", {})
+    meta["adaptive"] = asdict(adaptive)
+    meta["indicators"] = extras.get("indicators", {})
+    meta["candles"] = extras.get("candles", {})
+    meta["score_trace"] = {
+        "base": extras.get("base_score"),
+        "after_indicators": extras.get("score_after_indicators"),
+        "after_mtf": extras.get("score_after_mtf"),
+        "after_news": extras.get("score_after_news"),
+        "final": extras.get("final_score"),
+    }
+    meta["news_sentiment"] = extras.get("news_sentiment")
+    if news_blob and news_blob.items:
+        meta["news"] = {
+            "score": news_blob.score,
+            "normalized": news_blob.normalized,
+            "label": news_blob.sentiment_label,
+            "counts": news_blob.counts,
+            "headlines": [
+                {
+                    "title": item.title,
+                    "summary": item.summary,
+                    "sentiment": item.sentiment,
+                    "importance": item.importance,
+                    "impact": item.impact,
+                    "published_ts": item.published_ts,
+                    "link": item.link,
+                }
+                for item in news_blob.items[:5]
+            ],
+        }
     return result
 
 

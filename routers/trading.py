@@ -22,7 +22,11 @@ from schemas.trading import (
     Trade,
     EquityPoint,
 )
-from src.strategy import ema_cross_signals
+from src.strategy import (
+    ema_cross_signals,
+    load_strategy_config,
+    run_configured_ensemble,
+)
 from src.paper import PaperTrader
 
 LOG = logging.getLogger("ai_trader.trading")
@@ -374,6 +378,11 @@ async def get_signals(
     fast: int = Query(12, ge=1, description="Период быстрой EMA"),
     slow: int = Query(26, ge=1, description="Период медленной EMA"),
     limit: int = Query(360, ge=50, le=5000, description="Кол-во баров (рекомендуется >= slow+5)"),
+    ensemble: bool = Query(False, description="Использовать ансамбль стратегий из configs/strategy.yaml"),
+    strategy_config: Optional[str] = Query(
+        None,
+        description="Путь к YAML/JSON конфигу стратегий (по умолчанию configs/strategy.yaml)",
+    ),
     session: AsyncSession = Depends(get_session),
 ):
     """
@@ -400,20 +409,48 @@ async def get_signals(
 
         _ensure_min_bars(df, fast, slow)
 
-        # 3) сигналы
-        sigs = ema_cross_signals(df, fast, slow).copy()
-        _ensure_signals_df(sigs)
+        if ensemble:
+            try:
+                cfg_path = Path(strategy_config) if strategy_config else None
+                cfg = load_strategy_config(cfg_path)
+            except FileNotFoundError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+            except Exception as e:  # pragma: no cover
+                LOG.exception("Failed to load strategy config: %r", e)
+                raise HTTPException(status_code=400, detail=f"Strategy config error: {e}")
 
-        # 4) добавим ISO-время для удобства UI/отладки
-        sigs["timestamp_iso"] = _iso_from_ts_col(sigs, "ts")
+            sigs = run_configured_ensemble(df, cfg)
+            base_cols = df[["ts", "close"]].drop_duplicates(subset=["ts"])
+            base_cols["timestamp"] = base_cols["ts"]
+            sigs = sigs.merge(base_cols, on="ts", how="left")
+            sigs["timestamp"] = pd.to_numeric(sigs.get("timestamp"), errors="coerce").fillna(sigs["ts"]).astype(np.int64)
+            _ensure_signals_df(sigs)
+            sigs["timestamp_iso"] = _iso_from_ts_col(sigs, "ts")
+            out = sigs.to_dict(orient="records")
+            LOG.info(
+                "Signals ensemble %s/%s tf=%s bars=%d -> %d rows",
+                source,
+                symbol,
+                tf,
+                len(df),
+                len(out),
+            )
+            return {"signals": out, "mode": "ensemble"}
+        else:
+            # 3) сигналы EMA
+            sigs = ema_cross_signals(df, fast, slow).copy()
+            _ensure_signals_df(sigs)
 
-        # 5) стабильная сериализация
-        out = sigs.to_dict(orient="records")
-        LOG.info(
-            "Signals %s/%s tf=%s fast=%d slow=%d bars=%d -> %d rows",
-            source, symbol, tf, fast, slow, len(df), len(out),
-        )
-        return {"signals": out}
+            # 4) добавим ISO-время для удобства UI/отладки
+            sigs["timestamp_iso"] = _iso_from_ts_col(sigs, "ts")
+
+            # 5) стабильная сериализация
+            out = sigs.to_dict(orient="records")
+            LOG.info(
+                "Signals %s/%s tf=%s fast=%d slow=%d bars=%d -> %d rows",
+                source, symbol, tf, fast, slow, len(df), len(out),
+            )
+            return {"signals": out, "mode": "ema"}
 
     except HTTPException:
         raise
