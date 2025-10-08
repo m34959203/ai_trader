@@ -1,8 +1,15 @@
+Microsoft Windows [Version 10.0.19044.6216]
+(c) Корпорация Майкрософт (Microsoft Corporation). Все права защищены.
+
+C:\Users\Дмитрий>
+
+C:\Users\Дмитрий>cd C:\Users\Дмитрий\Desktop\ai_trader
 
 C:\Users\Дмитрий\Desktop\ai_trader>tree /f
 Структура папок
-Серийный номер тома: 7404-48E4
+Серийный номер тома: 000001C9 7404:48E4
 C:.
+│   .gitignore
 │   alembic.ini
 │   docker-compose.yml
 │   Dockerfile
@@ -10,6 +17,7 @@ C:.
 │   requirements-dev.txt
 │   requirements.txt
 │   run-dev.bat
+│   run_tests.bat
 │   setup.py
 │
 ├───.pytest_cache
@@ -19,6 +27,7 @@ C:.
 │   │
 │   └───v
 │       └───cache
+│               lastfailed
 │               nodeids
 │               stepwise
 │
@@ -30,6 +39,7 @@ C:.
 │       .env
 │       .env.test
 │       exec.yaml
+│       risk.yaml
 │
 ├───data
 │   │   ai_trader.db
@@ -69,7 +79,7 @@ C:.
 │       структура файлов и папок в проекте.txt
 │       технический аудит с конкретикой что делает каждый файл.docx
 │       Функционал AI-трейдера.docx
-│       Чек-лист промышленной эксплуатации AI-Трейдера.docx
+│       Чек-лист боеготовности AI-Трейдера .docx
 │
 ├───executors
 │   │   api_binance.py
@@ -113,14 +123,18 @@ C:.
 │           deadman.cpython-311.pyc
 │
 ├───routers
+│   │   autopilot.py
 │   │   ohlcv.py
+│   │   ohlcv_read.py
 │   │   trading.py
 │   │   trading_exec.py
 │   │   ui.py
 │   │   __init__.py
 │   │
 │   └───__pycache__
+│           autopilot.cpython-311.pyc
 │           ohlcv.cpython-311.pyc
+│           ohlcv_read.cpython-311.pyc
 │           trading.cpython-311.pyc
 │           trading_exec.cpython-311.pyc
 │           ui.cpython-311.pyc
@@ -138,6 +152,7 @@ C:.
 │
 ├───scripts
 │       demo_analyze.py
+│       faucet_request.py
 │       init_db.py
 │       reset_db.py
 │
@@ -207,6 +222,16 @@ C:.
 │
 ├───static
 │       htmx.min.js
+│
+├───tasks
+│   │   auto_trader.py
+│   │   ohlcv_loader.py
+│   │   __init__.py
+│   │
+│   └───__pycache__
+│           auto_trader.cpython-311.pyc
+│           ohlcv_loader.cpython-311.pyc
+│           __init__.cpython-311.pyc
 │
 ├───templates
 │   └───monitor

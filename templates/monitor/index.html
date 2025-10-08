@@ -60,9 +60,8 @@
 
     <!-- Controls -->
     <div id="controls" class="bg-white border border-gray-200 rounded-md p-4 mb-6 shadow-sm"
-         data-tooltip="Эти параметры передаются в каждый запрос партиалов (balance/positions/orders/metrics). 
-         Измени режим исполнения и testnet — и нажми «Обновить сейчас» или дождись автообновления.">
-      <form class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end" onsubmit="return false;">
+         data-tooltip="Эти параметры передаются в каждый запрос партиалов (balance/positions/orders/metrics).">
+      <form id="ui-form" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end" onsubmit="return false;">
         <!-- Exec mode -->
         <label class="block">
           <span class="block text-sm font-medium mb-1">Режим исполнения
@@ -70,7 +69,7 @@
                   data-tooltip="binance — реальные REST/WebSocket-данные биржи; sim — симулятор без реальных сделок.">i</span>
           </span>
           <select id="mode" name="mode" class="w-full border-gray-300 rounded-md">
-            <option value="binance">binance</option>
+            <option value="binance" selected>binance</option>
             <option value="sim">sim</option>
           </select>
         </label>
@@ -82,7 +81,7 @@
                   data-tooltip="true — использовать тестовую среду Binance (нужны отдельные API-ключи). false — основная сеть.">i</span>
           </span>
           <select id="testnet" name="testnet" class="w-full border-gray-300 rounded-md">
-            <option value="true">true</option>
+            <option value="true" selected>true</option>
             <option value="false">false</option>
           </select>
         </label>
@@ -94,8 +93,8 @@
                   data-tooltip="Периодический опрос всех карточек. 0 — отключить автообновление.">i</span>
           </span>
           <select id="refreshSec" class="w-full border-gray-300 rounded-md">
-            <option value="5">каждые 5s</option>
-            <option value="10" selected>каждые 10s</option>
+            <option value="5" selected>каждые 5s</option>
+            <option value="10">каждые 10s</option>
             <option value="15">каждые 15s</option>
             <option value="30">каждые 30s</option>
             <option value="0">выкл.</option>
@@ -116,56 +115,56 @@
 
     <!-- 4-column grid -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
-      <!-- Balance -->
-      <section id="balance-container"
+      <!-- Balance (STABLE WRAPPER) -->
+      <section id="balance-box"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
         hx-get="/ui/partials/balance"
-        hx-trigger="load, refresh"
-        hx-include="#controls"
-        hx-params="mode,testnet"
+        hx-trigger="load, refresh, every 5s"
+        hx-include="#ui-form"
         hx-indicator=".htmx-indicator"
+        hx-target="#balance"
         hx-swap="outerHTML"
         data-tooltip="Текущий equity в USDT и лимиты риск-менеджмента.">
-        <div class="text-sm text-gray-500">Загрузка баланса…</div>
+        <div id="balance"><div class="text-sm text-gray-500">Загрузка баланса…</div></div>
       </section>
 
-      <!-- Positions -->
-      <section id="positions-container"
+      <!-- Positions (STABLE WRAPPER) -->
+      <section id="positions-box"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
         hx-get="/ui/partials/positions"
-        hx-trigger="load, refresh"
-        hx-include="#controls"
-        hx-params="mode,testnet"
+        hx-trigger="load, refresh, every 5s"
+        hx-include="#ui-form"
         hx-indicator=".htmx-indicator"
+        hx-target="#positions"
         hx-swap="outerHTML"
         data-tooltip="Список открытых позиций.">
-        <div class="text-sm text-gray-500">Загрузка позиций…</div>
+        <div id="positions"><div class="text-sm text-gray-500">Загрузка позиций…</div></div>
       </section>
 
-      <!-- Orders -->
-      <section id="orders-container"
+      <!-- Orders (STABLE WRAPPER) -->
+      <section id="orders-box"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
-        hx-get="/ui/partials/orders"
-        hx-trigger="load, refresh"
-        hx-include="#controls"
-        hx-params="mode,testnet"
+        hx-get="/ui/partials/orders?limit=30"
+        hx-trigger="load, refresh, every 5s"
+        hx-include="#ui-form"
         hx-indicator=".htmx-indicator"
+        hx-target="#orders"
         hx-swap="outerHTML"
         data-tooltip="Последние ордера из БД.">
-        <div class="text-sm text-gray-500">Загрузка журнала ордеров…</div>
+        <div id="orders"><div class="text-sm text-gray-500">Загрузка журнала ордеров…</div></div>
       </section>
 
-      <!-- Metrics -->
-      <section id="metrics-container"
+      <!-- Metrics (STABLE WRAPPER) -->
+      <section id="metrics-box"
         class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
         hx-get="/ui/partials/metrics"
-        hx-trigger="load, refresh"
-        hx-include="#controls"
-        hx-params="mode,testnet"
+        hx-trigger="load, refresh, every 60s"
+        hx-include="#ui-form"
         hx-indicator=".htmx-indicator"
+        hx-target="#metrics"
         hx-swap="outerHTML"
         data-tooltip="Sharpe и волатильность BTCUSDT/1h.">
-        <div class="text-sm text-gray-500">Загрузка метрик…</div>
+        <div id="metrics"><div class="text-sm text-gray-500">Загрузка метрик…</div></div>
       </section>
     </div>
 
@@ -186,7 +185,7 @@
     function initControlsFromStorage(){
       document.getElementById('mode').value     = lsGet(LS_KEYS.mode, 'binance');
       document.getElementById('testnet').value  = lsGet(LS_KEYS.testnet, 'true');
-      document.getElementById('refreshSec').value = lsGet(LS_KEYS.refreshSec, '10');
+      document.getElementById('refreshSec').value = lsGet(LS_KEYS.refreshSec, '5');
       applyTheme(lsGet(LS_KEYS.theme, 'light'));
     }
     function persistControls(){
@@ -211,20 +210,20 @@
       lsSet(LS_KEYS.theme,next); applyTheme(next);
     });
 
-    // ------------------------ Intervals & refresh ------------------------
-    function setSectionInterval(id, sec){
+    // ------------------------ Intervals & refresh (work on *-box wrappers) ------------------------
+    function setBoxInterval(id, sec){
       const el=document.getElementById(id); if(!el) return;
       const base='load, refresh';
       el.setAttribute('hx-trigger', sec>0 ? `${base}, every ${sec}s` : base);
     }
     function applyIntervals(){
-      const sec=parseInt(document.getElementById('refreshSec').value||'10',10);
-      ['balance-container','positions-container','orders-container','metrics-container'].forEach(id=>setSectionInterval(id,sec));
+      const sec=parseInt(document.getElementById('refreshSec').value||'5',10);
+      ['balance-box','positions-box','orders-box','metrics-box'].forEach(id=>setBoxInterval(id,sec));
       persistControls();
       refreshAll();
     }
     function refreshAll(){
-      ['balance-container','positions-container','orders-container','metrics-container'].forEach(id=>{
+      ['balance-box','positions-box','orders-box','metrics-box'].forEach(id=>{
         const el=document.getElementById(id);
         if (el && window.htmx && htmx.trigger) { htmx.trigger(el,'refresh'); }
       });

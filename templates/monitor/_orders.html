@@ -1,26 +1,89 @@
-<section id="orders-container"
-  class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
-  hx-get="/ui/partials/orders"
-  hx-trigger="refresh"
-  hx-include="#controls"
-  hx-params="mode,testnet"
-  hx-indicator=".htmx-indicator"
-  hx-swap="outerHTML">
-
+<div id="orders">
   <h2 class="text-lg font-semibold mb-2">Ордера</h2>
+
   {% if orders and orders|length > 0 %}
-    <ul class="divide-y">
-      {% for o in orders %}
-        <li class="py-1">
-          {{ o.symbol }} — {{ o.side }} {{ o.qty }}
-          ({{ o.status }}){% if o.price is not none %} @ {{ o.price }}{% endif %}
-        </li>
-      {% endfor %}
-    </ul>
+    <div class="overflow-x-auto">
+      <table class="min-w-full text-sm border border-gray-200 rounded">
+        <thead class="bg-gray-50">
+          <tr>
+            <th class="px-3 py-2 text-left">Время</th>
+            <th class="px-3 py-2 text-left">Символ</th>
+            <th class="px-3 py-2 text-left">Сторона</th>
+            <th class="px-3 py-2 text-right">Кол-во</th>
+            <th class="px-3 py-2 text-right">Цена</th>
+            <th class="px-3 py-2 text-left">Статус</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for o in orders %}
+            {# полей может не быть — даём безопасные дефолты #}
+            {% set ts = o.timestamp or o.time or o.created_at or o.updateTime or o.transactTime %}
+            {% set symbol = o.symbol or o.asset or '-' %}
+            {% set side = (o.side or o.positionSide or '-')
+                          | upper %}
+            {% set qty = o.qty or o.origQty or o.executedQty or o.cumQty %}
+            {% set price = o.price if o.price is not none else (o.avgPrice if o.avgPrice is not none else o.stopPrice) %}
+            {% set status = (o.status or o.orderStatus or '-') | upper %}
+
+            {# бэйджи для side/status #}
+            {% if side == 'BUY' %}
+              {% set side_cls = 'bg-emerald-50 text-emerald-800 border-emerald-200' %}
+            {% elif side == 'SELL' %}
+              {% set side_cls = 'bg-rose-50 text-rose-800 border-rose-200' %}
+            {% else %}
+              {% set side_cls = 'bg-gray-50 text-gray-700 border-gray-200' %}
+            {% endif %}
+
+            {% set st = status %}
+            {% if st in ['NEW','PARTIALLY_FILLED','PENDING','ACCEPTED'] %}
+              {% set st_cls = 'bg-indigo-50 text-indigo-800 border-indigo-200' %}
+            {% elif st in ['FILLED','COMPLETED','DONE'] %}
+              {% set st_cls = 'bg-emerald-50 text-emerald-800 border-emerald-200' %}
+            {% elif st in ['CANCELED','CANCELLED','EXPIRED','REJECTED'] %}
+              {% set st_cls = 'bg-rose-50 text-rose-800 border-rose-200' %}
+            {% else %}
+              {% set st_cls = 'bg-gray-50 text-gray-700 border-gray-200' %}
+            {% endif %}
+
+            <tr class="border-t">
+              <td class="px-3 py-2 whitespace-nowrap">
+                {% if ts %}
+                  {{ ts }}
+                {% else %}
+                  <span class="text-gray-400">—</span>
+                {% endif %}
+              </td>
+              <td class="px-3 py-2">{{ symbol }}</td>
+              <td class="px-3 py-2">
+                <span class="text-xs px-2 py-0.5 border rounded {{ side_cls }}">{{ side }}</span>
+              </td>
+              <td class="px-3 py-2 text-right">
+                {% if qty is not none %}
+                  {{ qty }}
+                {% else %}
+                  <span class="text-gray-400">—</span>
+                {% endif %}
+              </td>
+              <td class="px-3 py-2 text-right">
+                {% if price is not none %}
+                  {{ price }}
+                {% else %}
+                  <span class="text-gray-400">—</span>
+                {% endif %}
+              </td>
+              <td class="px-3 py-2">
+                <span class="text-xs px-2 py-0.5 border rounded {{ st_cls }}">{{ status }}</span>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
     {% if updated_at %}
       <p class="mt-2 text-xs text-gray-400">Обновлено: {{ updated_at }}</p>
     {% endif %}
   {% else %}
     <p class="text-gray-500">Журнал ордеров пуст</p>
   {% endif %}
-</section>
+</div>

@@ -1,3 +1,4 @@
+# executors/api_binance.py
 from __future__ import annotations
 
 import hmac
@@ -18,10 +19,25 @@ import httpx
 getcontext().prec = 40
 
 # Проектные ключи (ENV/.env), бросает RuntimeError с понятным текстом при отсутствии
-from utils.secrets import get_binance_keys
+try:
+    from utils.secrets import get_binance_keys
+except Exception:
+    # безопасный фолбэк, если модуль ещё не добавлен
+    def get_binance_keys(*, testnet: bool = True) -> tuple[str, str]:
+        api_key = os.getenv("BINANCE_TESTNET_API_KEY" if testnet else "BINANCE_API_KEY", "")
+        api_secret = os.getenv("BINANCE_TESTNET_API_SECRET" if testnet else "BINANCE_API_SECRET", "")
+        if not api_key or not api_secret:
+            raise RuntimeError("Binance API keys not configured in environment")
+        return api_key, api_secret
+
 
 LOG = logging.getLogger("executors.api_binance")
 
+BINANCE_DOMAIN_MAIN = "https://api.binance.com"
+BINANCE_DOMAIN_TEST = "https://testnet.binance.vision"
+
+# Все пути внизу вызываются с префиксом "/api/v3/..." (base_url = DOMAIN без /api)
+API_PREFIX = "/api/v3"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Базовый протокол исполнителя
@@ -78,10 +94,14 @@ class _BinanceSpotClient:
     Private:
       - POST   /api/v3/order
       - DELETE /api/v3/order
+      - DELETE /api/v3/openOrders        (cancel all open orders on a symbol)
       - POST   /api/v3/order/oco
       - GET    /api/v3/account
       - GET    /api/v3/openOrders
+      - GET    /api/v3/order             (get order)
+
     Public:
+      - GET    /api/v3/ping
       - GET    /api/v3/time
       - GET    /api/v3/exchangeInfo
       - GET    /api/v3/ticker/price
@@ -90,15 +110,18 @@ class _BinanceSpotClient:
     def __init__(
         self,
         creds: _Creds,
-        base_url: str,
+        base_domain: str,
         recv_window: int = 5000,
         timeout: float = 20.0,
         max_retries: int = 5,
         backoff_base: float = 0.5,
         backoff_cap: float = 8.0,
+        user_agent: str = "AI-Trader/1.0 (+binance-spot)",
+        trust_env: bool = True,
     ):
         self.creds = creds
-        self.base_url = base_url.rstrip("/")
+        # domain без /api; пути будут начинаться с /api/v3/...
+        self.base_url = base_domain.rstrip("/")
         self.recv_window = max(1, int(recv_window))
         self.max_retries = max(0, int(max_retries))
         self.backoff_base = float(backoff_base)
@@ -118,13 +141,15 @@ class _BinanceSpotClient:
             max_connections=20,
             keepalive_expiry=30.0,
         )
+        self._headers_default = {"User-Agent": user_agent}
+
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self._timeout,
             limits=self._limits,
-            headers=None,
+            headers=self._headers_default,
             http2=False,
-            trust_env=True,
+            trust_env=trust_env,
         )
 
         # serverTime - local_time_ms drift
@@ -156,6 +181,7 @@ class _BinanceSpotClient:
                 base_url=self.base_url,
                 timeout=self._timeout,
                 limits=self._limits,
+                headers=self._headers_default,
                 http2=False,
                 trust_env=True,
             )
@@ -191,7 +217,7 @@ class _BinanceSpotClient:
         if (now - self._last_sync_ts) < self._sync_interval_sec:
             return
         try:
-            resp = await self._client.get("/api/v3/time")
+            resp = await self._client.get(f"{API_PREFIX}/time")
             resp.raise_for_status()
             data = resp.json()
             server_time = int(data.get("serverTime"))
@@ -326,11 +352,14 @@ class _BinanceSpotClient:
                 raise
 
     # -------- Публичные утилиты (с кэшом) --------
+    async def ping(self) -> None:
+        await self._request_with_retries("GET", f"{API_PREFIX}/ping", params={}, sign=False)
+
     async def get_exchange_info(self) -> Dict[str, Any]:
         now = time.time()
         if self._ex_info_cache and (now - self._ex_info_cache_ts) < self._ex_info_ttl:
             return self._ex_info_cache
-        data = await self._request_with_retries("GET", "/api/v3/exchangeInfo", params={}, sign=False)
+        data = await self._request_with_retries("GET", f"{API_PREFIX}/exchangeInfo", params={}, sign=False)
         self._ex_info_cache = data or {}
         self._ex_info_cache_ts = now
         return data
@@ -345,7 +374,7 @@ class _BinanceSpotClient:
             if (now - ts) < self._all_tickers_ttl:
                 return {k: v for k, (v, _) in self._all_tickers_cache.items()}
 
-        data = await self._request_with_retries("GET", "/api/v3/ticker/price", params={}, sign=False)
+        data = await self._request_with_retries("GET", f"{API_PREFIX}/ticker/price", params={}, sign=False)
         prices: Dict[str, Decimal] = {}
         for t in data or []:
             try:
@@ -396,7 +425,7 @@ class _BinanceSpotClient:
                 return price
 
         # 3) сеть
-        data = await self._request_with_retries("GET", "/api/v3/ticker/price", params={"symbol": sym}, sign=False)
+        data = await self._request_with_retries("GET", f"{API_PREFIX}/ticker/price", params={"symbol": sym}, sign=False)
         p = data.get("price")
         try:
             price = Decimal(str(p))
@@ -406,7 +435,15 @@ class _BinanceSpotClient:
             return None
 
     async def get_time(self) -> Dict[str, Any]:
-        return await self._request_with_retries("GET", "/api/v3/time", params={}, sign=False)
+        return await self._request_with_retries("GET", f"{API_PREFIX}/time", params={}, sign=False)
+
+    async def get_order(self, symbol: str, orderId: Optional[int] = None, origClientOrderId: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"symbol": symbol.upper()}
+        if orderId is not None:
+            params["orderId"] = orderId
+        if origClientOrderId is not None:
+            params["origClientOrderId"] = origClientOrderId
+        return await self._request_with_retries("GET", f"{API_PREFIX}/order", params=params, sign=True)
 
     # ---- ордера/баланс ----
     async def post_order(
@@ -422,6 +459,7 @@ class _BinanceSpotClient:
         timeInForce: Optional[str] = None,
         newClientOrderId: Optional[str] = None,
         newOrderRespType: Optional[str] = None,  # "ACK" | "RESULT" | "FULL"
+        test: bool = False,  # /order/test
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {"symbol": symbol.upper(), "side": side.upper(), "type": type.upper()}
         if quantity is not None:
@@ -438,7 +476,9 @@ class _BinanceSpotClient:
             params["newClientOrderId"] = newClientOrderId
         if newOrderRespType:
             params["newOrderRespType"] = newOrderRespType
-        return await self._request_with_retries("POST", "/api/v3/order", params=params, sign=True)
+
+        path = f"{API_PREFIX}/order/test" if test else f"{API_PREFIX}/order"
+        return await self._request_with_retries("POST", path, params=params, sign=True)
 
     async def post_oco_order(
         self,
@@ -473,7 +513,7 @@ class _BinanceSpotClient:
         if newOrderRespType:
             params["newOrderRespType"] = newOrderRespType
 
-        return await self._request_with_retries("POST", "/api/v3/order/oco", params=params, sign=True)
+        return await self._request_with_retries("POST", f"{API_PREFIX}/order/oco", params=params, sign=True)
 
     async def delete_order(
         self,
@@ -487,22 +527,29 @@ class _BinanceSpotClient:
             params["orderId"] = orderId
         if origClientOrderId is not None:
             params["origClientOrderId"] = origClientOrderId
-        return await self._request_with_retries("DELETE", "/api/v3/order", params=params, sign=True)
+        return await self._request_with_retries("DELETE", f"{API_PREFIX}/order", params=params, sign=True)
+
+    async def delete_open_orders(self, *, symbol: str) -> Dict[str, Any]:
+        """
+        Отмена всех открытых ордеров по символу (DELETE /api/v3/openOrders).
+        """
+        params: Dict[str, Any] = {"symbol": symbol.upper()}
+        return await self._request_with_retries("DELETE", f"{API_PREFIX}/openOrders", params=params, sign=True)
 
     async def get_account(self) -> Dict[str, Any]:
-        return await self._request_with_retries("GET", "/api/v3/account", params={}, sign=True)
+        return await self._request_with_retries("GET", f"{API_PREFIX}/account", params={}, sign=True)
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {}
         if symbol:
             params["symbol"] = symbol.upper()
-        data = await self._request_with_retries("GET", "/api/v3/openOrders", params=params, sign=True)
+        data = await self._request_with_retries("GET", f"{API_PREFIX}/openOrders", params=params, sign=True)
         return data if isinstance(data, list) else []
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Вспомогательная асинхронная пауза
-    # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# Вспомогательная асинхронная пауза
+# ──────────────────────────────────────────────────────────────────────
 async def _sleep_async(seconds: float) -> None:
     import asyncio
     await asyncio.sleep(seconds)
@@ -512,6 +559,7 @@ def _to_str(x: float | int | str | Decimal) -> str:
     if isinstance(x, str):
         return x
     d = Decimal(str(x))
+    # normalize без экспоненты
     return format(d.normalize(), "f")
 
 
@@ -555,6 +603,7 @@ class BinanceExecutor(Executor):
     Совместим со спринтом 4+:
       - open_order / close_order / list_positions / fetch_balance
       - защитные приказы (SL/TP/OCO) через open_with_protection
+      - delete_open_orders(symbol=...), get_order(...)
     """
 
     name = "binance"
@@ -572,35 +621,31 @@ class BinanceExecutor(Executor):
 
         # Ключи из ENV, если явно не передали
         if not api_key or not api_secret:
-            try:
-                api_key, api_secret = get_binance_keys(testnet=self.testnet)
-            except RuntimeError as e:
-                raise RuntimeError("Binance API keys not configured in environment") from e
+            api_key, api_secret = get_binance_keys(testnet=self.testnet)
 
         self.creds = _Creds(api_key=api_key, api_secret=api_secret)
 
-        base = self.config.get("base_url") or ("https://testnet.binance.vision" if testnet else "https://api.binance.com")
+        base_domain = self.config.get("base_url") or (BINANCE_DOMAIN_TEST if testnet else BINANCE_DOMAIN_MAIN)
         recv_window = int(self.config.get("recv_window", 5000))
-
-        timeout_cfg = float(self.config.get("timeout", 20.0))
-        if timeout_cfg <= 0:
-            timeout_cfg = 20.0
-
+        timeout_cfg = float(self.config.get("timeout", 20.0)) or 20.0
         max_retries = int(self.config.get("max_retries", 5))
         backoff_base = float(self.config.get("backoff_base", 0.5))
         backoff_cap = float(self.config.get("backoff_cap", 8.0))
+        user_agent = str(self.config.get("user_agent", "AI-Trader/1.0 (+binance-spot)"))
 
         self.client = _BinanceSpotClient(
             self.creds,
-            base_url=base,
+            base_domain=base_domain,
             recv_window=recv_window,
             timeout=timeout_cfg,
             max_retries=max_retries,
             backoff_base=backoff_base,
             backoff_cap=backoff_cap,
+            user_agent=user_agent,
+            trust_env=True,
         )
 
-        # Опциональный локальный регистр позиций; для прода полагаться на reconcile/балансы
+        # Опциональный локальный регистр позиций; для прод полагаться на reconcile/балансы
         self._track_local_pos: bool = bool(self.config.get("track_local_pos", False))
         self._pos: Dict[str, float] = {}
 
@@ -799,6 +844,7 @@ class BinanceExecutor(Executor):
         timeInForce: Optional[str] = None,
         client_order_id: Optional[str] = None,
         quote_qty: Optional[float] = None,
+        test: bool = False,
     ) -> Dict[str, Any]:
         side_u = side.upper()
         type_u = type.upper()
@@ -841,7 +887,23 @@ class BinanceExecutor(Executor):
             timeInForce=timeInForce,
             newClientOrderId=client_order_id,
             newOrderRespType="FULL",  # чтобы получить fills/комиссии
+            test=test,
         )
+
+        # Если это тестовый ордер — Binance возвращает {} при успехе
+        if test:
+            return {
+                "exchange": "binance",
+                "testnet": self.testnet,
+                "test_order": True,
+                "symbol": symbol.upper(),
+                "side": side.lower(),
+                "type": type.lower(),
+                "qty": float(qty_adj or 0.0),
+                "price": float(price_adj or 0.0) if price_adj else None,
+                "status": "TEST_OK",
+                "raw": resp,
+            }
 
         # расчёт исполнения
         status_u = (resp.get("status") or "").upper()

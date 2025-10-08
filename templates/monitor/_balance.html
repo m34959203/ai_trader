@@ -1,17 +1,20 @@
-<section id="balance-container"
-  class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
-  hx-get="/ui/partials/balance"
-  hx-trigger="refresh from:body"
-  hx-include="#controls"
-  hx-params="mode,testnet"
-  hx-indicator=".htmx-indicator"
-  hx-swap="outerHTML">
-
+<div id="balance">
   {% if bal %}
     <!-- Заголовок -->
-    <h2 class="text-lg font-semibold mb-3">
-      Баланс ({{ bal.exchange|upper }}{% if bal.testnet %} — TESTNET{% endif %})
-    </h2>
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-lg font-semibold">
+        Баланс
+        <span class="ml-1 text-gray-500">({{ (bal.exchange or 'binance')|upper }})</span>
+        {% if bal.testnet %}
+          <span class="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 border border-yellow-200">
+            TESTNET
+          </span>
+        {% endif %}
+      </h2>
+      <div class="text-xs text-gray-500">
+        Обновлено: {{ (bal.updated_at or '') or (now() if now is defined else '') }}
+      </div>
+    </div>
 
     <!-- Equity -->
     <div class="mb-4">
@@ -19,12 +22,16 @@
       {% if bal.equity_usdt is not none %}
         <span class="font-semibold">{{ '%.2f'|format(bal.equity_usdt) }}</span>
       {% else %}
-        {# fallback: сумма стейблов #}
+        {# Fallback: суммируем стейблы #}
         {% set stables = ['USDT','USDC','FDUSD','TUSD','BUSD','USD'] %}
-        {% set total_stable = 0 %}
-        {% for b in bal.balances or [] %}
-          {% if b.asset in stables %}
-            {% set total_stable = total_stable + (b.total or 0) %}
+        {% set total_stable = 0.0 %}
+        {% for b in (bal.balances or []) %}
+          {% set asset = (b.asset or b['asset']) if b is mapping or b is defined else None %}
+          {% if asset in stables %}
+            {% set free = (b.free if b.free is not none else 0.0) %}
+            {% set locked = (b.locked if b.locked is not none else 0.0) %}
+            {% set total = (b.total if b.total is not none else (free + locked)) %}
+            {% set total_stable = total_stable + (total or 0.0) %}
           {% endif %}
         {% endfor %}
         {% if total_stable > 0 %}
@@ -36,10 +43,41 @@
       {% endif %}
     </div>
 
+    <!-- Риск-лимиты -->
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      <div class="space-y-1 text-sm">
+        <div><span class="text-gray-500">Начальный equity:</span>
+          <span class="font-medium">
+            {{ '%.2f'|format(bal.risk.daily_start_equity) if bal.risk and bal.risk.daily_start_equity is not none else '—' }}
+          </span>
+        </div>
+        <div><span class="text-gray-500">Макс. убыток (день), %:</span>
+          <span class="font-medium">
+            {{ '%.2f'|format((bal.risk.daily_max_loss_pct or 0.0) * 100) if bal.risk else '—' }}
+          </span>
+        </div>
+      </div>
+      <div class="space-y-1 text-sm">
+        <div><span class="text-gray-500">Max trades/day:</span>
+          <span class="font-medium">
+            {{ bal.risk.max_trades_per_day if bal.risk and bal.risk.max_trades_per_day is not none else '—' }}
+          </span>
+        </div>
+        <div><span class="text-gray-500">Exposure / Leverage:</span>
+          <span class="font-medium">
+            {{ (bal.risk.exposure or 0) if bal.risk else 0 }} / {{ (bal.risk.leverage or 0) if bal.risk else 0 }}
+          </span>
+        </div>
+      </div>
+    </div>
+
     <!-- Таблица активов -->
-    {% if bal.balances %}
-      {% set rows = (bal.balances | selectattr('total','gt',0) | list) %}
-      {% if rows|length > 0 %}
+    {% set balances = (bal.balances or []) %}
+    {% if balances and balances|length > 0 %}
+      {% set rows = balances | selectattr('total','gt',0) | list %}
+      {% if rows|length == 0 %}
+        <p class="text-gray-500">Нет активов с ненулевым балансом</p>
+      {% else %}
         {% set rows_sorted = rows|sort(attribute='total', reverse=True) %}
         <div class="overflow-x-auto">
           <table class="min-w-full text-sm border border-gray-200 rounded">
@@ -55,40 +93,26 @@
               {% for b in rows_sorted %}
                 <tr class="border-t">
                   <td class="px-3 py-1 font-medium">{{ b.asset }}</td>
-                  <td class="px-3 py-1 text-right">{{ '%.6f'|format(b.free) }}</td>
-                  <td class="px-3 py-1 text-right">{{ '%.6f'|format(b.locked) }}</td>
-                  <td class="px-3 py-1 text-right font-medium">{{ '%.6f'|format(b.total) }}</td>
+                  <td class="px-3 py-1 text-right">
+                    {{ '%.6f'|format(b.free if b.free is not none else 0.0) }}
+                  </td>
+                  <td class="px-3 py-1 text-right">
+                    {{ '%.6f'|format(b.locked if b.locked is not none else 0.0) }}
+                  </td>
+                  <td class="px-3 py-1 text-right font-medium">
+                    {{ '%.6f'|format(b.total if b.total is not none else ((b.free or 0.0)+(b.locked or 0.0))) }}
+                  </td>
                 </tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
-      {% else %}
-        <p class="text-gray-500">Нет активов с ненулевым балансом</p>
       {% endif %}
     {% else %}
       <p class="text-gray-500">Нет активов</p>
     {% endif %}
 
-    <!-- Риск-лимиты -->
-    <div class="mt-4">
-        <span class="font-medium">Equity USDT:</span>
-  {{ '%.2f'|format(bal.equity_usdt or 0.0) }}
-      <div class="font-medium">Лимиты риска:</div>
-      <ul class="list-disc ml-5 text-sm">
-        <li>Начальный equity:
-          {{ '%.2f'|format(bal.risk.daily_start_equity) if bal.risk.daily_start_equity is not none else '—' }}
-        </li>
-        <li>Макс. убыток (%):
-          {{ '%.2f'|format(bal.risk.daily_max_loss_pct * 100) if bal.risk.daily_max_loss_pct is not none else '—' }}
-        </li>
-        <li>Макс. сделок в день:
-          {{ bal.risk.max_trades_per_day if bal.risk.max_trades_per_day is not none else '—' }}
-        </li>
-      </ul>
-    </div>
-
   {% else %}
     <p class="text-gray-500">Баланс не получен</p>
   {% endif %}
-</section>
+</div>

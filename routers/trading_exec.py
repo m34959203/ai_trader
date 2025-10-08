@@ -1,3 +1,4 @@
+# ai_trader/routers/trading_exec.py
 from __future__ import annotations
 
 import os
@@ -399,14 +400,16 @@ def _sum_stables(free_map: Dict[str, float], locked_map: Dict[str, float]) -> fl
     """Сумма стейблов (free+locked) как «минимально достоверный» equity."""
     return sum((free_map.get(ccy, 0.0) + locked_map.get(ccy, 0.0)) for ccy in _STABLES)
 
-# ai_trader/routers/trading_exec.py  (заменить существующую реализацию полностью)
+# ──────────────────────────────────────────────────────────────────────────────
+# Устойчивая оценка equity в USDT
+# ──────────────────────────────────────────────────────────────────────────────
 async def _estimate_equity_usdt(executor) -> float:
     """
-    Устойчивая оценка equity в USDT для Testnet:
+    Устойчивая оценка equity в USDT:
       - Стейблы считаем напрямую (без сети).
       - Для остальных активов конвертируем ТОЛЬКО через пары, которые реально есть в get_all_tickers().
       - Никаких одиночных вызовов /ticker/price?symbol=... → исключаем 400 Invalid symbol.
-      - Никогда не бросаем исключений, на любой ошибке возвращаем текущее накопленное значение.
+      - Никогда не бросаем исключений; на любой ошибке возвращаем текущее накопленное значение.
     """
     try:
         bal = await asyncio.wait_for(executor.fetch_balance(), timeout=min(10.0, DEFAULT_OP_TIMEOUT))
@@ -434,15 +437,22 @@ async def _estimate_equity_usdt(executor) -> float:
                 free_map[asset] = free_map.get(asset, 0.0) + free
                 locked_map[asset] = locked_map.get(asset, 0.0) + locked
         else:
-            # Фолбэк на всякий случай
-            for k, v in dict(bal or {}).items():
-                kk = str(k).upper()
-                if kk in {"EXCHANGE", "TESTNET", "RAW", "UPDATETIME", "BALANCES"}:
-                    continue
-                try:
-                    free_map[kk] = free_map.get(kk, 0.0) + float(v or 0)
-                except Exception:
-                    continue
+            # Фолбэк: поддерживаем формат {"free": {...}, "locked": {...}}
+            if isinstance(bal, dict):
+                f = bal.get("free")
+                if isinstance(f, dict):
+                    for a, v in f.items():
+                        try:
+                            free_map[str(a).upper()] = free_map.get(str(a).upper(), 0.0) + float(v or 0.0)
+                        except Exception:
+                            continue
+                l = bal.get("locked")
+                if isinstance(l, dict):
+                    for a, v in l.items():
+                        try:
+                            locked_map[str(a).upper()] = locked_map.get(str(a).upper(), 0.0) + float(v or 0.0)
+                        except Exception:
+                            continue
     except Exception:
         # не падаем
         pass
@@ -451,61 +461,22 @@ async def _estimate_equity_usdt(executor) -> float:
     total = 0.0
     for ccy in _STABLES:
         if ccy in free_map or ccy in locked_map:
-            free = free_map.get(ccy, 0.0)
-            locked = locked_map.get(ccy, 0.0)
-            total += free + locked
+            total += free_map.get(ccy, 0.0) + locked_map.get(ccy, 0.0)
 
-        # 3) Если других активов нет — вернули сумму стейблов
-        assets = (set(free_map.keys()) | set(locked_map.keys())) - _STABLES
-        assets = {a for a in assets if (free_map.get(a, 0.0) + locked_map.get(a, 0.0)) > 0.0}
-        if not assets:
-            return float(total)
-
-    # 4) Берём батч всех цен и строим множество существующих USDT-символов
-    prices_map: Dict[str, float] = {}
-    usdt_set: set[str] = set()
-    try:
-        # поддерживаем как client.get_all_tickers(), так и executor.get_all_tickers()
-        src = None
-        for attr in ("client", None):
-            target = getattr(executor, attr, executor) if attr else executor
-            fn = getattr(target, "get_all_tickers", None)
-            if callable(fn):
-                try:
-                    res = await asyncio.wait_for(fn(), timeout=5.0)
-                    if isinstance(res, dict):
-                        for s, p in res.items():
-                            ss = str(s).upper()
-                            try:
-                                prices_map[ss] = float(p)
-                                if ss.endswith("USDT"):
-                                    usdt_set.add(ss)
-                            except Exception:
-                                continue
-                        src = "dict"
-                        break
-                    elif isinstance(res, list):
-                        for it in res:
-                            try:
-                                ss = str(it.get("symbol") or "").upper()
-                                pp = float(it.get("price") or 0)
-                                prices_map[ss] = pp
-                                if ss.endswith("USDT"):
-                                    usdt_set.add(ss)
-                            except Exception:
-                                continue
-                        src = "list"
-                        break
-                except Exception:
-                    continue
-        if not src:
-            # если не получилось — тихо выходим с тем, что уже посчитали
-            return float(total)
-    except Exception:
+    # 3) Список остальных активов с ненулевым остатком
+    assets = (set(free_map.keys()) | set(locked_map.keys())) - _STABLES
+    assets = {a for a in assets if (free_map.get(a, 0.0) + locked_map.get(a, 0.0)) > 0.0}
+    if not assets:
         return float(total)
 
-    # 5) Конвертируем только те активы, у которых есть пара к USDT в полученном батче
-    #   ограничим TOP-12 по объёму, чтобы не гонять тысячи активов фантомов
+    # 4) Берём батч всех цен и выделяем доступные пары к USDT
+    prices_map: Dict[str, float] = await _get_all_tickers_prices(executor)
+    usdt_set: set[str] = {s for s in prices_map.keys() if s.endswith("USDT")}
+    if not prices_map or not usdt_set:
+        # нет цен — возвращаем хотя бы сумму стейблов
+        return float(total)
+
+    # 5) Конвертируем TOP-12 по объёму в USDT
     top_assets = sorted(
         assets,
         key=lambda a: free_map.get(a, 0.0) + locked_map.get(a, 0.0),
@@ -516,7 +487,6 @@ async def _estimate_equity_usdt(executor) -> float:
     for a in top_assets:
         symbol = f"{a}USDT"
         if symbol not in usdt_set:
-            # пары нет на тестнете — пропускаем этот актив
             continue
         px = prices_map.get(symbol)
         if not px or px <= 0:
@@ -527,73 +497,6 @@ async def _estimate_equity_usdt(executor) -> float:
         add += amount * px
 
     return float(total + add)
-
-
-    # Берём TOP-N по величине, чтобы не долбить сеть по мелочи
-    top_assets = sorted(
-        [a for a in assets if (free_map.get(a, 0.0) + locked_map.get(a, 0.0)) > 0.0],
-        key=lambda a: free_map.get(a, 0.0) + locked_map.get(a, 0.0),
-        reverse=True,
-    )[:12]
-
-    # Кеш доступных USDT-символов (чтобы не ловить 400 Invalid symbol на Testnet)
-    usdt_symbols = await _get_usdt_symbols(executor)
-
-    prices = await _get_all_tickers_prices(executor)
-
-    async def _get_px(sym: str) -> Optional[float]:
-        # Сначала из батча
-        px = prices.get(sym)
-        if px is not None:
-            return float(px)
-        # Фолбэк: поштучно (только если символ существует)
-        if usdt_symbols and sym not in usdt_symbols:
-            return None
-        for name in ("get_price", "get_ticker_price", "price"):
-            m = getattr(executor, name, None)
-            if callable(m):
-                try:
-                    v = await asyncio.wait_for(m(sym), timeout=2.0)
-                    if isinstance(v, dict):
-                        for key in ("price", "last", "close", "markPrice", "lastPrice"):
-                            if key in v:
-                                v = v[key]
-                                break
-                    if v is None:
-                        continue
-                    return float(v)
-                except Exception:
-                    continue
-        return None
-
-    sem = asyncio.Semaphore(6)
-
-    async def _one(asset: str) -> float:
-        amount = free_map.get(asset, 0.0) + locked_map.get(asset, 0.0)
-        if amount <= 0:
-            return 0.0
-        symbol = f"{asset}USDT"
-        # если заранее знаем, что пары нет — игнорируем актив
-        if usdt_symbols and (symbol not in usdt_symbols):
-            return 0.0
-        px = await _get_px(symbol)
-        return amount * float(px or 0.0)
-
-    async def _guarded(asset: str) -> float:
-        async with sem:
-            try:
-                return await _one(asset)
-            except Exception:
-                return 0.0
-
-    parts = await asyncio.gather(*[_guarded(a) for a in top_assets], return_exceptions=False)
-    total += sum(parts)
-
-    # если по каким-то причинам оценка нулевая – возвращаем хотя бы сумму стейблов
-    if total <= 0.0:
-        total = _sum_stables(free_map, locked_map)
-
-    return float(total)
 
 async def _entry_price_for_order(executor, *, symbol: str, order_type: str, provided_price: Optional[float]) -> Optional[float]:
     t = (order_type or "market").lower()
@@ -677,14 +580,12 @@ def _heartbeat_touch() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 async def list_positions_data(mode: Literal["binance", "sim"] = "binance", testnet: bool = True):
     ex = _select_executor(mode, testnet)
-    # list_positions обычно быстрый, но ограничим
     try:
         async with asyncio.timeout(min(10.0, DEFAULT_OP_TIMEOUT)):
             return await ex.list_positions()
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="positions timeout")
 
-# ai_trader/routers/trading_exec.py
 async def balance_data(mode: Literal["binance", "sim"] = "binance", testnet: bool = True, fast: bool = False):
     ex = _select_executor(mode, testnet)
     try:
@@ -711,8 +612,11 @@ async def balance_data(mode: Literal["binance", "sim"] = "binance", testnet: boo
                                 except Exception:
                                     pass
                                 break
-                    elif "USDT" in bal.get("free", {}):
-                        equity = float(bal["free"].get("USDT", 0.0))
+                    elif "USDT" in (bal.get("free") or {}):
+                        try:
+                            equity = float((bal.get("free") or {}).get("USDT", 0.0)) + float((bal.get("locked") or {}).get("USDT", 0.0))
+                        except Exception:
+                            equity = float((bal.get("free") or {}).get("USDT", 0.0))
 
             risk_cfg = load_risk_config()
             state = ensure_day(
@@ -1250,8 +1154,6 @@ async def get_balance(
     except Exception as e:
         return _map_exc(e)
 
-
-# ai_trader/routers/trading_exec.py  (где-нибудь ниже перед OPEN/CLOSE)
 @router.get("/_debug/equity")
 async def debug_equity(
     mode: Literal["binance", "sim"] = Query("binance"),

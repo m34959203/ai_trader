@@ -1,28 +1,86 @@
-<section id="positions-container"
-  class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
-  hx-get="/ui/partials/positions"
-  hx-trigger="refresh"
-  hx-include="#controls"
-  hx-params="mode,testnet"
-  hx-indicator=".htmx-indicator"
-  hx-swap="outerHTML">
-
+<div id="positions">
   <h2 class="text-lg font-semibold mb-2">Позиции</h2>
+
   {% if positions and positions|length > 0 %}
-    <ul class="divide-y">
-      {% for p in positions %}
-        <li class="py-1">
-          {{ p.symbol }} — {{ p.side }} {{ p.qty }}{% if p.price is not none %} @ {{ p.price }}{% endif %}
-        </li>
-      {% endfor %}
-    </ul>
+    <div class="overflow-x-auto">
+      <table class="min-w-full text-sm border border-gray-200 rounded">
+        <thead class="bg-gray-50">
+          <tr>
+            <th class="px-3 py-2 text-left">Символ</th>
+            <th class="px-3 py-2 text-left">Сторона</th>
+            <th class="px-3 py-2 text-right">Кол-во</th>
+            <th class="px-3 py-2 text-right">Entry</th>
+            <th class="px-3 py-2 text-right">Mark</th>
+            <th class="px-3 py-2 text-right">UPnL</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in positions %}
+            {# Поддержка разных схем полей (Binance/симулятор) #}
+            {% set symbol = p.symbol or p.asset or '-' %}
+            {% set qty = (p.qty if p.qty is not none else p.positionAmt if p.positionAmt is not none else None) %}
+            {% set entry = (p.entry if p.entry is not none else p.entryPrice if p.entryPrice is not none else None) %}
+            {% set mark  = (p.mark if p.mark is not none else p.markPrice if p.markPrice is not none else None) %}
+            {% set upnl  = (p.unrealized_pnl if p.unrealized_pnl is not none else p.unRealizedProfit if p.unRealizedProfit is not none else None) %}
+            {% set raw_side = p.side or p.positionSide %}
+            {# Если side не задан, выводим по знаку qty #}
+            {% if raw_side %}
+              {% set side = raw_side|upper %}
+            {% else %}
+              {% if qty is not none %}
+                {% set side = ('LONG' if qty|string|float>0 else 'SHORT' if qty|string|float<0 else 'FLAT') %}
+              {% else %}
+                {% set side = '-' %}
+              {% endif %}
+            {% endif %}
+
+            {# Стили для стороны #}
+            {% if side in ['BUY','LONG'] %}
+              {% set side_cls = 'bg-emerald-50 text-emerald-800 border-emerald-200' %}
+            {% elif side in ['SELL','SHORT'] %}
+              {% set side_cls = 'bg-rose-50 text-rose-800 border-rose-200' %}
+            {% else %}
+              {% set side_cls = 'bg-gray-50 text-gray-700 border-gray-200' %}
+            {% endif %}
+
+            {# Цвет для PnL #}
+            {% if upnl is not none %}
+              {% set pnl_cls = 'text-emerald-600' if (upnl|string|float) >= 0 else 'text-rose-600' %}
+            {% else %}
+              {% set pnl_cls = 'text-gray-400' %}
+            {% endif %}
+
+            <tr class="border-t">
+              <td class="px-3 py-2">{{ symbol }}</td>
+              <td class="px-3 py-2">
+                <span class="text-xs px-2 py-0.5 border rounded {{ side_cls }}">{{ side }}</span>
+              </td>
+              <td class="px-3 py-2 text-right">
+                {% if qty is not none %}{{ qty }}{% else %}<span class="text-gray-400">—</span>{% endif %}
+              </td>
+              <td class="px-3 py-2 text-right">
+                {% if entry is not none %}{{ entry }}{% else %}<span class="text-gray-400">—</span>{% endif %}
+              </td>
+              <td class="px-3 py-2 text-right">
+                {% if mark is not none %}{{ mark }}{% else %}<span class="text-gray-400">—</span>{% endif %}
+              </td>
+              <td class="px-3 py-2 text-right {{ pnl_cls }}">
+                {% if upnl is not none %}{{ upnl }}{% else %}<span class="text-gray-400">—</span>{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <div class="flex items-start space-x-2 text-gray-600">
       <span class="text-blue-600">ℹ️</span>
       <div>
         <div>Открытых позиций нет</div>
-        <div class="text-xs text-gray-400">Если ожидаете активность — проверьте режим <code>binance/sim</code>, флаг <code>testnet</code> и источники данных на сервере.</div>
+        <div class="text-xs text-gray-400">
+          Если ожидаете активность — проверьте режим <code>binance/sim</code>, флаг <code>testnet</code> и источники данных на сервере.
+        </div>
       </div>
     </div>
   {% endif %}
-</section>
+</div>

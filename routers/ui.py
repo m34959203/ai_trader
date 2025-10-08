@@ -1,15 +1,15 @@
-# routers/ui.py
 from __future__ import annotations
 
 import os
 import json
 import asyncio
-from typing import Optional, Literal, Any, Dict, List
+import hashlib
+from typing import Optional, Literal, Any, Dict, List, Tuple
 from pathlib import Path
 
 import pandas as pd
-from fastapi import APIRouter, Request, Depends, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi import APIRouter, Request, Depends, Query, Response, status
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 # Используем уже реализованные обработчики как сервисные функции
@@ -75,18 +75,30 @@ _SEC_HEADERS = {
     "X-Frame-Options": "SAMEORIGIN",
 }
 _NO_CACHE_HEADERS = {
-    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-    "Pragma": "no-cache",
-    "Expires": "0",
+    # no-store гарантирует отсутствие кэширования HTML-фрагментов при polling
+    "Cache-Control": "no-store",
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Stateless hash-dedupe (per key)
 # ──────────────────────────────────────────────────────────────────────────────
+_LAST_DIGEST: Dict[str, str] = {}
+
+def _sha1_of(obj: Any) -> str:
+    try:
+        data = json.dumps(obj, sort_keys=True, default=str, ensure_ascii=False)
+    except Exception:
+        data = str(obj)
+    return hashlib.sha1(data.encode("utf-8")).hexdigest()
+
 def _apply_headers(resp: Response, *dicts: Dict[str, str]) -> None:
     for d in dicts:
         for k, v in d.items():
             resp.headers[k] = v
+
+def _is_hx(request: Request) -> bool:
+    # HTMX помечает запрос заголовком HX-Request: true
+    return request.headers.get("HX-Request", "").lower() == "true"
 
 def _render_fragment(
     template_name: str,
@@ -120,6 +132,7 @@ async def _with_timeout(coro, seconds: float):
 def _unwrap_json(resp: Any) -> Dict[str, Any]:
     if isinstance(resp, Response):
         try:
+            # JSONResponse/Response.body доступно сразу
             return json.loads(resp.body.decode("utf-8"))
         except Exception:
             return {}
@@ -138,6 +151,22 @@ def _to_int(v: Any, default: Optional[int] = None) -> Optional[int]:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+def _maybe_204(request: Request, key: str, signature_obj: Any) -> Optional[Response]:
+    """
+    Если это HTMX-запрос и подпись не изменилась — возвращаем 204 No Content,
+    иначе обновляем подпись и продолжаем нормальный рендеринг.
+    """
+    if not _is_hx(request):
+        return None
+    new_digest = _sha1_of(signature_obj)
+    old_digest = _LAST_DIGEST.get(key)
+    if old_digest == new_digest:
+        r = Response(status_code=status.HTTP_204_NO_CONTENT)
+        _apply_headers(r, _SEC_HEADERS, _NO_CACHE_HEADERS)
+        return r
+    _LAST_DIGEST[key] = new_digest
+    return None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Root dashboard
@@ -196,7 +225,12 @@ async def partial_balance(
         equity_usdt = _to_float(equity_usdt)
 
         if equity_usdt is None and mode == "sim":
-            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
+            # Демо-данные
+            demo = _demo_balance()
+            # сигнатура для 204
+            if (r := _maybe_204(request, f"balance:{mode}:{testnet}", {"equity": demo["equity_usdt"], "n": len(demo["balances"])})) is not None:
+                return r
+            return _render_fragment("monitor/_balance.html", request, {"bal": demo})
 
         bal = {
             "exchange": (
@@ -220,28 +254,56 @@ async def partial_balance(
                     0.0,
                 ),
             },
-            "balances": balances_src,  # теперь передаём в шаблон
+            "balances": balances_src,
             "balance": balance_src if isinstance(balance_src, dict) else {},
             "_demo": False,
         }
 
-        if bal["equity_usdt"] is None and mode == "sim":
-            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
+        # Подпись «существенных» полей для 204
+        sig = {
+            "exchange": bal["exchange"],
+            "equity": bal["equity_usdt"],
+            "balances_n": len(balances_src or []),
+        }
+        if (r := _maybe_204(request, f"balance:{mode}:{testnet}", sig)) is not None:
+            return r
 
         return _render_fragment("monitor/_balance.html", request, {"bal": bal})
 
     except asyncio.TimeoutError:
         if mode == "sim":
-            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
+            demo = _demo_balance()
+            if (r := _maybe_204(request, f"balance:{mode}:{testnet}", {"equity": demo["equity_usdt"], "n": len(demo["balances"])})) is not None:
+                return r
+            return _render_fragment("monitor/_balance.html", request, {"bal": demo})
         return _error_fragment("balance", "Таймаут при получении баланса")
     except Exception as e:
         if mode == "sim":
-            return _render_fragment("monitor/_balance.html", request, {"bal": _demo_balance()})
+            demo = _demo_balance()
+            if (r := _maybe_204(request, f"balance:{mode}:{testnet}", {"equity": demo["equity_usdt"], "n": len(demo["balances"])})) is not None:
+                return r
+            return _render_fragment("monitor/_balance.html", request, {"bal": demo})
         return _error_fragment("balance", f"Не удалось получить баланс: {e!s}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Partials — позиции
 # ──────────────────────────────────────────────────────────────────────────────
+def _positions_signature(positions: List[Dict[str, Any] | Any]) -> Dict[str, Any]:
+    n = len(positions or [])
+    # Строим компактную подпись по ключевым полям, если они есть
+    sample: List[Tuple] = []
+    keys = ("symbol", "asset", "position", "qty", "size", "leverage", "side", "entryPrice", "avgPrice", "unrealizedPnl", "updateTime")
+    for p in (positions or [])[:10]:
+        row = []
+        if isinstance(p, dict):
+            for k in keys:
+                row.append(p.get(k))
+        else:
+            for k in keys:
+                row.append(getattr(p, k, None))
+        sample.append(tuple(row))
+    return {"n": n, "sample": sample}
+
 @router.get("/partials/positions", response_class=HTMLResponse)
 async def partial_positions(
     request: Request,
@@ -253,6 +315,12 @@ async def partial_positions(
         payload = _unwrap_json(raw)
         data = payload.get("data") or payload
         positions = data.get("positions") or payload.get("positions") or []
+
+        # 204, если состав позиций не изменился
+        sig = _positions_signature(positions)
+        if (r := _maybe_204(request, f"positions:{mode}:{testnet}", sig)) is not None:
+            return r
+
         return _render_fragment("monitor/_positions.html", request, {"positions": positions})
 
     except asyncio.TimeoutError:
@@ -263,6 +331,21 @@ async def partial_positions(
 # ──────────────────────────────────────────────────────────────────────────────
 # Partials — последние ордера
 # ──────────────────────────────────────────────────────────────────────────────
+def _orders_signature(orders: List[Any]) -> Dict[str, Any]:
+    n = len(orders or [])
+    sample: List[Tuple] = []
+    keys = ("id", "order_id", "client_order_id", "symbol", "side", "type", "status", "price", "origQty", "executedQty", "updateTime", "transactTime", "created_at", "updated_at")
+    for o in (orders or [])[:10]:
+        row = []
+        if isinstance(o, dict):
+            for k in keys:
+                row.append(o.get(k))
+        else:
+            for k in keys:
+                row.append(getattr(o, k, None))
+        sample.append(tuple(row))
+    return {"n": n, "sample": sample}
+
 @router.get("/partials/orders", response_class=HTMLResponse)
 async def partial_orders(
     request: Request,
@@ -270,10 +353,14 @@ async def partial_orders(
     db=Depends(_get_db_session),
 ):
     if not _HAS_DB or crud_orders is None or db is None:
+        # 204 имеет смысл только для HTMX, но при пустых данных можно сразу 200 с пустым блоком
         return _render_fragment("monitor/_orders.html", request, {"orders": [], "updated_at": None})
 
     try:
         orders = await _with_timeout(crud_orders.get_last_orders(db, limit=limit), ORDERS_TIMEOUT)  # type: ignore[arg-type]
+        # 204, если список ордеров по сути не изменился
+        if (r := _maybe_204(request, f"orders:{limit}", _orders_signature(orders))) is not None:
+            return r
         ctx = {"orders": orders, "updated_at": pd.Timestamp.utcnow().isoformat()}
         return _render_fragment("monitor/_orders.html", request, ctx)
     except asyncio.TimeoutError:
@@ -341,6 +428,14 @@ def _compute_metrics_close(
     vol = sigma_d * (annualization_days ** 0.5)
     return {"sharpe": sharpe, "vol": vol}
 
+def _metrics_signature(metrics: Dict[str, Optional[float]], symbol: str, tf: str) -> Dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "tf": tf,
+        "sharpe": None if metrics.get("sharpe") is None else round(float(metrics["sharpe"]), 6),
+        "vol": None if metrics.get("vol") is None else round(float(metrics["vol"]), 6),
+    }
+
 @router.get("/partials/metrics", response_class=HTMLResponse)
 async def partial_metrics(
     request: Request,
@@ -360,10 +455,12 @@ async def partial_metrics(
     calculated_at = pd.Timestamp.utcnow().isoformat()
 
     if not _HAS_DB or crud is None or db is None:
+        metrics = {"sharpe": None, "vol": None}
+        # 204 на пустых метриках не критичен — рендерим статично
         ctx = {
             "symbol": symbol,
             "tf": tf,
-            "metrics": {"sharpe": None, "vol": None},
+            "metrics": metrics,
             "window_days": window_days,
             "annualization_days": annualization_days,
             "risk_free_annual": risk_free_annual,
@@ -388,6 +485,11 @@ async def partial_metrics(
             annualization_days=annualization_days,
             risk_free_annual=risk_free_annual,
         )
+
+        # 204, если метрики не изменились
+        if (r := _maybe_204(request, f"metrics:{symbol}:{tf}", _metrics_signature(metrics, symbol, tf))) is not None:
+            return r
+
         ctx = {
             "symbol": symbol,
             "tf": tf,
@@ -422,3 +524,62 @@ async def ui_health(_: Request):
     resp = HTMLResponse(html)
     _apply_headers(resp, _SEC_HEADERS, _NO_CACHE_HEADERS)
     return resp
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Back-compat aliases (короткие пути без /partials/*)
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/balance", response_class=HTMLResponse)
+async def balance_alias(
+    request: Request,
+    mode: Literal["binance", "sim"] = Query(DEFAULT_MODE),
+    testnet: bool = Query(DEFAULT_TESTNET),
+):
+    return await partial_balance(request, mode=mode, testnet=testnet)
+
+@router.get("/positions", response_class=HTMLResponse)
+async def positions_alias(
+    request: Request,
+    mode: Literal["binance", "sim"] = Query(DEFAULT_MODE),
+    testnet: bool = Query(DEFAULT_TESTNET),
+):
+    return await partial_positions(request, mode=mode, testnet=testnet)
+
+@router.get("/orders", response_class=HTMLResponse)
+async def orders_alias(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    db=Depends(_get_db_session),
+):
+    return await partial_orders(request, limit=limit, db=db)
+
+@router.get("/metrics", response_class=HTMLResponse)
+async def metrics_alias(
+    request: Request,
+    source: str = Query(DEF_MET_SOURCE),
+    symbol: str = Query(DEF_MET_SYMBOL),
+    tf: str = Query(DEF_MET_TF),
+    limit: int = Query(3000, ge=50, le=20000),
+    window_days: int = Query(30, ge=5, le=365),
+    annualization_days: int = Query(365, ge=200, le=365),
+    risk_free_annual: float = Query(0.0, ge=0.0, le=0.2),
+    sharpe_warn: float = Query(0.5),
+    sharpe_crit: float = Query(0.0),
+    vol_warn: float = Query(0.8),
+    vol_crit: float = Query(1.2),
+    db=Depends(_get_db_session),
+):
+    return await partial_metrics(
+        request,
+        source=source,
+        symbol=symbol,
+        tf=tf,
+        limit=limit,
+        window_days=window_days,
+        annualization_days=annualization_days,
+        risk_free_annual=risk_free_annual,
+        sharpe_warn=sharpe_warn,
+        sharpe_crit=sharpe_crit,
+        vol_warn=vol_warn,
+        vol_crit=vol_crit,
+        db=db,
+    )

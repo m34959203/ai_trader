@@ -1,20 +1,73 @@
-<section id="metrics-container"
-  class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-1"
-  hx-get="/ui/partials/metrics"
-  hx-trigger="refresh"
-  hx-include="#controls"
-  hx-params="mode,testnet"
-  hx-indicator=".htmx-indicator"
-  hx-swap="outerHTML">
+<div id="metrics">
+  <h2 class="text-lg font-semibold mb-2">
+    Метрики рынка ({{ symbol }}/{{ tf }})
+  </h2>
 
-  <h2 class="text-lg font-semibold mb-2">Метрики рынка ({{ symbol }}/{{ tf }})</h2>
-  {% if metrics and metrics.sharpe is not none and metrics.vol is not none %}
-    <div class="space-y-1">
-      <div>Sharpe: {{ "%.2f"|format(metrics.sharpe) }}</div>
-      <div>Volatility: {{ "%.2f"|format(metrics.vol) }}</div>
-      <p class="text-xs text-gray-400">Рассчитано: {{ calculated_at }}</p>
+  {% set sh = metrics.sharpe if metrics else None %}
+  {% set vol = metrics.vol if metrics else None %}
+  {% set th  = thresholds or {} %}
+
+  {# Пороги (с безопасными дефолтами) #}
+  {% set sh_warn = th.sharpe_warn if th and th.sharpe_warn is not none else 0.5 %}
+  {% set sh_crit = th.sharpe_crit if th and th.sharpe_crit is not none else 0.0 %}
+  {% set vol_warn = th.vol_warn if th and th.vol_warn is not none else 0.8 %}
+  {% set vol_crit = th.vol_crit if th and th.vol_crit is not none else 1.2 %}
+
+  {% if sh is not none and vol is not none %}
+    {# Класс состояния для Sharpe #}
+    {% if sh <= sh_crit %}
+      {% set sh_cls = "bg-red-50 text-red-800 border-red-200" %}
+      {% set sh_lbl = "низкий" %}
+    {% elif sh <= sh_warn %}
+      {% set sh_cls = "bg-yellow-50 text-yellow-800 border-yellow-200" %}
+      {% set sh_lbl = "слабый" %}
+    {% else %}
+      {% set sh_cls = "bg-emerald-50 text-emerald-800 border-emerald-200" %}
+      {% set sh_lbl = "OK" %}
+    {% endif %}
+
+    {# Класс состояния для Vol #}
+    {% if vol >= vol_crit %}
+      {% set vol_cls = "bg-red-50 text-red-800 border-red-200" %}
+      {% set vol_lbl = "высокая" %}
+    {% elif vol >= vol_warn %}
+      {% set vol_cls = "bg-yellow-50 text-yellow-800 border-yellow-200" %}
+      {% set vol_lbl = "повышенная" %}
+    {% else %}
+      {% set vol_cls = "bg-emerald-50 text-emerald-800 border-emerald-200" %}
+      {% set vol_lbl = "умеренная" %}
+    {% endif %}
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <!-- Sharpe -->
+      <div class="border rounded p-3">
+        <div class="text-sm text-gray-500 mb-1">Sharpe</div>
+        <div class="flex items-center gap-2">
+          <div class="text-xl font-semibold">{{ "%.2f"|format(sh) }}</div>
+          <span class="text-xs px-2 py-0.5 border rounded {{ sh_cls }}">{{ sh_lbl }}</span>
+        </div>
+        <div class="mt-2 text-xs text-gray-500">
+          Пороги: warn ≥ {{ "%.2f"|format(sh_warn) }}, crit ≤ {{ "%.2f"|format(sh_crit) }}
+        </div>
+      </div>
+
+      <!-- Volatility -->
+      <div class="border rounded p-3">
+        <div class="text-sm text-gray-500 mb-1">Volatility (ann.)</div>
+        <div class="flex items-center gap-2">
+          <div class="text-xl font-semibold">{{ "%.2f"|format(vol) }}</div>
+          <span class="text-xs px-2 py-0.5 border rounded {{ vol_cls }}">{{ vol_lbl }}</span>
+        </div>
+        <div class="mt-2 text-xs text-gray-500">
+          Пороги: warn ≥ {{ "%.2f"|format(vol_warn) }}, crit ≥ {{ "%.2f"|format(vol_crit) }}
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-3 text-xs text-gray-500">
+      Рассчитано: {{ calculated_at }} · Окно: {{ window_days }}d · Annualization: {{ annualization_days }}d · Rf: {{ "%.2f"|format(risk_free_annual*100) }}%
     </div>
   {% else %}
     <p class="text-gray-500">Метрики недоступны</p>
   {% endif %}
-</section>
+</div>
