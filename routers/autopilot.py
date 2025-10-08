@@ -13,6 +13,13 @@ from executors.api_binance import BinanceExecutor, BinanceAPIError
 LOG = logging.getLogger("ai_trader.autopilot")
 router = APIRouter(prefix="/autopilot", tags=["autopilot"])
 
+try:  # optional: фон. автотрейдер
+    from tasks import auto_trader as auto_trader_module  # type: ignore
+    _HAS_AUTO_TRADER_RUNTIME = True
+except Exception:  # pragma: no cover
+    auto_trader_module = None  # type: ignore
+    _HAS_AUTO_TRADER_RUNTIME = False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Глобальное состояние пилота (один воркер для простоты)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -329,4 +336,11 @@ async def status_autopilot():
     running = _TASK is not None and not _TASK.done()
     d = dict(_STATE)
     d["running"] = running
+    if _HAS_AUTO_TRADER_RUNTIME and auto_trader_module is not None:
+        try:
+            d["auto_trader"] = auto_trader_module.get_runtime_status()
+        except Exception as exc:  # pragma: no cover
+            d["auto_trader"] = {"error": repr(exc)}
+    else:
+        d["auto_trader"] = {"available": False}
     return d
