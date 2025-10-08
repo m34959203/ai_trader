@@ -22,7 +22,7 @@ from src.indicators import (
     atr as atr_ind, adx as adx_ind
 )
 
-__all__ = ["AnalysisConfig", "DEFAULT_CONFIG", "analyze_market"]
+__all__ = ["AnalysisConfig", "DEFAULT_CONFIG", "SentimentOverlay", "analyze_market"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -96,6 +96,21 @@ class AnalysisConfig:
 
 
 DEFAULT_CONFIG: Final[AnalysisConfig] = AnalysisConfig()
+
+
+@dataclass(frozen=True, slots=True)
+class SentimentOverlay:
+    """Lightweight container with aggregated sentiment scores."""
+
+    news_score: float = 0.0
+    social_score: float = 0.0
+    fear_greed: float = 50.0
+    composite_score: float = 0.0
+    methodology: str = "v1"
+
+    @property
+    def bias(self) -> float:
+        return max(-1.0, min(1.0, float(self.composite_score)))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -536,7 +551,9 @@ def _align_timeframes(df_fast: pd.DataFrame, df_slow: pd.DataFrame) -> Tuple[pd.
 def analyze_market(
     df_1h: pd.DataFrame,
     df_4h: Optional[pd.DataFrame] = None,
+    *,
     config: AnalysisConfig = DEFAULT_CONFIG,
+    sentiment: Optional[SentimentOverlay] = None,
 ) -> Dict:
     """
     Analyze market on 1h (fast) with optional 4h (slow) confirmation.
@@ -568,6 +585,27 @@ def analyze_market(
     trend = _infer_trend(df1)
     vol   = _vol_state(df1, cfg)
     sig, score, reasons = _rule_signal(df1, cfg, levels)
+
+    sentiment_payload: Optional[Dict[str, float]] = None
+    if sentiment is not None:
+        bias = float(sentiment.bias)
+        delta = int(round(bias * 10))
+        if delta != 0:
+            new_score = int(max(0, min(100, score + delta)))
+            if new_score != score:
+                if delta > 0:
+                    reasons.append(f"Сентимент усилил уверенность (+{delta})")
+                else:
+                    reasons.append(f"Сентимент снизил уверенность ({delta})")
+                score = new_score
+        sentiment_payload = {
+            "news_score": round(float(sentiment.news_score), 3),
+            "social_score": round(float(sentiment.social_score), 3),
+            "fear_greed": round(float(sentiment.fear_greed), 1),
+            "composite_score": round(float(sentiment.composite_score), 3),
+            "methodology": sentiment.methodology,
+            "bias": round(float(sentiment.bias), 3),
+        }
 
     # Multi-timeframe confirmation (4h)
     mtf: Optional[Dict[str, str]] = None
@@ -629,6 +667,21 @@ def analyze_market(
     else:
         final_sig = "flat"
 
+    if sentiment_payload is not None:
+        bias = sentiment_payload["bias"]
+        if bias >= 0.6 and final_sig == "sell":
+            final_sig = "flat"
+            reasons.append("Сентимент: позитивный фон отменил sell")
+        elif bias <= -0.6 and final_sig == "buy":
+            final_sig = "flat"
+            reasons.append("Сентимент: негативный фон отменил buy")
+        elif bias >= 0.6 and final_sig == "flat":
+            final_sig = "buy"
+            reasons.append("Сентимент: сильный позитив → допускаем buy")
+        elif bias <= -0.6 and final_sig == "flat":
+            final_sig = "sell"
+            reasons.append("Сентимент: сильный негатив → допускаем sell")
+
     # Final payload (JSON-friendly)
     out_levels = [
         {"kind": lvl["kind"], "price": float(lvl["price"]), "strength": int(lvl["strength"])}
@@ -645,6 +698,8 @@ def analyze_market(
     }
     if mtf is not None:
         result["mtf"] = mtf
+    if sentiment_payload is not None:
+        result["sentiment"] = sentiment_payload
     return result
 
 

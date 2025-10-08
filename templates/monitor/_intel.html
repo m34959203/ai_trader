@@ -1,0 +1,103 @@
+<div id="intel">
+  <h2 class="text-lg font-semibold mb-3">Рыночный интеллект и контроль</h2>
+
+  {% if error %}
+    <div class="p-3 rounded bg-red-50 border border-red-200 text-red-700 text-sm mb-3">
+      {{ error }}
+    </div>
+  {% endif %}
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <!-- PnL / activity -->
+    <div class="border rounded-md p-4 bg-white shadow-sm">
+      <div class="flex items-center justify-between mb-2">
+        <div>
+          <div class="text-sm text-gray-500">PnL (последние ордера)</div>
+          <div class="text-2xl font-semibold">{{ pnl.total_pnl | default(0.0) }}</div>
+        </div>
+        <div class="text-xs text-gray-500 text-right">
+          <div>Сделок: {{ pnl.trades | default(0) }}</div>
+          <div>Filled: {{ pnl.filled | default(0) }} · Rejected: {{ pnl.rejected | default(0) }}</div>
+          <div>Объём: {{ pnl.volume | default(0.0) }}</div>
+        </div>
+      </div>
+      {% if pnl.timeline %}
+        <div class="text-xs text-gray-500">
+          {% for day in pnl.timeline[:5] %}
+            <div class="flex justify-between">
+              <span>{{ day.date }}</span>
+              <span class="font-medium {{ 'text-emerald-600' if day.pnl >= 0 else 'text-red-600' }}">{{ '%.2f'|format(day.pnl) }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="text-sm text-gray-500">Недостаточно данных по сделкам.</p>
+      {% endif %}
+      <div class="mt-3">
+        <a href="/ui/reports/orders.csv" class="text-xs text-indigo-600 hover:text-indigo-500" target="_blank">Скачать журнал (CSV)</a>
+      </div>
+    </div>
+
+    <!-- Risk limits -->
+    <div class="border rounded-md p-4 bg-white shadow-sm">
+      <div class="text-sm text-gray-500 mb-2">Риск-параметры</div>
+      <dl class="space-y-1 text-sm">
+        <div class="flex justify-between"><dt>Риск на сделку</dt><dd>{{ (risk.risk_pct_per_trade * 100) | default(0)|round(2) }}%</dd></div>
+        <div class="flex justify-between"><dt>Портфельный риск</dt><dd>{{ (risk.portfolio_max_risk_pct * 100) | default(0)|round(2) }}%</dd></div>
+        <div class="flex justify-between"><dt>Макс. позиций</dt><dd>{{ risk.max_open_positions | default(0) }}</dd></div>
+        <div class="flex justify-between"><dt>Дневной стоп</dt><dd>{{ (risk.daily_max_loss_pct * 100) | default(0)|round(2) }}%</dd></div>
+        <div class="flex justify-between"><dt>Торгов в день</dt><dd>{{ risk.max_trades_per_day | default(0) }}</dd></div>
+        <div class="flex justify-between"><dt>Deadman (сек)</dt><dd>{{ risk.deadman_max_stale_sec | default(0) }}</dd></div>
+      </dl>
+    </div>
+
+    <!-- Sentiment -->
+    <div class="border rounded-md p-4 bg-white shadow-sm">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-sm text-gray-500">Сводный сентимент</div>
+        {% if sentiment %}
+          <span class="text-xs text-gray-400">{{ sentiment.methodology }}</span>
+        {% endif %}
+      </div>
+      {% if sentiment %}
+        <div class="text-2xl font-semibold mb-2 {{ 'text-emerald-600' if sentiment.composite >= 0 else 'text-red-600' }}">
+          {{ sentiment.composite }}
+        </div>
+        <dl class="text-xs text-gray-500 space-y-1">
+          <div class="flex justify-between"><dt>Новости</dt><dd>{{ sentiment.news_score }}</dd></div>
+          <div class="flex justify-between"><dt>Соцсети</dt><dd>{{ sentiment.social_score }}</dd></div>
+          <div class="flex justify-between"><dt>Fear &amp; Greed</dt><dd>{{ sentiment.fear_greed }}</dd></div>
+        </dl>
+      {% else %}
+        <p class="text-sm text-gray-500">Сентимент недоступен.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="mt-4">
+    <h3 class="text-md font-semibold mb-2">Последние новости</h3>
+    {% if news %}
+      <ul class="space-y-2 text-sm">
+        {% for item in news %}
+          <li class="border rounded-md p-3 bg-white shadow-sm">
+            <div class="flex items-center justify-between">
+              <a href="{{ item.link }}" target="_blank" rel="noopener" class="font-semibold text-indigo-600 hover:text-indigo-500">{{ item.title }}</a>
+              <span class="text-xs text-gray-400">{{ item.published or '—' }}</span>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">
+              {{ item.summary or 'Без описания' }}
+            </div>
+            <div class="text-xs mt-2 flex items-center gap-3">
+              <span class="px-2 py-0.5 rounded border border-gray-200 text-gray-600">impact: {{ item.impact }}</span>
+              <span class="px-2 py-0.5 rounded border border-gray-200 text-gray-600">sentiment: {{ item.sentiment }}</span>
+              <span class="px-2 py-0.5 rounded border border-gray-200 text-gray-600">importance: {{ item.importance }}</span>
+              {% if item.source %}<span class="text-gray-400">{{ item.source }}</span>{% endif %}
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="text-sm text-gray-500">Новостной поток пуст.</p>
+    {% endif %}
+  </div>
+</div>

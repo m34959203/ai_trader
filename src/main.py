@@ -83,11 +83,12 @@ except Exception:
 
 # Аналитика
 try:
-    from .analysis.analyze_market import analyze_market, DEFAULT_CONFIG, AnalysisConfig  # type: ignore
+    from .analysis.analyze_market import analyze_market, DEFAULT_CONFIG, AnalysisConfig, SentimentOverlay  # type: ignore
 except Exception:  # pragma: no cover
     analyze_market = None  # type: ignore
     DEFAULT_CONFIG = None  # type: ignore
     AnalysisConfig = None  # type: ignore
+    SentimentOverlay = None  # type: ignore
 
 # Потоки (опц.)
 try:
@@ -121,6 +122,20 @@ try:
     _HAS_AUTO_BG = True
 except Exception:
     _HAS_AUTO_BG = False
+
+try:
+    from tasks.news_ingest import background_loop as news_bg
+    _HAS_NEWS_BG = True
+except Exception:
+    _HAS_NEWS_BG = False
+
+try:
+    from services.news_pipeline import load_latest_sentiment, SentimentContext
+    _HAS_NEWS_INTEL = True
+except Exception:  # pragma: no cover
+    load_latest_sentiment = None  # type: ignore
+    SentimentContext = None  # type: ignore
+    _HAS_NEWS_INTEL = False
 
 
 APP_VERSION = os.getenv("APP_VERSION", "0.11.1")
@@ -175,6 +190,7 @@ FEATURES: Dict[str, bool] = {
     "market_ws":     env_bool("FEATURE_MARKET_WS", True) and _HAS_STREAMS,
     "user_ws":       env_bool("FEATURE_USER_WS", True) and _HAS_STREAMS,
     "autopilot":     env_bool("FEATURE_AUTOPILOT", True) and _HAS_AUTOPILOT,
+    "market_intel":  env_bool("FEATURE_MARKET_INTEL", True) and _HAS_NEWS_INTEL,
 }
 
 # Управление бэкграунд-тасками: включаем по умолчанию для prod/staging окружений
@@ -476,6 +492,8 @@ async def lifespan(app: FastAPI):
         app.state.ohlcv_bg_task = asyncio.create_task(ohlcv_bg(), name="ohlcv_bg")
     if ENABLE_BG_TASKS and _HAS_AUTO_BG:
         app.state.auto_bg_task = asyncio.create_task(auto_bg(), name="auto_bg")
+    if ENABLE_BG_TASKS and _HAS_NEWS_BG:
+        app.state.news_bg_task = asyncio.create_task(news_bg(), name="news_bg")
 
     # Process watchdog
     app.state._watchdog = EventLoopWatchdog(interval=5.0, max_consecutive_misses=12)
@@ -495,6 +513,7 @@ async def lifespan(app: FastAPI):
                 getattr(app.state, "ohlcv_bg_task", None),
                 getattr(app.state, "auto_bg_task", None),
                 getattr(app.state, "watchdog_task", None),
+                getattr(app.state, "news_bg_task", None),
             ]
             for t in tasks:
                 if t is not None:
@@ -1011,8 +1030,31 @@ if env_bool("FEATURE_SIGNALS", True) and analyze_market is not None:
             cfg = AnalysisConfig(**cfg_dict)  # type: ignore
 
         t0 = time.perf_counter()
+        sentiment_overlay = None
+        if FEATURES.get("market_intel", False) and load_latest_sentiment is not None and SentimentOverlay is not None:
+            try:
+                ctx = await load_latest_sentiment()  # type: ignore[misc]
+                if ctx is not None:
+                    if SentimentContext is not None and isinstance(ctx, SentimentContext):
+                        sentiment_overlay = SentimentOverlay(
+                            news_score=ctx.news_score,
+                            social_score=ctx.social_score,
+                            fear_greed=ctx.fear_greed,
+                            composite_score=ctx.composite_score,
+                            methodology=getattr(ctx, "methodology", "v1"),
+                        )
+                    else:
+                        sentiment_overlay = SentimentOverlay(
+                            news_score=getattr(ctx, "news_score", 0.0),
+                            social_score=getattr(ctx, "social_score", 0.0),
+                            fear_greed=getattr(ctx, "fear_greed", 50.0),
+                            composite_score=getattr(ctx, "composite_score", 0.0),
+                            methodology=getattr(ctx, "methodology", "v1"),
+                        )
+            except Exception as intel_err:
+                LOG.debug("load sentiment failed: %r", intel_err)
         try:
-            result = analyze_market(df_fast, df_slow, config=cfg)  # type: ignore
+            result = analyze_market(df_fast, df_slow, config=cfg, sentiment=sentiment_overlay)  # type: ignore
         except AssertionError as e:
             raise HTTPException(status_code=400, detail=f"Analysis assertion: {e}")
         except Exception as e:

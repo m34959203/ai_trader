@@ -4,12 +4,15 @@ import os
 import json
 import asyncio
 import hashlib
+import csv
+import io
 from typing import Optional, Literal, Any, Dict, List, Tuple
 from pathlib import Path
 
 import pandas as pd
-from fastapi import APIRouter, Request, Depends, Query, Response, status
+from fastapi import APIRouter, Request, Depends, Query, Response, status, HTTPException
 from fastapi.responses import HTMLResponse
+from sqlalchemy import select
 from fastapi.templating import Jinja2Templates
 
 # Используем уже реализованные обработчики как сервисные функции
@@ -17,6 +20,8 @@ from routers.trading_exec import (
     get_balance as _get_balance,
     list_positions as _list_positions,
 )
+from monitoring.reporting import build_dashboard_state
+from utils.risk_config import load_risk_config
 
 # ──────────────────────────────────────────────────────────────────────────────
 # БД: мягкая зависимость (роуты работают даже без БД)
@@ -25,14 +30,26 @@ _HAS_DB = True
 try:
     from db import crud_orders  # type: ignore
     from db import crud         # type: ignore
+    from db import crud_news    # type: ignore
+    from db.models_orders import OrderLog  # type: ignore
     from db.session import get_session as _get_db_session  # type: ignore
 except Exception:  # pragma: no cover
     _HAS_DB = False
     crud_orders = None  # type: ignore
     crud = None         # type: ignore
+    crud_news = None    # type: ignore
+    OrderLog = None     # type: ignore
 
     async def _get_db_session():  # type: ignore
         yield None
+
+try:
+    from services.news_pipeline import load_latest_sentiment, SentimentContext
+    _HAS_NEWS_INTEL = True
+except Exception:  # pragma: no cover
+    load_latest_sentiment = None  # type: ignore
+    SentimentContext = None  # type: ignore
+    _HAS_NEWS_INTEL = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Templates
@@ -64,6 +81,7 @@ DEFAULT_TESTNET = os.getenv("UI_EXEC_TESTNET", "1").strip().lower() in ("1", "tr
 BAL_POS_TIMEOUT = float(os.getenv("UI_TIMEOUT_BAL_POS", "8.0"))
 ORDERS_TIMEOUT  = float(os.getenv("UI_TIMEOUT_ORDERS", "6.0"))
 METRICS_TIMEOUT = float(os.getenv("UI_TIMEOUT_METRICS", "7.0"))
+INTEL_TIMEOUT = float(os.getenv("UI_TIMEOUT_INTEL", "7.0"))
 
 DEF_MET_SOURCE = os.getenv("UI_METRICS_SOURCE", "binance")
 DEF_MET_SYMBOL = os.getenv("UI_METRICS_SYMBOL", "BTCUSDT")
@@ -511,6 +529,107 @@ async def partial_metrics(
     except Exception as e:
         return _error_fragment("metrics", f"Не удалось вычислить метрики: {e!s}")
 
+
+@router.get("/partials/intel", response_class=HTMLResponse)
+async def partial_intel(
+    request: Request,
+    mode: Literal["binance", "sim"] = Query(DEFAULT_MODE),
+    testnet: bool = Query(DEFAULT_TESTNET),
+    db=Depends(_get_db_session),
+):
+    if not _HAS_DB or db is None:
+        ctx = {
+            "pnl": {"trades": 0, "filled": 0, "rejected": 0, "volume": 0.0, "timeline": [], "total_pnl": 0.0},
+            "risk": load_risk_config().to_dict(),
+            "sentiment": None,
+            "news": [],
+            "error": "База данных недоступна",
+        }
+        return _render_fragment("monitor/_intel.html", request, ctx)
+
+    try:
+        dashboard_state = await _with_timeout(build_dashboard_state(db), INTEL_TIMEOUT)
+        news_rows = []
+        if crud_news is not None:
+            news_rows = await _with_timeout(crud_news.latest_news(db, limit=8), INTEL_TIMEOUT)  # type: ignore[arg-type]
+        sentiment_ctx = None
+        if _HAS_NEWS_INTEL and load_latest_sentiment is not None:
+            sentiment_ctx = await _with_timeout(load_latest_sentiment(), INTEL_TIMEOUT)
+
+        ctx = {
+            "pnl": dashboard_state.get("pnl", {}),
+            "risk": dashboard_state.get("risk", {}),
+            "sentiment": _sentiment_to_dict(sentiment_ctx),
+            "news": [_news_item_to_dict(item) for item in news_rows],
+            "error": None,
+            "mode": mode,
+            "testnet": testnet,
+        }
+        return _render_fragment("monitor/_intel.html", request, ctx)
+    except asyncio.TimeoutError:
+        return _error_fragment("intel", "Таймаут при загрузке панели интеллекта")
+    except Exception as e:
+        return _error_fragment("intel", f"Не удалось построить панель: {e!s}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reports
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/reports/orders.csv")
+async def export_orders_csv(
+    limit: int = Query(500, ge=10, le=2000),
+    db=Depends(_get_db_session),
+):
+    if not _HAS_DB or db is None or OrderLog is None:
+        raise HTTPException(status_code=503, detail="База данных недоступна")
+    stmt = select(OrderLog).order_by(OrderLog.created_at.desc()).limit(limit)
+    rows = list(await db.scalars(stmt))
+
+    headers = [
+        "id",
+        "created_at",
+        "exchange",
+        "testnet",
+        "symbol",
+        "side",
+        "type",
+        "status",
+        "price",
+        "qty",
+        "quote_qty",
+        "cummulative_quote_qty",
+        "commission",
+        "commission_asset",
+    ]
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    for row in rows:
+        data = row.as_dict() if hasattr(row, "as_dict") else {}
+        writer.writerow([
+            data.get("id"),
+            data.get("created_at"),
+            data.get("exchange"),
+            data.get("testnet"),
+            data.get("symbol"),
+            data.get("side"),
+            data.get("type"),
+            data.get("status"),
+            data.get("price"),
+            data.get("qty"),
+            data.get("quote_qty"),
+            data.get("cummulative_quote_qty"),
+            data.get("commission"),
+            data.get("commission_asset"),
+        ])
+
+    content = buf.getvalue()
+    return Response(
+        content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="orders.csv"'},
+    )
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Health
 # ──────────────────────────────────────────────────────────────────────────────
@@ -583,3 +702,44 @@ async def metrics_alias(
         vol_crit=vol_crit,
         db=db,
     )
+def _news_item_to_dict(item: Any) -> Dict[str, Any]:
+    published = None
+    if getattr(item, "published_at", None):
+        try:
+            published = item.published_at.isoformat()
+        except Exception:
+            published = str(item.published_at)
+    return {
+        "title": getattr(item, "title", ""),
+        "summary": (getattr(item, "summary", "") or "")[:240],
+        "impact": getattr(item, "impact", "low"),
+        "sentiment": getattr(item, "sentiment", 0),
+        "importance": getattr(item, "importance", "low"),
+        "link": getattr(item, "link", None),
+        "source": getattr(item, "source", None),
+        "published": published,
+    }
+
+
+def _sentiment_to_dict(ctx: Any) -> Optional[Dict[str, Any]]:
+    if ctx is None:
+        return None
+    if SentimentContext is not None and isinstance(ctx, SentimentContext):
+        news_score = ctx.news_score
+        social_score = ctx.social_score
+        fear_greed = ctx.fear_greed
+        composite = ctx.composite_score
+        methodology = getattr(ctx, "methodology", "v1")
+    else:
+        news_score = float(getattr(ctx, "news_score", 0.0))
+        social_score = float(getattr(ctx, "social_score", 0.0))
+        fear_greed = float(getattr(ctx, "fear_greed", 50.0))
+        composite = float(getattr(ctx, "composite_score", 0.0))
+        methodology = getattr(ctx, "methodology", "v1")
+    return {
+        "news_score": round(news_score, 3),
+        "social_score": round(social_score, 3),
+        "fear_greed": round(fear_greed, 1),
+        "composite": round(composite, 3),
+        "methodology": methodology,
+    }

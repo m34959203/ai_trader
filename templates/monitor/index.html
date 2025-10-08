@@ -168,6 +168,19 @@
       </section>
     </div>
 
+    <!-- Intelligence & risk panel -->
+    <section id="intel-box"
+      class="bg-white border border-gray-200 rounded-md shadow-sm p-4 mt-6"
+      hx-get="/ui/partials/intel"
+      hx-trigger="load, refresh, every 120s"
+      hx-include="#ui-form"
+      hx-indicator=".htmx-indicator"
+      hx-target="#intel"
+      hx-swap="outerHTML"
+      data-tooltip="PnL, риск-лимиты и новостной сентимент.">
+      <div id="intel"><div class="text-sm text-gray-500">Загрузка панели…</div></div>
+    </section>
+
     <p class="mt-6 text-xs text-gray-500">
       Подсказка: переключай режим <code>binance/sim</code> и флаг <code>testnet</code> — партиалы подгружают данные с этими параметрами.
       Интервалы автообновления задаются селектором «Интервал обновления».

@@ -385,6 +385,34 @@ async def alert_warn(msg: str, *, context: Optional[Dict[str, Any]] = None) -> N
 async def alert_crit(msg: str, *, context: Optional[Dict[str, Any]] = None) -> None:
     await _alert("crit", msg, context=context)
 
+
+async def notify_limit_breach(limit_name: str, *, value: Any, threshold: Any, context: Optional[Dict[str, Any]] = None) -> None:
+    details = {"limit": limit_name, "value": value, "threshold": threshold, **(context or {})}
+    await alert_warn(f"Risk limit breached: {limit_name}", context=details)
+
+
+async def notify_execution_error(
+    message: str,
+    *,
+    order_id: Optional[str] = None,
+    symbol: Optional[str] = None,
+    side: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload = dict(context or {})
+    if order_id:
+        payload["order_id"] = order_id
+    if symbol:
+        payload["symbol"] = symbol
+    if side:
+        payload["side"] = side
+    await alert_crit(f"Execution error: {message}", context=payload)
+
+
+async def notify_service_degradation(component: str, *, details: str, context: Optional[Dict[str, Any]] = None) -> None:
+    payload = {"component": component, "details": details, **(context or {})}
+    await alert_warn(f"Service degradation detected: {component}", context=payload)
+
 async def alert_exception(exc: BaseException, *, where: str = "", context: Optional[Dict[str, Any]] = None) -> None:
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     msg = f"Exception {type(exc).__name__} at {where or 'unknown'}\n{tb}"
