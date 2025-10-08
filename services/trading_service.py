@@ -4,8 +4,8 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, List, Literal, Iterable, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, Optional, List, Literal, Iterable, Tuple, TypeVar
 from datetime import datetime, timezone, date
 
 # Совместимые интерфейсы (ожидаемые типы/классы)
@@ -13,12 +13,17 @@ from executors import (  # type: ignore
     Executor,            # базовый интерфейс исполнителя
     BinanceExecutor,     # реальный спот через Binance REST (testnet/prod)
     SimulatedExecutor,   # симулятор
-    UIExecutorStub,      # UI-агент (заглушка)
+    UIExecutorAgent,     # UI-агент с DOM/OCR
+    UIExecutorStub,      # совместимость
     OrderResult,         # тип результата ордера
     Position,            # тип позиции
 )
 
 # Риск-конфиг и утилиты портфельного риска
+from services.auto_heal import AutoHealingOrchestrator, StateSnapshot
+from services.security import AccessController, Role, SecretVault, TwoFactorGuard
+from utils.assets import load_assets
+from utils.logging_utils import install_sensitive_filter
 from utils.risk_config import load_risk_config
 try:
     # Необязательная зависимость (если добавляли ранее)
@@ -70,6 +75,8 @@ except Exception:  # pragma: no cover
 
 LOG = logging.getLogger("ai_trader.trading_service")
 
+T = TypeVar("T")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Конфиг (локальный слой — оставлен для обратной совместимости UI/API)
@@ -99,6 +106,7 @@ class TradingConfig:
     ui: Optional[Dict[str, Any]] = None
     # риск
     risk: RiskLimits = RiskLimits()
+    security: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def from_mapping(raw: Optional[Dict[str, Any]]) -> "TradingConfig":
@@ -118,6 +126,7 @@ class TradingConfig:
             sim=(raw.get("sim") or {}),
             ui=(raw.get("ui") or {}),
             risk=risk,
+            security=dict(raw.get("security") or {}),
         )
 
 
@@ -149,6 +158,11 @@ class TradingService:
         testnet: bool = True,
         config: Optional[Dict[str, Any]] = None,
     ):
+        install_sensitive_filter(LOG, fields=("api_key", "api_secret"))
+        self._assets = load_assets()
+        self._auto_healer = AutoHealingOrchestrator()
+        self._ui_executor: Optional[UIExecutorAgent] = None
+        self._failover_count = 0
         cfg = TradingConfig.from_mapping(config)
         # приоритет: явные аргументы > конфиг
         self._mode: Literal["sim", "binance", "ui"] = mode or cfg.mode or "sim"
@@ -160,12 +174,21 @@ class TradingService:
             sim=cfg.sim,
             ui=cfg.ui,
             risk=cfg.risk,
+            security=cfg.security,
         )
+        self._vault = SecretVault()
+        self._twofactor = TwoFactorGuard(self._vault)
+        self._security_cfg: Dict[str, Any] = {}
+        self._access = AccessController(roles={}, assignments={})
+        self._require_2fa = False
+        self._reconfigure_security()
         # ENV override (полезно в Docker/CI)
         if self._mode == "binance":
             self._testnet = _env_bool("BINANCE_TESTNET", self._testnet)
 
         self._executor: Executor = self._make_executor()
+        if isinstance(self._executor, UIExecutorAgent):
+            self._ui_executor = self._executor
         self._lock = asyncio.Lock()
 
         # Состояние риск-счётчиков
@@ -180,6 +203,11 @@ class TradingService:
             await self._executor.close()  # type: ignore[attr-defined]
         except Exception:
             pass
+        if self._ui_executor is not None and self._ui_executor is not self._executor:
+            try:
+                await self._ui_executor.close()
+            except Exception:
+                pass
 
     async def __aenter__(self) -> "TradingService":
         return self
@@ -192,9 +220,49 @@ class TradingService:
         if self._mode == "binance":
             return BinanceExecutor(testnet=self._testnet, config=self._raw_config.binance or {})  # type: ignore
         if self._mode == "ui":
-            return UIExecutorStub(testnet=self._testnet, config=self._raw_config.ui or {})  # type: ignore
+            return UIExecutorAgent(testnet=self._testnet, config=self._raw_config.ui or {})  # type: ignore
         # по умолчанию — симулятор
-        return SimulatedExecutor(testnet=True, config=self._raw_config.sim or {})  # type: ignore
+        sim = SimulatedExecutor(testnet=self._testnet)
+        return sim  # type: ignore
+
+    def _get_ui_executor(self) -> UIExecutorAgent:
+        if self._ui_executor is None:
+            self._ui_executor = UIExecutorAgent(testnet=self._testnet, config=self._raw_config.ui or {})
+        return self._ui_executor
+
+    async def _with_failover(
+        self,
+        func: Callable[[Executor], Awaitable[T]],
+        *,
+        context: str,
+        allow_ui: bool = True,
+    ) -> T:
+        try:
+            return await func(self._executor)
+        except Exception as exc:
+            LOG.warning("Primary executor failure during %s: %r", context, exc)
+            await self._auto_healer.write_snapshot(
+                StateSnapshot(
+                    name="executor_failover",
+                    payload={
+                        "context": context,
+                        "mode": self._mode,
+                        "testnet": self._testnet,
+                        "error": repr(exc),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "failovers": self._failover_count + 1,
+                    },
+                )
+            )
+            if not allow_ui or self._mode == "ui":
+                raise
+            self._failover_count += 1
+            ui = self._get_ui_executor()
+            try:
+                return await func(ui)
+            except Exception as ui_exc:
+                LOG.error("UI failover failed during %s: %r", context, ui_exc)
+                raise
 
     async def _swap_executor_if_needed(
         self,
@@ -216,7 +284,10 @@ class TradingService:
             self._testnet = new_testnet
             if config is not None:
                 self._raw_config = TradingConfig.from_mapping(config)
+                self._reconfigure_security()
             self._executor = self._make_executor()
+            if isinstance(self._executor, UIExecutorAgent):
+                self._ui_executor = self._executor
             # сброс дневных счётчиков при смене режима
             self._reset_day_counters(force=True)
 
@@ -225,6 +296,14 @@ class TradingService:
     @property
     def risk(self) -> RiskLimits:
         return self._raw_config.risk
+
+    @property
+    def available_assets(self) -> Dict[str, List[str]]:
+        return self._assets
+
+    @property
+    def failover_count(self) -> int:
+        return self._failover_count
 
     @staticmethod
     def _symbols_arg(symbols: Optional[Iterable[str]]) -> Optional[List[str]]:
@@ -240,6 +319,38 @@ class TradingService:
             self._day_trades_count = 0
             self._day_start_equity = None  # лениво вычислим при первом использовании
             LOG.info("Risk counters reset for new day: %s", self._day.isoformat())
+
+    def _reconfigure_security(self) -> None:
+        security = getattr(self._raw_config, "security", {}) or {}
+        self._security_cfg = dict(security)
+        roles_cfg = self._security_cfg.get("roles") or {}
+        roles = {name: Role.from_permissions(name, perms) for name, perms in roles_cfg.items()}
+        assignments_cfg = self._security_cfg.get("assignments") or {}
+        assignments = {user: role for user, role in assignments_cfg.items() if role in roles}
+        self._access = AccessController(roles=roles, assignments=assignments)
+        self._require_2fa = bool(self._security_cfg.get("require_2fa", False))
+
+    def _authorize(self, security_ctx: Optional[Dict[str, str]], permission: str) -> None:
+        if not self._require_2fa and not self._access.roles:
+            return
+        ctx = security_ctx or {}
+        user = ctx.get("user")
+        otp = ctx.get("otp")
+        if self._access.roles:
+            if not user:
+                raise PermissionError("User identifier required for RBAC checks")
+            self._access.require(user, permission)
+        if self._require_2fa:
+            if not otp:
+                raise PermissionError("Two-factor token required")
+            subject = user or "default"
+            self._twofactor.require(subject, otp)
+
+    def enroll_twofactor(self, user_id: str) -> str:
+        return self._twofactor.enroll(user_id)
+
+    def assign_role(self, user_id: str, role: str) -> None:
+        self._access.assign(user_id, role)
 
     async def _ensure_day_equity(self) -> None:
         """Лениво фиксируем equity на начало дня."""
@@ -548,6 +659,7 @@ class TradingService:
         return {
             "mode": self._mode,
             "testnet": self._testnet,
+            "failovers": self._failover_count,
             "risk": {
                 "per_trade_risk_pct": self.risk.per_trade_risk_pct,
                 "daily_loss_limit_pct": self.risk.daily_loss_limit_pct,
@@ -558,6 +670,11 @@ class TradingService:
                 "portfolio_max_risk_pct": rc.portfolio_max_risk_pct,
                 "max_open_positions": rc.max_open_positions,
                 "min_sl_distance_pct": rc.min_sl_distance_pct,
+            },
+            "assets": self.available_assets,
+            "security": {
+                "require_2fa": self._require_2fa,
+                "roles": list(self._access.roles.keys()),
             },
         }
 
@@ -571,12 +688,14 @@ class TradingService:
         sl_pct: Optional[float] = None,
         tp_pct: Optional[float] = None,
         client_tag: Optional[str] = None,
+        security_ctx: Optional[Dict[str, str]] = None,
     ) -> OrderResult:
         """
         MARKET-ордер. amount — базовое количество (qty).
         Риск-проверка, портфельная проверка, подгонка объёма к шагу,
         защита через open_with_protection (если есть).
         """
+        self._authorize(security_ctx, "trade:open")
         # риск-проверка (для рынка цену возьмём из тикера)
         approved_amount, warn = await self._check_risk_and_size(
             symbol=symbol, side=side, amount=amount, price_hint=None, sl_pct=sl_pct
@@ -590,32 +709,39 @@ class TradingService:
             side=side, last_price=last_price, sl_pct=sl_pct, tp_pct=tp_pct
         )
 
-        # 1) если исполнитель умеет open_with_protection — используем
-        owp = getattr(self._executor, "open_with_protection", None)
-        if callable(owp) and (sl_price is not None or tp_price is not None):
-            res = await owp(  # type: ignore[misc]
+        async def _execute(ex: Executor) -> OrderResult:
+            owp = getattr(ex, "open_with_protection", None)
+            if callable(owp) and (sl_price is not None or tp_price is not None):
+                return await owp(  # type: ignore[misc]
+                    symbol=symbol,
+                    side=side,
+                    qty=approved_amount,
+                    entry_type="market",
+                    entry_price=None,
+                    sl_price=sl_price,
+                    tp_price=tp_price,
+                    client_order_id=client_tag,
+                )
+            om = getattr(ex, "open_market", None)
+            if callable(om):
+                return await om(  # type: ignore[misc]
+                    symbol=symbol,
+                    side=side,
+                    amount=approved_amount,
+                    sl_pct=sl_pct,
+                    tp_pct=tp_pct,
+                    client_tag=client_tag,
+                )
+            oo = getattr(ex, "open_order")
+            return await oo(  # type: ignore[misc]
                 symbol=symbol,
                 side=side,
+                type="market",
                 qty=approved_amount,
-                entry_type="market",
-                entry_price=None,
-                sl_price=sl_price,
-                tp_price=tp_price,
                 client_order_id=client_tag,
             )
-        else:
-            # 2) иначе — нативный open_market / open_order
-            om = getattr(self._executor, "open_market", None)
-            if callable(om):
-                res = await om(  # type: ignore[misc]
-                    symbol=symbol, side=side, amount=approved_amount, sl_pct=sl_pct, tp_pct=tp_pct, client_tag=client_tag
-                )
-            else:
-                # универсальный слой поверх open_order (см. BinanceExecutor)
-                oo = getattr(self._executor, "open_order")
-                res = await oo(  # type: ignore[misc]
-                    symbol=symbol, side=side, type="market", qty=approved_amount, client_order_id=client_tag
-                )
+
+        res = await self._with_failover(_execute, context=f"open_market:{symbol}")
 
         try:
             # считаем сделкой только не-отклонённый результат
@@ -641,54 +767,61 @@ class TradingService:
         client_tag: Optional[str] = None,
         sl_pct: Optional[float] = None,
         tp_pct: Optional[float] = None,
+        security_ctx: Optional[Dict[str, str]] = None,
     ) -> OrderResult:
         """
         LIMIT-ордер. Риск-проверка использует limit-цену как hint.
         Если исполнитель поддерживает open_with_protection и заданы sl/tp — добавляем защиту.
         """
+        self._authorize(security_ctx, "trade:open")
+
         approved_amount, warn = await self._check_risk_and_size(
             symbol=symbol, side=side, amount=amount, price_hint=float(price), sl_pct=sl_pct
         )
         approved_amount = await self._round_amount(symbol, approved_amount)
 
-        # Поддержка защиты для лимита: выставляем сразу, если есть метод и нужны SL/TP
-        owp = getattr(self._executor, "open_with_protection", None)
-        if callable(owp) and (sl_pct or tp_pct):
-            # для лимита цены SL/TP вычислим относительно лимит-цены
-            sl_price, tp_price = None, None
-            if sl_pct and sl_pct > 0:
-                sl_price = price * (1.0 - sl_pct) if side == "buy" else price * (1.0 + sl_pct)
-            if tp_pct and tp_pct > 0:
-                tp_price = price * (1.0 + tp_pct) if side == "buy" else price * (1.0 - tp_pct)
+        async def _execute(ex: Executor) -> OrderResult:
+            owp = getattr(ex, "open_with_protection", None)
+            if callable(owp) and (sl_pct or tp_pct):
+                sl_price, tp_price = None, None
+                if sl_pct and sl_pct > 0:
+                    sl_price = price * (1.0 - sl_pct) if side == "buy" else price * (1.0 + sl_pct)
+                if tp_pct and tp_pct > 0:
+                    tp_price = price * (1.0 + tp_pct) if side == "buy" else price * (1.0 - tp_pct)
 
-            res = await owp(  # type: ignore[misc]
-                symbol=symbol,
-                side=side,
-                qty=approved_amount,
-                entry_type="limit",
-                entry_price=float(price),
-                sl_price=sl_price,
-                tp_price=tp_price,
-                client_order_id=client_tag,
-                timeInForce=tif,
-            )
-        else:
-            ol = getattr(self._executor, "open_limit", None)
-            if callable(ol):
-                res = await ol(  # type: ignore[misc]
-                    symbol=symbol, side=side, amount=approved_amount, price=float(price), time_in_force=tif, client_tag=client_tag
-                )
-            else:
-                oo = getattr(self._executor, "open_order")
-                res = await oo(  # type: ignore[misc]
+                return await owp(  # type: ignore[misc]
                     symbol=symbol,
                     side=side,
-                    type="limit",
                     qty=approved_amount,
-                    price=float(price),
-                    timeInForce=tif,
+                    entry_type="limit",
+                    entry_price=float(price),
+                    sl_price=sl_price,
+                    tp_price=tp_price,
                     client_order_id=client_tag,
+                    timeInForce=tif,
                 )
+            ol = getattr(ex, "open_limit", None)
+            if callable(ol):
+                return await ol(  # type: ignore[misc]
+                    symbol=symbol,
+                    side=side,
+                    amount=approved_amount,
+                    price=float(price),
+                    time_in_force=tif,
+                    client_tag=client_tag,
+                )
+            oo = getattr(ex, "open_order")
+            return await oo(  # type: ignore[misc]
+                symbol=symbol,
+                side=side,
+                type="limit",
+                qty=approved_amount,
+                price=float(price),
+                timeInForce=tif,
+                client_order_id=client_tag,
+            )
+
+        res = await self._with_failover(_execute, context=f"open_limit:{symbol}")
 
         try:
             status = getattr(res, "status", None) or (res.get("status") if isinstance(res, dict) else None)
@@ -722,54 +855,87 @@ class TradingService:
             return await do.delete_order(symbol=symbol, orderId=order_id, origClientOrderId=client_order_id)  # type: ignore[misc]
         raise NotImplementedError("Executor does not support cancel_order")
 
-    async def close_all(self, *, symbol: str) -> List[OrderResult]:
+    async def close_all(self, *, symbol: str, security_ctx: Optional[Dict[str, str]] = None) -> List[OrderResult]:
         """
         «Закрыть всё» по инструменту: для спота — SELL рыночным на весь свободный BASE.
         В симуляторе — мгновенно.
         """
-        # если у исполнителя есть готовый метод
-        ca = getattr(self._executor, "close_all", None)
-        if callable(ca):
-            return await ca(symbol=symbol)  # type: ignore[misc]
+        self._authorize(security_ctx, "trade:close")
+        async def _execute(ex: Executor) -> List[OrderResult]:
+            ca = getattr(ex, "close_all", None)
+            if callable(ca):
+                return await ca(symbol=symbol)  # type: ignore[misc]
 
-        # фоллбек: пробуем получить позиции и закрыть рыночным
-        try:
-            get_pos = getattr(self._executor, "get_positions", None) or getattr(self._executor, "list_positions", None)
+            get_pos = getattr(ex, "get_positions", None) or getattr(ex, "list_positions", None)
             pos_list: List[Dict[str, Any]] = []
             if callable(get_pos):
                 pos_list = await get_pos(symbols=[symbol])  # type: ignore[misc]
 
             qty_to_close = 0.0
             for p in (pos_list or []):
-                if str(p.get("symbol")).upper() == symbol.upper():
-                    qty_to_close = float(p.get("qty") or 0.0)
+                if isinstance(p, dict):
+                    sym = str(p.get("symbol", ""))
+                    qty_candidate = p.get("qty") or p.get("total_base") or p.get("amount") or 0.0
+                else:
+                    sym = str(getattr(p, "symbol", ""))
+                    qty_candidate = getattr(p, "qty", getattr(p, "total_base", 0.0))
+                if sym.upper() == symbol.upper():
+                    qty_to_close = float(qty_candidate)
                     break
 
-            if qty_to_close <= 0:
-                return [{"status": "NOOP", "symbol": symbol, "note": "nothing to close"}]  # type: ignore[return-value]
+            if qty_to_close == 0.0:
+                return []
 
-            # фоллбек на универсальный open_order/close_order
-            close_order = getattr(self._executor, "close_order", None)
+            side_close = "sell" if qty_to_close > 0 else "buy"
+            qty_abs = abs(qty_to_close)
+            close_order = getattr(ex, "close_order", None)
             if callable(close_order):
-                res = await close_order(symbol=symbol, qty=qty_to_close, type="market")  # type: ignore[misc]
+                res = await close_order(symbol=symbol, qty=qty_abs, type="market")  # type: ignore[misc]
                 return [res]  # type: ignore[return-value]
 
-            open_order = getattr(self._executor, "open_order", None)
+            om = getattr(ex, "open_market", None)
+            if callable(om):
+                res = await om(  # type: ignore[misc]
+                    symbol=symbol,
+                    side=side_close,
+                    amount=qty_abs,
+                    sl_pct=None,
+                    tp_pct=None,
+                    client_tag="auto-close",
+                )
+                return [res]
+
+            open_order = getattr(ex, "open_order", None)
             if callable(open_order):
-                res = await open_order(symbol=symbol, side="sell", type="market", qty=qty_to_close)  # type: ignore[misc]
-                return [res]  # type: ignore[return-value]
+                res = await open_order(  # type: ignore[misc]
+                    symbol=symbol,
+                    side=side_close,
+                    type="market",
+                    qty=qty_abs,
+                    client_order_id="auto-close",
+                )
+                return [res]
 
-        except Exception as e:
-            LOG.exception("close_all fallback failed for %s: %r", symbol, e)
+            raise NotImplementedError("Executor does not support close_all for this mode")
 
-        raise NotImplementedError("Executor does not support close_all for this mode")
+        return await self._with_failover(_execute, context=f"close_all:{symbol}")
 
     # --- Read only ---
-    async def get_positions(self, *, symbols: Optional[List[str]] = None) -> List[Position]:
-        gp = getattr(self._executor, "get_positions", None) or getattr(self._executor, "list_positions", None)
-        if callable(gp):
-            return await gp(symbols=self._symbols_arg(symbols))  # type: ignore[misc]
-        return []  # type: ignore[return-value]
+    async def get_positions(
+        self,
+        *,
+        symbols: Optional[List[str]] = None,
+        security_ctx: Optional[Dict[str, str]] = None,
+    ) -> List[Position]:
+        self._authorize(security_ctx, "trade:view")
+
+        async def _execute(ex: Executor) -> List[Position]:
+            gp = getattr(ex, "get_positions", None) or getattr(ex, "list_positions", None)
+            if callable(gp):
+                return await gp(symbols=self._symbols_arg(symbols))  # type: ignore[misc]
+            return []  # type: ignore[return-value]
+
+        return await self._with_failover(_execute, context="get_positions", allow_ui=True)
 
     async def get_balance(self) -> Dict[str, Any]:
         """Баланс счёта/кошелька (free/locked/total), если исполнитель поддерживает."""
@@ -791,11 +957,18 @@ class TradingService:
         tp_pct: Optional[float] = None,
         tif: Literal["GTC", "IOC", "FOK"] = "GTC",
         client_tag: Optional[str] = None,
+        security_ctx: Optional[Dict[str, str]] = None,
     ) -> OrderResult:
         """Единая точка входа: type == market|limit, с риск-проверками и защитами."""
         if type == "market":
             return await self.open_market(
-                symbol=symbol, side=side, amount=amount, sl_pct=sl_pct, tp_pct=tp_pct, client_tag=client_tag
+                symbol=symbol,
+                side=side,
+                amount=amount,
+                sl_pct=sl_pct,
+                tp_pct=tp_pct,
+                client_tag=client_tag,
+                security_ctx=security_ctx,
             )
         if price is None:
             raise ValueError("price is required for limit orders")
@@ -808,6 +981,7 @@ class TradingService:
             client_tag=client_tag,
             sl_pct=sl_pct,
             tp_pct=tp_pct,
+            security_ctx=security_ctx,
         )
 
     # --- Информация о текущем режиме/рисках (для /health, /exec/*) ---
@@ -831,4 +1005,10 @@ class TradingService:
             "day": self._day.isoformat(),
             "day_trades": self._day_trades_count,
             "day_start_equity": self._day_start_equity,
+            "failovers": self._failover_count,
+            "assets": self.available_assets,
+            "security": {
+                "require_2fa": self._require_2fa,
+                "roles": list(self._access.roles.keys()),
+            },
         }
