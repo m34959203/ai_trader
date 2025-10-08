@@ -10,13 +10,15 @@ Public API (stable):
     - analyze_market(df_1h, df_4h=None, config=DEFAULT_CONFIG) -> dict
 """
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Optional, Final
 
 import numpy as np
 import pandas as pd
 
 # Индикаторы проекта
+from src.ai.adaptive import DEFAULT_ENGINE
 from src.indicators import (
     ema, rsi as rsi_ind, macd as macd_ind, bollinger_bands as bb_ind,
     atr as atr_ind, adx as adx_ind
@@ -568,6 +570,15 @@ def analyze_market(
     trend = _infer_trend(df1)
     vol   = _vol_state(df1, cfg)
     sig, score, reasons = _rule_signal(df1, cfg, levels)
+    latest_row = df1.iloc[-1]
+    if sig in {"buy", "sell"}:
+        DEFAULT_ENGINE.record_example(latest_row, 1 if sig == "buy" else 0)
+    if DEFAULT_ENGINE.needs_retrain():
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(DEFAULT_ENGINE.maybe_retrain())
+        except RuntimeError:
+            asyncio.run(DEFAULT_ENGINE.maybe_retrain())
 
     # Multi-timeframe confirmation (4h)
     mtf: Optional[Dict[str, str]] = None
@@ -645,6 +656,9 @@ def analyze_market(
     }
     if mtf is not None:
         result["mtf"] = mtf
+    adaptive = DEFAULT_ENGINE.adjust(result, df=df1)
+    result.setdefault("meta", {})
+    result["meta"]["adaptive"] = asdict(adaptive)
     return result
 
 

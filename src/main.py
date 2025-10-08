@@ -10,6 +10,13 @@ from typing import Literal, Optional, Any, Dict, List
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+try:
+    from risk.deadman import HEARTBEAT_FILE as DEADMAN_HEARTBEAT_FILE  # type: ignore
+    _HAS_DEADMAN = True
+except Exception:  # pragma: no cover
+    DEADMAN_HEARTBEAT_FILE = Path("data/state/heartbeat.txt")
+    _HAS_DEADMAN = False
+
 import pandas as pd
 import httpx
 import psutil
@@ -84,7 +91,12 @@ except Exception:  # pragma: no cover
 
 # Потоки (опц.)
 try:
-    from services.reconcile import reconcile_positions  # type: ignore
+    from services.reconcile import (  # type: ignore
+        reconcile_positions,
+        reconcile_on_start,
+        reconcile_periodic,
+        get_periodic_config_from_env,
+    )
     _HAS_RECONCILE = True
 except Exception:  # pragma: no cover
     _HAS_RECONCILE = False
@@ -112,6 +124,7 @@ except Exception:
 
 
 APP_VERSION = os.getenv("APP_VERSION", "0.11.1")
+APP_ENV = (os.getenv("APP_ENV") or "dev").strip().lower()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV utils
@@ -164,8 +177,9 @@ FEATURES: Dict[str, bool] = {
     "autopilot":     env_bool("FEATURE_AUTOPILOT", True) and _HAS_AUTOPILOT,
 }
 
-# Управление бэкграунд-тасками: по умолчанию ВЫКЛ (важно для тестов)
-ENABLE_BG_TASKS = env_bool("ENABLE_BG_TASKS", False)
+# Управление бэкграунд-тасками: включаем по умолчанию для prod/staging окружений
+_BG_DEFAULT = APP_ENV in {"prod", "production", "staging"}
+ENABLE_BG_TASKS = env_bool("ENABLE_BG_TASKS", _BG_DEFAULT)
 
 # Binance / WS окружение
 BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY", "")
@@ -193,7 +207,7 @@ RECONCILE_SYMBOLS    = os.getenv("RECONCILE_SYMBOLS")
 # Константы
 # ──────────────────────────────────────────────────────────────────────────────
 APP_START_TS = int(time.time())
-HEARTBEAT_FILE = Path("data/state/heartbeat.txt")
+HEARTBEAT_FILE = DEADMAN_HEARTBEAT_FILE
 HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 BINANCE_REST_TESTNET = "https://testnet.binance.vision/api"
@@ -354,6 +368,58 @@ async def lifespan(app: FastAPI):
     app.state.market_last_event_ts = 0
     app.state.user_last_event_ts   = 0
     app.state.market_ring: List[Dict[str, Any]] = []
+
+    # Reconcile on start / periodic loop (если доступно и разрешено)
+    if _HAS_RECONCILE and FEATURES.get("execution_api", False):
+        if RECONCILE_AT_START:
+            try:
+                report = await reconcile_on_start()
+                if report and not report.get("ok", True):
+                    LOG.warning("Reconcile on start reported issues: %s", report)
+                elif report:
+                    LOG.info(
+                        "Reconcile on start completed: mismatches=%s",
+                        report.get("summary", {}).get("mismatch_count"),
+                    )
+            except Exception as e:  # pragma: no cover
+                LOG.warning("Reconcile on start failed: %r", e)
+
+        if ENABLE_BG_TASKS and RECONCILE_PERIODIC:
+            periodic_cfg: Optional[Dict[str, Any]] = None
+            try:
+                periodic_cfg = get_periodic_config_from_env()
+            except Exception as e:  # pragma: no cover
+                LOG.warning("Failed to load periodic reconcile config: %r", e)
+
+            if not periodic_cfg:
+                symbols_list = [
+                    s.strip().upper() for s in (RECONCILE_SYMBOLS or "").split(",") if s.strip()
+                ]
+                mode_env = str(RECONCILE_MODE or "binance").strip().lower()
+                periodic_cfg = {
+                    "interval_sec": max(5, int(RECONCILE_INT_SEC or 60)),
+                    "mode": "sim" if mode_env == "sim" else "binance",
+                    "testnet": bool(RECONCILE_TESTNET),
+                    "auto_fix": bool(RECONCILE_AUTO_FIX),
+                    "abs_tol": float(RECONCILE_ABS_TOL or 1e-8),
+                    "journal_limit": int(RECONCILE_JOURNAL_N or 200),
+                    "symbols": symbols_list or None,
+                }
+
+            try:
+                app.state.reconcile_task = asyncio.create_task(
+                    reconcile_periodic(**periodic_cfg),
+                    name="reconcile_loop",
+                )
+                LOG.info(
+                    "Reconcile loop scheduled: every %ss (mode=%s, testnet=%s, auto_fix=%s)",
+                    periodic_cfg.get("interval_sec"),
+                    periodic_cfg.get("mode"),
+                    periodic_cfg.get("testnet"),
+                    periodic_cfg.get("auto_fix"),
+                )
+            except Exception as e:  # pragma: no cover
+                LOG.warning("Failed to start reconcile loop: %r", e)
 
     # MARKET WS
     if FEATURES.get("market_ws", False) and _HAS_STREAMS:

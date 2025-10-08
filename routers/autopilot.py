@@ -3,330 +3,306 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional, Literal, Dict, Any
+from dataclasses import replace
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Body
-from pydantic import BaseModel, Field
-
-from executors.api_binance import BinanceExecutor, BinanceAPIError
+from fastapi import APIRouter, Body, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
 LOG = logging.getLogger("ai_trader.autopilot")
+
 router = APIRouter(prefix="/autopilot", tags=["autopilot"])
 
+try:  # опциональный модуль авто-трейдера
+    from tasks import auto_trader as auto_trader_module  # type: ignore
+
+    AutoTraderConfig = auto_trader_module.AutoTraderConfig
+    AutoTraderState = auto_trader_module.AutoTraderState
+    get_config = auto_trader_module.get_config
+    set_config = auto_trader_module.set_config
+    get_runtime_status = auto_trader_module.get_runtime_status
+    background_loop = auto_trader_module.background_loop
+
+    _HAS_AUTO_TRADER_RUNTIME = True
+except Exception:  # pragma: no cover
+    AutoTraderConfig = None  # type: ignore
+    AutoTraderState = None  # type: ignore
+    get_config = None  # type: ignore
+    set_config = None  # type: ignore
+    get_runtime_status = None  # type: ignore
+    background_loop = None  # type: ignore
+
+    _HAS_AUTO_TRADER_RUNTIME = False
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Глобальное состояние пилота (один воркер для простоты)
+# Модели запросов/ответов
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+class AutoTraderConfigPatch(BaseModel):
+    enabled: Optional[bool] = None
+    symbols: Optional[List[str]] = Field(default=None, min_length=1)
+    timeframe: Optional[str] = Field(default=None, min_length=1, max_length=20)
+    api_base: Optional[str] = Field(default=None, min_length=3)
+    source: Optional[str] = Field(default=None, min_length=1)
+    mode: Optional[str] = Field(default=None, min_length=1)
+    testnet: Optional[bool] = None
+
+    sma_fast: Optional[int] = Field(default=None, ge=1)
+    sma_slow: Optional[int] = Field(default=None, ge=2)
+    confirm_on_close: Optional[bool] = None
+    signal_persist: Optional[int] = Field(default=None, ge=1)
+    signal_cooldown: Optional[int] = Field(default=None, ge=0)
+    signal_min_gap_pct: Optional[float] = Field(default=None, ge=0.0)
+    use_regime_filter: Optional[bool] = None
+
+    atr_period: Optional[int] = Field(default=None, ge=0)
+    atr_mult: Optional[float] = Field(default=None, ge=0.0)
+    min_sl_pct: Optional[float] = Field(default=None, ge=0.0)
+    max_sl_pct: Optional[float] = Field(default=None, ge=0.0)
+
+    quote_usdt: Optional[float] = Field(default=None, ge=0.0)
+    equity_min_usdt: Optional[float] = Field(default=None, ge=0.0)
+    sl_pct: Optional[float] = Field(default=None, ge=0.0)
+    tp_pct: Optional[float] = Field(default=None, ge=0.0)
+    use_risk_autosize: Optional[bool] = None
+    use_portfolio_risk: Optional[bool] = None
+    max_portfolio_risk: Optional[float] = Field(default=None, ge=0.0)
+
+    sell_on_death: Optional[bool] = None
+    sell_pct_of_position: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+    loop_sec: Optional[float] = Field(default=None, ge=1.0)
+    http_timeout_sec: Optional[float] = Field(default=None, ge=1.0)
+    net_max_retries: Optional[int] = Field(default=None, ge=1)
+    net_retry_base: Optional[float] = Field(default=None, ge=0.1)
+    net_retry_cap: Optional[float] = Field(default=None, ge=0.1)
+
+    dry_run: Optional[bool] = None
+    concurrency: Optional[int] = Field(default=None, ge=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("symbols", mode="before")
+    @classmethod
+    def _normalize_symbols(cls, value):
+        if value is None:
+            return value
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            raise TypeError("symbols must be a list of strings")
+        normalized = []
+        for item in value:
+            if item is None:
+                continue
+            item_str = str(item).strip().upper()
+            if item_str:
+                normalized.append(item_str)
+        if not normalized:
+            raise ValueError("symbols must contain at least one symbol")
+        return normalized
+
+    @field_validator("timeframe", "api_base", "source", "mode", mode="before")
+    @classmethod
+    def _strip_strings(cls, value):
+        if value is None:
+            return value
+        return str(value).strip()
+
+    @model_validator(mode="after")
+    def _validate_sl_bounds(self):
+        if self.min_sl_pct is not None and self.max_sl_pct is not None:
+            if self.max_sl_pct < self.min_sl_pct:
+                raise ValueError("max_sl_pct must be >= min_sl_pct")
+        if self.sma_fast is not None and self.sma_slow is not None:
+            if self.sma_fast >= self.sma_slow:
+                raise ValueError("sma_slow must be greater than sma_fast")
+        if self.net_retry_base is not None and self.net_retry_cap is not None:
+            if self.net_retry_cap < self.net_retry_base:
+                raise ValueError("net_retry_cap must be >= net_retry_base")
+        return self
+
+
+class StartResponse(BaseModel):
+    status: str
+    config: Dict[str, Any]
+
+
+class StopResponse(BaseModel):
+    status: str
+
+
+class StatusResponse(BaseModel):
+    running: bool
+    task_state: Dict[str, Any]
+    auto_trader: Dict[str, Any]
+
+
+class ConfigResponse(BaseModel):
+    config: Dict[str, Any]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Глобальное состояние управления через API
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 _TASK: Optional[asyncio.Task] = None
-_STOP = asyncio.Event()
-_EXECUTOR: Optional[BinanceExecutor] = None
+_TASK_STATE: Optional[AutoTraderState] = None
+_LOCK = asyncio.Lock()
 
-_STATE: Dict[str, Any] = {
-    "running": False,
-    "symbol": None,
-    "side_mode": None,
-    "force": None,
-    "step_sec": None,
-    "testnet": True,
-    "started_at": None,
-    "last_error": None,
-    "budget_usdt": None,
-}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Модель для опционального override ключей через JSON-тело
-# ──────────────────────────────────────────────────────────────────────────────
-class ApiCreds(BaseModel):
-    api_key: Optional[str] = Field(default=None, description="Binance API key (override ENV)")
-    api_secret: Optional[str] = Field(default=None, description="Binance API secret (override ENV)")
+def _ensure_runtime() -> None:
+    if not _HAS_AUTO_TRADER_RUNTIME:
+        raise HTTPException(status_code=503, detail="Autonomous trader runtime not available")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Вспомогательные утилиты
-# ──────────────────────────────────────────────────────────────────────────────
-async def _get_symbol_assets(executor: BinanceExecutor, symbol: str) -> tuple[str, str]:
-    """Вернуть (baseAsset, quoteAsset) по символу или кинуть 400."""
-    s_info = await executor.client.get_symbol_info(symbol.upper())
-    if not s_info:
-        raise HTTPException(status_code=400, detail=f"Unknown symbol: {symbol.upper()}")
-    base = s_info.get("baseAsset")
-    quote = s_info.get("quoteAsset")
-    if not base or not quote:
-        raise HTTPException(status_code=400, detail=f"No base/quote assets for symbol {symbol.upper()}")
-    return base, quote
 
-async def _free_balances(executor: BinanceExecutor) -> dict:
-    """Карта свободных балансов вида {'USDT': 123.45, 'BTC': 0.01, ...}."""
-    acc = await executor.fetch_balance()
-    return {b["asset"]: float(b["free"]) for b in (acc.get("balances") or [])}
-
-async def _place_market_buy_by_quote(
-    executor: BinanceExecutor,
-    symbol: str,
-    quote_amount: float,
-) -> Dict[str, Any]:
-    """
-    MARKET BUY по quoteOrderQty (биржа сама валидирует NOTIONAL).
-    ВАЖНО: ваш BinanceExecutor.open_order НЕ поддерживает параметр `test`,
-    поэтому не передаём его сюда.
-    """
-    return await executor.open_order(
-        symbol=symbol,
-        side="buy",
-        type="market",
-        quote_qty=quote_amount,
-        client_order_id=None,   # сгенерируется автоматически внутри executora
-    )
-
-async def _place_market_sell_by_qty(
-    executor: BinanceExecutor,
-    symbol: str,
-    qty: float,
-) -> Dict[str, Any]:
-    """MARKET SELL по количеству (qty) с авто-округлением по фильтрам."""
-    adj = await executor.round_qty(symbol, qty)
-    if adj <= 0:
-        raise ValueError("Adjusted quantity <= 0")
-    return await executor.open_order(
-        symbol=symbol,
-        side="sell",
-        type="market",
-        qty=adj,
-        client_order_id=None,   # сгенерируется автоматически
-    )
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Основной цикл автопилота
-# ──────────────────────────────────────────────────────────────────────────────
-async def _loop_autotrade(
-    executor: BinanceExecutor,
-    symbol: str,
-    budget_usdt: float,
-    step_sec: int,
-    side_mode: Literal["both", "buy_only", "sell_only"],
-    force: bool,
-):
-    LOG.info(
-        "Autopilot started: symbol=%s budget=%.6f step=%ss side=%s force=%s",
-        symbol, budget_usdt, step_sec, side_mode, force,
-    )
-    buy_turn = True
-
+def _apply_patch(base: AutoTraderConfig, patch: AutoTraderConfigPatch) -> AutoTraderConfig:
+    data = patch.model_dump(exclude_unset=True)
+    if not data:
+        return base
     try:
-        base, quote = await _get_symbol_assets(executor, symbol)
+        return replace(base, **data)
+    except TypeError as exc:  # pragma: no cover - дополнительная страховка
+        raise HTTPException(status_code=400, detail=f"Invalid config override: {exc}") from exc
 
-        while not _STOP.is_set():
-            try:
-                # Балансы
-                free = await _free_balances(executor)
-                free_base = float(free.get(base, 0.0))
-                free_quote = float(free.get(quote, 0.0))
 
-                # Выбор стороны
-                if side_mode == "buy_only":
-                    side = "BUY"
-                elif side_mode == "sell_only":
-                    side = "SELL"
-                else:
-                    side = "BUY" if buy_turn else "SELL"
+async def _stop_task_locked(timeout: float = 10.0) -> bool:
+    global _TASK, _TASK_STATE
+    task = _TASK
+    if task is None:
+        return False
 
-                # Стратегия объёма:
-                # - BUY: quote_qty = min(budget_usdt, free_quote) (если !force),
-                #         если force — используем budget_usdt (биржа валидирует NOTIONAL)
-                # - SELL: продаём min(rounded(free_base), qty_from_budget) если !force,
-                #         иначе — берём qty_from_budget (или микролот как fallback)
-                if side == "BUY":
-                    if force:
-                        quote_amt = max(0.5, budget_usdt)  # >= ~0.5 для прохождения MIN_NOTIONAL многих пар
-                    else:
-                        if free_quote <= 0:
-                            LOG.info("BUY skip: no free %s (free_quote=%.6f)", quote, free_quote)
-                            await asyncio.sleep(step_sec)
-                            buy_turn = not buy_turn
-                            continue
-                        quote_amt = min(budget_usdt, free_quote)
-
-                    try:
-                        r = await _place_market_buy_by_quote(executor, symbol, quote_amt)
-                        LOG.info("BUY placed: symbol=%s quote=%.6f status=%s", symbol, quote_amt, r.get("status"))
-                    except BinanceAPIError as e:
-                        LOG.error("BUY BinanceAPIError: %s", e)
-                        if not force:
-                            raise
-                    except Exception as e:
-                        LOG.error("BUY error: %r", e)
-                        if not force:
-                            raise
-
-                else:  # SELL
-                    if free_base <= 0 and not force:
-                        LOG.info("SELL skip: no free %s (free_base=%.8f)", base, free_base)
-                        await asyncio.sleep(step_sec)
-                        buy_turn = not buy_turn
-                        continue
-
-                    # Подберём qty исходя из бюджета и/или всего free_base
-                    qty_target = free_base
-
-                    # Попробуем оценить цену, чтобы связать бюджет с qty (best-effort)
-                    try:
-                        last_px = await executor.get_last_price(symbol)
-                    except Exception:
-                        last_px = None
-
-                    if last_px and last_px > 0:
-                        qty_from_budget = budget_usdt / float(last_px)
-                        qty_target = min(free_base, qty_from_budget) if not force else max(qty_from_budget, 0.0)
-
-                    # Fallback: если совсем пусто, но force — поставим минимальный пилотный лот
-                    if (qty_target is None or qty_target <= 0.0) and force:
-                        qty_target = 0.0005  # безопасный микролот; executor.round_qty его приведёт
-
-                    try:
-                        r = await _place_market_sell_by_qty(executor, symbol, qty=qty_target)
-                        LOG.info("SELL placed: symbol=%s qty=%.8f status=%s", symbol, qty_target, r.get("status"))
-                    except BinanceAPIError as e:
-                        LOG.error("SELL BinanceAPIError: %s", e)
-                        if not force:
-                            raise
-                    except Exception as e:
-                        LOG.error("SELL error: %r", e)
-                        if not force:
-                            raise
-
-                buy_turn = not buy_turn
-                await asyncio.sleep(step_sec)
-
-            except asyncio.CancelledError:
-                LOG.info("Autopilot task cancelled.")
-                break
-            except Exception as e:
-                LOG.exception("Autopilot iteration error: %r", e)
-                _STATE["last_error"] = repr(e)
-                if not force:
-                    # Без форса — выходим при ошибке
-                    break
-                await asyncio.sleep(step_sec)
-
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=timeout)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        LOG.warning("Autopilot task did not stop within %.1fs", timeout)
+    except Exception as exc:
+        LOG.warning("Autopilot task finished with error: %r", exc)
     finally:
-        LOG.info("Autopilot stopped.")
+        _TASK = None
+        _TASK_STATE = None
+    return True
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Роуты управления
 # ──────────────────────────────────────────────────────────────────────────────
-@router.post("/start")
+
+
+@router.get("/config", response_model=ConfigResponse)
+async def get_autopilot_config() -> ConfigResponse:
+    """Вернуть текущий конфиг авто-трейдера."""
+    _ensure_runtime()
+    cfg = get_config()
+    return ConfigResponse(config=cfg.to_public_dict())
+
+
+@router.put("/config", response_model=ConfigResponse)
+async def update_autopilot_config(
+    patch: AutoTraderConfigPatch = Body(default_factory=AutoTraderConfigPatch),
+    restart: bool = Query(default=False),
+) -> ConfigResponse:
+    """Обновить конфигурацию; опционально перезапустить работающий цикл."""
+
+    _ensure_runtime()
+
+    global _TASK, _TASK_STATE
+
+    async with _LOCK:
+        base_cfg = get_config()
+        new_cfg = _apply_patch(base_cfg, patch)
+        set_config(new_cfg)
+
+        if restart and _TASK is not None and not _TASK.done():
+            LOG.info("Restarting autopilot with updated configuration")
+            await _stop_task_locked()
+            state = AutoTraderState()
+            _TASK = asyncio.create_task(
+                background_loop(config=new_cfg, state=state),
+                name="auto_trader_api",
+            )
+            _TASK_STATE = state
+
+    return ConfigResponse(config=get_config().to_public_dict())
+
+
+@router.post("/start", response_model=StartResponse)
 async def start_autopilot(
-    symbol: str = Query("BTCUSDT"),
-    budget_usdt: float = Query(50.0, ge=1.0),
-    step_sec: int = Query(15, ge=5, le=600),
-    side_mode: Literal["both", "buy_only", "sell_only"] = "both",
-    force: bool = Query(False),
-    testnet: bool = Query(True),
-    # OPTIONAL override ключей: query...
-    api_key_q: str | None = Query(None, alias="api_key"),
-    api_secret_q: str | None = Query(None, alias="api_secret"),
-    # ...или JSON-тело
-    creds: ApiCreds = Body(default=ApiCreds()),
-):
-    """
-    Запустить фоновый цикл автопилота.
-    Ключи берутся из ENV (.env) через utils.secrets.get_binance_keys() внутри BinanceExecutor,
-    если явно не переданы в запросе (query/body).
-    """
-    global _TASK, _STOP, _EXECUTOR, _STATE
+    patch: AutoTraderConfigPatch = Body(default_factory=AutoTraderConfigPatch),
+    restart: bool = Query(default=False),
+) -> StartResponse:
+    """Запустить фоновый цикл авто-трейдера с указанными override-настройками."""
 
-    if _TASK and not _TASK.done():
-        raise HTTPException(status_code=409, detail="Autopilot already running")
+    _ensure_runtime()
 
-    # Если пользователь передал ключи — используем; иначе позволяем Executor достать из ENV
-    api_key = api_key_q or creds.api_key
-    api_secret = api_secret_q or creds.api_secret
+    global _TASK, _TASK_STATE
 
-    try:
-        _EXECUTOR = BinanceExecutor(api_key=api_key, api_secret=api_secret, testnet=testnet)
+    async with _LOCK:
+        if _TASK is not None and not _TASK.done():
+            if not restart:
+                raise HTTPException(status_code=409, detail="Autopilot already running")
+            LOG.info("Restart requested via /autopilot/start")
+            await _stop_task_locked()
 
-        # sanity check connectivity + symbol
-        await _EXECUTOR.client.get_time()
-        await _get_symbol_assets(_EXECUTOR, symbol)
+        base_cfg = get_config()
+        cfg = _apply_patch(base_cfg, patch)
+        set_config(cfg)
 
-    except BinanceAPIError as e:
-        if _EXECUTOR:
-            await _EXECUTOR.close()
-        _EXECUTOR = None
-        raise HTTPException(status_code=400, detail=f"Binance connectivity/symbol check failed: {e.msg}") from e
+        state = AutoTraderState()
+        _TASK = asyncio.create_task(
+            background_loop(config=cfg, state=state),
+            name="auto_trader_api",
+        )
+        _TASK_STATE = state
 
-    except RuntimeError as e:
-        # Типичный случай: ключи не найдены в ENV и не переданы в запросе
-        if _EXECUTOR:
-            await _EXECUTOR.close()
-        _EXECUTOR = None
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "API keys not found in environment. "
-                "Заполните .env или передайте api_key/api_secret в запросе."
-            ),
-        ) from e
+    return StartResponse(status="started", config=cfg.to_public_dict())
 
-    except Exception as e:
-        if _EXECUTOR:
-            await _EXECUTOR.close()
-        _EXECUTOR = None
-        raise HTTPException(status_code=400, detail=f"Connectivity check error: {repr(e)}") from e
 
-    _STOP = asyncio.Event()
+@router.post("/stop", response_model=StopResponse)
+async def stop_autopilot() -> StopResponse:
+    """Остановить фоновый цикл авто-трейдера."""
 
-    _STATE.update({
-        "running": True,
-        "symbol": symbol.upper(),
-        "side_mode": side_mode,
-        "force": force,
-        "step_sec": step_sec,
-        "testnet": testnet,
-        "started_at": asyncio.get_running_loop().time(),
-        "last_error": None,
-        "budget_usdt": float(budget_usdt),
-    })
+    _ensure_runtime()
 
-    _TASK = asyncio.create_task(_loop_autotrade(
-        _EXECUTOR, symbol, budget_usdt, step_sec, side_mode, force
-    ))
+    async with _LOCK:
+        stopped = await _stop_task_locked()
+    return StopResponse(status="stopped" if stopped else "idle")
 
-    return {
-        "status": "started",
-        "symbol": symbol.upper(),
-        "step_sec": step_sec,
-        "force": force,
-        "testnet": testnet,
-        "side_mode": side_mode,
-        "budget_usdt": float(budget_usdt),
-    }
 
-@router.post("/stop")
-async def stop_autopilot():
-    global _TASK, _STOP, _EXECUTOR, _STATE
-    if not _TASK:
-        return {"status": "idle"}
+@router.get("/status", response_model=StatusResponse)
+async def status_autopilot() -> StatusResponse:
+    """Получить состояние фонового автотрейдера."""
 
-    _STOP.set()
-    try:
-        await asyncio.wait_for(_TASK, timeout=7.0)
-    except asyncio.TimeoutError:
-        _TASK.cancel()
-
-    _TASK = None
-    _STATE["running"] = False
-
-    # Аккуратно закрыть HTTP-клиента
-    if _EXECUTOR:
-        try:
-            await _EXECUTOR.close()
-        finally:
-            _EXECUTOR = None
-
-    return {"status": "stopped"}
-
-@router.get("/status")
-async def status_autopilot():
     running = _TASK is not None and not _TASK.done()
-    d = dict(_STATE)
-    d["running"] = running
-    return d
+    task_state: Dict[str, Any] = {
+        "running": running,
+        "task_name": getattr(_TASK, "get_name", lambda: "auto_trader_api")(),
+    }
+    if _TASK_STATE is not None:
+        task_state.update(
+            {
+                "iteration": _TASK_STATE.iteration,
+                "started_at": _TASK_STATE.started_at,
+                "last_cycle_started": _TASK_STATE.last_cycle_started,
+                "last_cycle_finished": _TASK_STATE.last_cycle_finished,
+                "last_error": _TASK_STATE.last_error,
+            }
+        )
+
+    if not _HAS_AUTO_TRADER_RUNTIME:
+        auto_status: Dict[str, Any] = {"available": False}
+    else:
+        try:
+            auto_status = get_runtime_status()
+        except Exception as exc:  # pragma: no cover
+            LOG.warning("Failed to fetch runtime status: %r", exc)
+            auto_status = {"error": repr(exc)}
+
+    return StatusResponse(running=running, task_state=task_state, auto_trader=auto_status)
+

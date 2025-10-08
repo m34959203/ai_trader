@@ -8,10 +8,10 @@ from typing import AsyncIterator, Dict, List, Optional, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse
-from sqlalchemy import text as sa_text
+from sqlalchemy import text as sa_text, select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.session import get_async_session
+from db.session import get_session
 from db import crud
 from db.models import OHLCV
 
@@ -56,7 +56,7 @@ CSV_HEADER = ["source", "asset", "tf", "ts", "open", "high", "low", "close", "vo
 @router.post("/prices/store")
 async def store_prices(
     payload: dict = Body(...),
-    session: AsyncSession = Depends(get_async_session),
+    session: AsyncSession = Depends(get_session),
 ):
     """
     Загружает OHLCV из источника и сохраняет в БД.
@@ -107,7 +107,7 @@ async def get_ohlcv(
     limit: int = Query(1000, ge=0),
     offset: int = Query(0, ge=0),
     order: Literal["asc","desc"] = Query("asc"),
-    session: AsyncSession = Depends(get_async_session),
+    session: AsyncSession = Depends(get_session),
 ):
     """
     Строгая limit/offset-пагинация БЕЗ «додобора».
@@ -166,7 +166,7 @@ async def get_ohlcv_csv(
     limit: int = Query(0, ge=0),  # 0 => без ограничения (всё)
     offset: int = Query(0, ge=0),
     order: Literal["asc","desc"] = Query("asc"),
-    session: AsyncSession = Depends(get_async_session),
+    session: AsyncSession = Depends(get_session),
 ):
     """
     Стримовый CSV с теми же фильтрами, без «додобора».
@@ -242,7 +242,7 @@ async def get_ohlcv_count(
     timeframe: Optional[str] = Query(None),
     ts_from: Optional[int] = None,
     ts_to: Optional[int] = None,
-    session: AsyncSession = Depends(get_async_session),
+    session: AsyncSession = Depends(get_session),
 ):
     """
     Возвращает 200 всегда; если CRUD доступен — реальные count/stats.
@@ -270,3 +270,51 @@ async def get_ohlcv_count(
         "count": int(count) if isinstance(count, int) else None,
         "stats": stats,
     })
+
+
+@router.get("/ohlcv/stats")
+async def get_ohlcv_stats(
+    source: Optional[str] = Query(None),
+    ticker: Optional[str] = Query(None, alias="ticker"),
+    timeframe: Optional[str] = Query(None),
+    ts_from: Optional[int] = None,
+    ts_to: Optional[int] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Компактная сводка по свечам: минимальный/максимальный timestamp и количество.
+    Используется health-эндпоинтом и тестами для проверки наполнения БД.
+    """
+    filters = []
+    if source:
+        filters.append(OHLCV.source == source.strip().lower())
+    if ticker:
+        filters.append(OHLCV.asset == ticker.strip().upper())
+    if timeframe:
+        filters.append(OHLCV.tf == timeframe.strip())
+    if ts_from is not None:
+        filters.append(OHLCV.ts >= int(ts_from))
+    if ts_to is not None:
+        filters.append(OHLCV.ts <= int(ts_to))
+
+    stmt = select(
+        func.min(OHLCV.ts).label("min_ts"),
+        func.max(OHLCV.ts).label("max_ts"),
+        func.count(func.distinct(OHLCV.ts)).label("count"),
+    )
+    if filters:
+        stmt = stmt.where(and_(*filters))
+
+    result = await session.execute(stmt)
+    row = result.one_or_none()
+    if not row:
+        return {"min_ts": None, "max_ts": None, "count": 0}
+
+    min_ts = row.min_ts
+    max_ts = row.max_ts
+    count = row.count
+    return {
+        "min_ts": int(min_ts) if min_ts is not None else None,
+        "max_ts": int(max_ts) if max_ts is not None else None,
+        "count": int(count or 0),
+    }
