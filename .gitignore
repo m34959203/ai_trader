@@ -22,3 +22,5 @@ data/
 venv/
 venv/
 .venv/
+data/ai_trader.db
+data/state/
