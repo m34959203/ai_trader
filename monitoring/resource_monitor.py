@@ -8,7 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 
@@ -200,6 +200,9 @@ class ResourceMonitor:
         self._level_value = "ok"
         self._alert_level = "ok"
         self._last_info_ts = 0.0
+        self._last_snapshot: Optional[ResourceSnapshot] = None
+        self._last_reasons: List[str] = []
+        self._last_snapshot_ts: Optional[int] = None
 
     def stop(self) -> None:
         self._stop = True
@@ -295,6 +298,10 @@ class ResourceMonitor:
             "config": self.config.to_public_dict(),
         }
 
+        self._last_snapshot = snap
+        self._last_reasons = list(reasons)
+        self._last_snapshot_ts = snap.timestamp
+
         if level == "crit":
             if self._level_streak >= self.config.crit_streak and self._alert_level != "crit":
                 msg = "Resource monitor: critical thresholds exceeded"
@@ -368,3 +375,18 @@ class ResourceMonitor:
                 raise
 
         self.log.info("Resource monitor stopped")
+
+    def status(self) -> Dict[str, Any]:
+        """Возвращает агрегированную информацию о состоянии монитора."""
+
+        snapshot_dict = self._last_snapshot.to_dict() if self._last_snapshot else None
+        return {
+            "running": not self._stop,
+            "level": self._level_value,
+            "alert_level": self._alert_level,
+            "streak": self._level_streak,
+            "reasons": list(self._last_reasons),
+            "last_snapshot_ts": self._last_snapshot_ts,
+            "snapshot": snapshot_dict,
+            "config": self.config.to_public_dict(),
+        }
