@@ -5,9 +5,15 @@ import os
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 
 import httpx
+import pandas as pd
+
+from src.indicators import atr as atr_indicator
+from src.strategy import ema_cross_signals
+from utils.risk_config import load_risk_config, RiskConfig
 
 LOG = logging.getLogger("ai_trader.auto_trader")
 
@@ -29,14 +35,26 @@ SMA_FAST              = int(os.getenv("AUTO_TRADER_SMA_FAST", "20"))
 SMA_SLOW              = int(os.getenv("AUTO_TRADER_SMA_SLOW", "50"))
 CONFIRM_ON_CLOSE      = os.getenv("AUTO_TRADER_CONFIRM_ON_CLOSE", "1").strip() not in {"0", "false", "False", ""}
 # Если True — торгуем только один раз на закрытии новой свечи (no repaint).
+SIGNAL_PERSIST        = int(os.getenv("AUTO_TRADER_SIGNAL_PERSIST", "1"))
+SIGNAL_COOLDOWN       = int(os.getenv("AUTO_TRADER_SIGNAL_COOLDOWN", "0"))
+SIGNAL_MIN_GAP_PCT    = float(os.getenv("AUTO_TRADER_SIGNAL_MIN_GAP_PCT", "0"))
+USE_REGIME_FILTER     = os.getenv("AUTO_TRADER_USE_REGIME_FILTER", "0").strip() in {"1", "true", "True"}
+
+# ATR / стопы
+ATR_PERIOD            = int(os.getenv("AUTO_TRADER_ATR_PERIOD", "14"))
+ATR_MULT              = float(os.getenv("AUTO_TRADER_ATR_MULT", "2.0"))
+MIN_SL_PCT            = float(os.getenv("AUTO_TRADER_MIN_SL_PCT", "0.001"))
+MAX_SL_PCT            = float(os.getenv("AUTO_TRADER_MAX_SL_PCT", "0.05"))
 
 # Размер позиции / риск
-QUOTE_USDT            = float(os.getenv("AUTO_TRADER_QUOTE_USDT", "50"))        # сумма покупки в USDT
+QUOTE_USDT            = float(os.getenv("AUTO_TRADER_QUOTE_USDT", "50"))        # сумма покупки в USDT (потолок)
 EQUITY_MIN_USDT       = float(os.getenv("AUTO_TRADER_EQUITY_MIN_USDT", "10"))   # минимальный порог equity
 SL_PCT                = float(os.getenv("AUTO_TRADER_SL_PCT", "0"))             # 0..1 (например 0.01 = 1%); 0 — не задавать
 TP_PCT                = float(os.getenv("AUTO_TRADER_TP_PCT", "0"))             # 0..1; 0 — не задавать
-USE_RISK_AUTOSIZE     = os.getenv("AUTO_TRADER_USE_RISK_AUTOSIZE", "0").strip() in {"1", "true", "True"}
-# Если True, а SL_PCT > 0 — ордер отправляется без qty/quote_qty, сервер сам рассчитает qty по риску.
+USE_RISK_AUTOSIZE     = os.getenv("AUTO_TRADER_USE_RISK_AUTOSIZE", "1").strip() not in {"0", "false", "False", ""}
+# Если True, а стоп вычислен (>0) — ордер отправляется без qty/quote_qty, сервер сам рассчитает qty по риску.
+USE_PORTFOLIO_RISK    = os.getenv("AUTO_TRADER_USE_PORTFOLIO_RISK", "1").strip() not in {"0", "false", "False", ""}
+MAX_RISK_PORTFOLIO    = float(os.getenv("AUTO_TRADER_MAX_PORTFOLIO_RISK", "0"))  # 0 => брать из RiskConfig
 
 # Продажа по death cross (для spot)
 SELL_ON_DEATH         = os.getenv("AUTO_TRADER_SELL_ON_DEATH", "1").strip() not in {"0", "false", "False", ""}
@@ -61,32 +79,137 @@ CONCURRENCY           = max(1, int(os.getenv("AUTO_TRADER_CONCURRENCY", "4")))
 _LAST_CANDLE_TS: Dict[str, int] = {}
 _LAST_SIGNAL: Dict[str, int] = {}
 
+
+@dataclass(frozen=True)
+class RiskSnapshot:
+    config: RiskConfig
+    portfolio_used: float
+    positions: List[Dict[str, Any]]
+
+
+def _load_risk_config_cached() -> RiskConfig:
+    try:
+        cfg = load_risk_config().validate()
+    except Exception:
+        cfg = RiskConfig()  # type: ignore[call-arg]
+    return cfg
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Утилиты
 # ═════════════════════════════════════════════════════════════════════════════
-def _sma(values: List[float], length: int) -> Optional[float]:
-    if length <= 0 or len(values) < length:
-        return None
-    return sum(values[-length:]) / float(length)
+def _rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["t", "o", "h", "l", "c", "v"])
+    df = pd.DataFrame(rows)
+    rename = {"t": "ts", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
+    df = df.rename(columns=rename)
+    for col in ("ts", "open", "high", "low", "close", "volume"):
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["ts", "close"]).copy()
+    df["ts"] = df["ts"].astype(int)
+    df = df.drop_duplicates(subset=["ts"], keep="last").sort_values("ts")
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    df["timestamp"] = pd.to_datetime(df["ts"], unit="ms" if df["ts"].max() > 10**12 else "s", utc=True)
+    df = df.set_index("timestamp")
+    return df
 
-def _cross(prev_fast: float, prev_slow: float, cur_fast: float, cur_slow: float) -> int:
-    """
-    +1: golden cross (fast пересёк снизу вверх)
-    -1: death cross  (fast пересёк сверху вниз)
-     0: нет события
-    """
-    if prev_fast is None or prev_slow is None or cur_fast is None or cur_slow is None:
-        return 0
-    if prev_fast <= prev_slow and cur_fast > cur_slow:
-        return +1
-    if prev_fast >= prev_slow and cur_fast < cur_slow:
-        return -1
-    return 0
+
+def _last_signal(df: pd.DataFrame) -> Tuple[int, int]:
+    signals = ema_cross_signals(
+        df,
+        fast=SMA_FAST,
+        slow=SMA_SLOW,
+        persist=max(1, SIGNAL_PERSIST),
+        cooldown=max(0, SIGNAL_COOLDOWN),
+        min_gap_pct=max(0.0, SIGNAL_MIN_GAP_PCT),
+        use_regime_filter=USE_REGIME_FILTER,
+    )
+    sig = int(signals["signal"].iloc[-1]) if not signals.empty else 0
+    ts = int(signals["ts"].iloc[-1]) if not signals.empty else int(df.index[-1].timestamp())
+    return sig, ts
+
+
+def _atr_stop_pct(df: pd.DataFrame) -> float:
+    if ATR_PERIOD <= 0 or ATR_MULT <= 0:
+        return max(0.0, SL_PCT)
+    try:
+        atr_series = atr_indicator(df["high"], df["low"], df["close"], ATR_PERIOD)
+        atr_val = float(atr_series.iloc[-1]) if len(atr_series) else 0.0
+        last_close = float(df["close"].iloc[-1])
+    except Exception:
+        atr_val = 0.0
+        last_close = 0.0
+    if atr_val <= 0 or last_close <= 0:
+        return max(0.0, SL_PCT)
+    pct = (atr_val * ATR_MULT) / last_close
+    pct = max(MIN_SL_PCT, pct)
+    pct = max(pct, SL_PCT)
+    pct = min(MAX_SL_PCT, pct)
+    return pct
 
 async def _sleep_backoff(attempt: int) -> None:
     # экспоненциальная задержка с капом
     delay = min(NET_RETRY_CAP, NET_RETRY_BASE * (2 ** attempt))
     await asyncio.sleep(delay)
+
+
+def _position_risk_fraction(*, equity: float, qty: float, entry_price: float, stop_price: Optional[float], cfg: RiskConfig) -> float:
+    if equity <= 0 or qty <= 0 or entry_price <= 0 or stop_price is None:
+        return float(cfg.risk_pct_per_trade)
+    dist = abs(entry_price - stop_price)
+    min_dist = max(cfg.min_sl_distance_pct * entry_price, 1e-12)
+    dist = max(dist, min_dist)
+    return max(0.0, min(1.0, (dist * qty) / max(equity, 1e-9)))
+
+
+def _portfolio_risk_used(positions: List[Dict[str, Any]], *, cfg: RiskConfig, equity: float) -> float:
+    total = 0.0
+    for pos in positions:
+        try:
+            qty = float(pos.get("qty") or pos.get("positionAmt") or 0.0)
+        except Exception:
+            qty = 0.0
+        try:
+            entry_price = float(pos.get("entry_price") or pos.get("entryPrice") or pos.get("avg_price") or 0.0)
+        except Exception:
+            entry_price = 0.0
+        sl_price: Optional[float] = None
+        raw_sl = pos.get("stop_loss_price") or pos.get("sl_price")
+        try:
+            if raw_sl is not None:
+                sl_price = float(raw_sl)
+        except Exception:
+            sl_price = None
+        if sl_price is None:
+            try:
+                sl_pct = float(pos.get("sl_pct") or 0.0)
+                if sl_pct > 0 and entry_price > 0:
+                    side = str(pos.get("side") or pos.get("positionSide") or "long").lower()
+                    if side.startswith("short"):
+                        sl_price = entry_price * (1.0 + sl_pct)
+                    else:
+                        sl_price = entry_price * (1.0 - sl_pct)
+            except Exception:
+                sl_price = None
+        total += _position_risk_fraction(
+            equity=equity,
+            qty=float(qty),
+            entry_price=float(entry_price),
+            stop_price=sl_price,
+            cfg=cfg,
+        )
+    return max(0.0, min(1.0, total))
+
+
+def _risk_snapshot_from_positions(positions: List[Dict[str, Any]], *, equity: float) -> RiskSnapshot:
+    cfg = _load_risk_config_cached()
+    used = _portfolio_risk_used(positions, cfg=cfg, equity=equity) if USE_PORTFOLIO_RISK else 0.0
+    if MAX_RISK_PORTFOLIO > 0:
+        used = min(used, MAX_RISK_PORTFOLIO)
+    return RiskSnapshot(config=cfg, portfolio_used=used, positions=positions)
 
 async def _post_json(client: httpx.AsyncClient, url: str, json: Any) -> httpx.Response:
     last_exc: Optional[Exception] = None
@@ -179,7 +302,33 @@ async def _fetch_free_base_asset(client: httpx.AsyncClient, symbol: str) -> floa
             break
     return max(0.0, free)
 
-async def _place_market_buy(client: httpx.AsyncClient, symbol: str, quote_usdt: float) -> Dict[str, Any]:
+
+async def _fetch_positions(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    url = f"{API_BASE}/exec/positions"
+    params = {"mode": MODE, "testnet": str(TESTNET).lower()}
+    r = await _get(client, url, params)
+    if r.status_code >= 400:
+        return []
+    try:
+        data = r.json()
+    except Exception:
+        return []
+    if isinstance(data, dict) and "positions" in data:
+        positions = data.get("positions") or []
+        if isinstance(positions, list):
+            return positions
+    if isinstance(data, list):
+        return data
+    return []
+
+async def _place_market_buy(
+    client: httpx.AsyncClient,
+    symbol: str,
+    quote_usdt: float,
+    *,
+    sl_pct: float,
+    tp_pct: float,
+) -> Dict[str, Any]:
     """
     /exec/open (MARKET BUY).
     Если USE_RISK_AUTOSIZE=True и SL_PCT>0: не передаем qty/quote_qty — сервер сам рассчитает qty по риску.
@@ -193,21 +342,36 @@ async def _place_market_buy(client: httpx.AsyncClient, symbol: str, quote_usdt: 
         "side": "buy",
         "type": "market",
     }
-    if USE_RISK_AUTOSIZE and SL_PCT > 0:
+    if USE_RISK_AUTOSIZE and sl_pct > 0:
         # ничего не добавляем (qty/quote_qty), но передадим sl_pct/tp_pct
         pass
     else:
         params["quote_qty"] = f"{quote_usdt}"
 
-    if SL_PCT > 0:
-        params["sl_pct"] = f"{SL_PCT}"
-    if TP_PCT > 0:
-        params["tp_pct"] = f"{TP_PCT}"
+    if sl_pct > 0:
+        params["sl_pct"] = f"{sl_pct}"
+    if tp_pct > 0:
+        params["tp_pct"] = f"{tp_pct}"
 
-    r = await _get(client, url, params) if DRY_RUN else await client.post(url, params=params, timeout=HTTP_TIMEOUT_SEC)
+    if DRY_RUN:
+        return {"status": "DRY", "params": params}
+
+    r = await client.post(url, params=params, timeout=HTTP_TIMEOUT_SEC)
+    if r.status_code == 409:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = {"error": "risk_blocked", "detail": r.text[:200]}
+        return {"status": "BLOCKED", "detail": detail}
     if r.status_code >= 400:
-        raise RuntimeError(f"open BUY failed {r.status_code}: {r.text[:300]}")
-    return r.json()
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text[:300]
+        raise RuntimeError(f"open BUY failed {r.status_code}: {detail}")
+    payload = r.json()
+    payload.setdefault("status", "UNKNOWN")
+    return payload
 
 async def _place_market_sell(client: httpx.AsyncClient, symbol: str, qty: float) -> Dict[str, Any]:
     """
@@ -225,101 +389,140 @@ async def _place_market_sell(client: httpx.AsyncClient, symbol: str, qty: float)
         "type": "market",
         "qty": f"{qty}",
     }
+    if DRY_RUN:
+        return {"status": "DRY", "params": params}
     # Для SELL SL/TP не имеет смысла в споте; опускаем.
-    r = await _get(client, url, params) if DRY_RUN else await client.post(url, params=params, timeout=HTTP_TIMEOUT_SEC)
+    r = await client.post(url, params=params, timeout=HTTP_TIMEOUT_SEC)
     if r.status_code >= 400:
         raise RuntimeError(f"open SELL failed {r.status_code}: {r.text[:300]}")
-    return r.json()
+    payload = r.json()
+    payload.setdefault("status", "UNKNOWN")
+    return payload
 
 def _base_from_symbol(symbol: str) -> str:
     return symbol[:-4] if symbol.endswith("USDT") else symbol
+
+
+def _calc_quote_amount(*, equity: float, sl_pct: float, cfg: RiskConfig) -> float:
+    if equity <= 0:
+        return 0.0
+    base_cap = equity
+    if QUOTE_USDT > 0:
+        base_cap = min(base_cap, QUOTE_USDT)
+    if sl_pct <= 0:
+        return max(0.0, min(base_cap, equity))
+    risk_fraction = cfg.risk_fraction_for_trade(sl_pct)
+    if risk_fraction <= 0:
+        return 0.0
+    allowed = equity * risk_fraction
+    return max(0.0, min(base_cap, allowed))
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Основная логика по символу (один шаг цикла)
 # ═════════════════════════════════════════════════════════════════════════════
 async def _process_symbol(client: httpx.AsyncClient, symbol: str) -> None:
     try:
-        limit = max(SMA_SLOW + 5, 120)
+        limit = max(SMA_SLOW + 10, 200)
         candles = await _fetch_candles(client, symbol, TIMEFRAME, limit)
         if len(candles) < (SMA_SLOW + 2):
             LOG.info("[auto] %s %s — мало свечей: %d", symbol, TIMEFRAME, len(candles))
             return
 
-        # сортируем на всякий
-        candles = sorted(candles, key=lambda r: int(r.get("t", 0)))
-        closes: List[float] = []
-        times:  List[int] = []
-        for row in candles:
-            t = row.get("t")
-            c = row.get("c", row.get("close"))
-            if t is None or c is None:
-                continue
-            try:
-                times.append(int(t))
-                closes.append(float(c))
-            except Exception:
-                continue
-
-        if len(closes) < (SMA_SLOW + 2):
-            LOG.info("[auto] %s %s — мало закрытий: %d", symbol, TIMEFRAME, len(closes))
+        df = _rows_to_df(candles)
+        if df.empty or len(df) < (SMA_SLOW + 2):
+            LOG.info("[auto] %s %s — недостаточно данных для сигналов (%d)", symbol, TIMEFRAME, len(df))
             return
 
-        # считаем по закрытым свечам:
-        # prev_* — на предпоследней свече, cur_* — на последней (текущей закрытой)
-        prev_fast = _sma(closes[:-1], SMA_FAST)
-        prev_slow = _sma(closes[:-1], SMA_SLOW)
-        cur_fast  = _sma(closes,      SMA_FAST)
-        cur_slow  = _sma(closes,      SMA_SLOW)
+        sig, last_closed_ts = _last_signal(df)
 
-        sig = _cross(prev_fast, prev_slow, cur_fast, cur_slow)  # +1 / -1 / 0
+        if CONFIRM_ON_CLOSE and _LAST_CANDLE_TS.get(symbol) == last_closed_ts and _LAST_SIGNAL.get(symbol) == sig:
+            return
 
-        last_closed_ts = int(times[-1])  # метка последней закрытой свечи
-        if CONFIRM_ON_CLOSE:
-            # чтобы не открывать несколько раз на одной свече:
-            if _LAST_CANDLE_TS.get(symbol) == last_closed_ts and _LAST_SIGNAL.get(symbol) == sig:
-                # этот сигнал уже обработан для этой свечи
-                return
-
-        LOG.debug("[auto] %s %s SMA(%d/%d): prev(%.4f/%.4f) -> cur(%.4f/%.4f) => sig=%d (ts=%s)",
-                  symbol, TIMEFRAME, SMA_FAST, SMA_SLOW,
-                  prev_fast or -1, prev_slow or -1, cur_fast or -1, cur_slow or -1,
-                  sig, last_closed_ts)
-
-        # Обновим метки сразу, чтобы при быстрых повторах не задвоить
         _LAST_CANDLE_TS[symbol] = last_closed_ts
         _LAST_SIGNAL[symbol] = sig
 
-        # === Покупка по «золотому кресту» ===
+        close_price = float(df["close"].iloc[-1])
+        sl_pct_dynamic = _atr_stop_pct(df)
+        tp_pct = TP_PCT if TP_PCT > 0 else 0.0
+
         if sig == +1:
             equity = await _fetch_equity(client)
-            if equity < max(EQUITY_MIN_USDT, QUOTE_USDT) and not (USE_RISK_AUTOSIZE and SL_PCT > 0):
-                LOG.warning("[auto] %s — equity_usdt=%.2f < требуемого (%.2f). Пропуск.",
-                            symbol, equity, max(EQUITY_MIN_USDT, QUOTE_USDT))
+            if equity <= 0:
+                LOG.warning("[auto] %s — не удалось получить equity, пропуск", symbol)
+                return
+            if equity < max(EQUITY_MIN_USDT, 1.0) and not (USE_RISK_AUTOSIZE and sl_pct_dynamic > 0):
+                LOG.info("[auto] %s — equity %.2f ниже порога %.2f", symbol, equity, max(EQUITY_MIN_USDT, 1.0))
                 return
 
-            if DRY_RUN:
-                LOG.info("[auto][dry] BUY %s %s на ~%.2f USDT (equity %.2f, sl=%.3f tp=%.3f autosize=%s)",
-                         symbol, TIMEFRAME, QUOTE_USDT, equity, SL_PCT, TP_PCT, USE_RISK_AUTOSIZE)
+            positions = await _fetch_positions(client)
+            snapshot = _risk_snapshot_from_positions(positions, equity=equity)
+
+            if USE_PORTFOLIO_RISK:
+                if len(snapshot.positions) >= snapshot.config.max_open_positions:
+                    have_symbol = any(str(p.get("symbol", "")).upper() == symbol.upper() for p in snapshot.positions)
+                    if not have_symbol:
+                        LOG.info("[auto] %s — достигнут лимит позиций (%d)", symbol, snapshot.config.max_open_positions)
+                        return
+                next_risk = snapshot.config.risk_fraction_for_trade(sl_pct_dynamic)
+                portfolio_cap = MAX_RISK_PORTFOLIO if MAX_RISK_PORTFOLIO > 0 else snapshot.config.portfolio_max_risk_pct
+                if snapshot.portfolio_used + next_risk > portfolio_cap + 1e-6:
+                    LOG.info("[auto] %s — портфельный риск %.3f > лимита %.3f, пропуск",
+                             symbol, snapshot.portfolio_used + next_risk, portfolio_cap)
+                    return
+
+            quote_amt = _calc_quote_amount(equity=equity, sl_pct=sl_pct_dynamic, cfg=snapshot.config)
+            if quote_amt <= 0 and not (USE_RISK_AUTOSIZE and sl_pct_dynamic > 0):
+                LOG.info("[auto] %s — рассчитанный объём сделки <= 0 (equity=%.2f, sl_pct=%.4f)",
+                         symbol, equity, sl_pct_dynamic)
                 return
 
-            res = await _place_market_buy(client, symbol, QUOTE_USDT)
-            LOG.info("[auto] BUY %s %s на ~%.2f USDT -> %s (order_id=%s)",
-                     symbol, TIMEFRAME, QUOTE_USDT, res.get("status"), res.get("order_id"))
-            return  # на этой свече больше ничего не делаем
+            try:
+                res = await _place_market_buy(
+                    client,
+                    symbol,
+                    quote_amt,
+                    sl_pct=sl_pct_dynamic,
+                    tp_pct=tp_pct,
+                )
+            except RuntimeError as exc:
+                LOG.warning("[auto] BUY %s ошибка: %s", symbol, exc)
+                return
 
-        # === Продажа по «death cross» (опционально) ===
+            status = str(res.get("status") or "").upper()
+            if status == "BLOCKED":
+                LOG.warning("[auto] BUY %s отклонён риском: %s", symbol, res.get("detail"))
+                return
+
+            LOG.info(
+                "[auto] BUY %s %s price≈%.4f quote≈%.2f sl_pct=%.4f tp_pct=%.4f -> %s (order_id=%s)",
+                symbol,
+                TIMEFRAME,
+                close_price,
+                quote_amt,
+                sl_pct_dynamic,
+                tp_pct,
+                status or res.get("status"),
+                res.get("order_id"),
+            )
+            return
+
         if sig == -1 and SELL_ON_DEATH:
             free_base = await _fetch_free_base_asset(client, symbol)
             sell_qty = max(0.0, free_base * SELL_PCT_OF_POSITION)
             if sell_qty <= 0:
                 return
-            if DRY_RUN:
-                LOG.info("[auto][dry] SELL %s qty≈%.8f (%.0f%% of free %.8f)",
-                         symbol, sell_qty, SELL_PCT_OF_POSITION * 100.0, free_base)
+            try:
+                res = await _place_market_sell(client, symbol, sell_qty)
+            except RuntimeError as exc:
+                LOG.warning("[auto] SELL %s ошибка: %s", symbol, exc)
                 return
-            res = await _place_market_sell(client, symbol, sell_qty)
-            LOG.info("[auto] SELL %s qty≈%.8f -> %s (order_id=%s)",
-                     symbol, sell_qty, res.get("status"), res.get("order_id"))
+            LOG.info(
+                "[auto] SELL %s qty≈%.8f -> %s (order_id=%s)",
+                symbol,
+                sell_qty,
+                res.get("status"),
+                res.get("order_id"),
+            )
 
     except asyncio.CancelledError:
         raise
@@ -351,23 +554,26 @@ async def background_loop() -> None:
         return
 
     LOG.info(
-        "[auto] старт: symbols=%s, tf=%s, fast=%d, slow=%d, quote=%.2f, loop=%ds, testnet=%s, dry=%s, "
-        "sell_on_death=%s, api=%s, exec_mode=%s/%s",
+        "[auto] старт: symbols=%s tf=%s ema(%d/%d) loop=%ss quote_cap=%.2f testnet=%s dry=%s risk_auto=%s "
+        "atr=(period=%d mult=%.2f) sell_on_death=%s api=%s exec=%s/%s",
         ",".join(SYMBOLS),
         TIMEFRAME,
         SMA_FAST,
         SMA_SLOW,
-        QUOTE_USDT,
         LOOP_SEC,
+        QUOTE_USDT,
         TESTNET,
         DRY_RUN,
+        USE_RISK_AUTOSIZE,
+        ATR_PERIOD,
+        ATR_MULT,
         SELL_ON_DEATH,
         API_BASE,
         MODE,
         SOURCE,
     )
-    if USE_RISK_AUTOSIZE and SL_PCT <= 0:
-        LOG.warning("[auto] USE_RISK_AUTOSIZE включен, но SL_PCT=0 — сервер не сможет рассчитать qty по риску.")
+    if USE_RISK_AUTOSIZE and SL_PCT <= 0 and (ATR_PERIOD <= 0 or ATR_MULT <= 0):
+        LOG.warning("[auto] USE_RISK_AUTOSIZE включен, но стоп не задан (SL_PCT/ATR) — qty не будет рассчитан.")
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
