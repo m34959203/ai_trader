@@ -17,7 +17,9 @@ LOG = logging.getLogger("ai_trader.auto_trader")
 ENABLED               = os.getenv("AUTO_TRADER_ENABLED", "1").strip() not in {"0", "false", "False", ""}
 SYMBOLS               = [s.strip().upper() for s in os.getenv("AUTO_TRADER_SYMBOLS", "BTCUSDT").split(",") if s.strip()]
 TIMEFRAME             = os.getenv("AUTO_TRADER_TIMEFRAME", "15m").strip()
-API_BASE              = os.getenv("AUTO_TRADER_API_BASE", "http://127.0.0.1:8001").rstrip("/")
+_DEFAULT_APP_PORT     = os.getenv("APP_PORT") or os.getenv("PORT") or "8000"
+_DEFAULT_API_BASE     = os.getenv("APP_API_BASE") or f"http://127.0.0.1:{_DEFAULT_APP_PORT}"
+API_BASE              = os.getenv("AUTO_TRADER_API_BASE", _DEFAULT_API_BASE).rstrip("/")
 SOURCE                = os.getenv("AUTO_TRADER_SOURCE", "binance")     # /ohlcv/* источник
 MODE                  = os.getenv("AUTO_TRADER_MODE", "binance")       # для /exec/*
 TESTNET               = os.getenv("AUTO_TRADER_TESTNET", "1").strip() not in {"0", "false", "False", ""}
@@ -349,8 +351,20 @@ async def background_loop() -> None:
         return
 
     LOG.info(
-        "[auto] старт: symbols=%s, tf=%s, fast=%d, slow=%d, quote=%.2f, loop=%ds, testnet=%s, dry=%s, sell_on_death=%s",
-        ",".join(SYMBOLS), TIMEFRAME, SMA_FAST, SMA_SLOW, QUOTE_USDT, LOOP_SEC, TESTNET, DRY_RUN, SELL_ON_DEATH
+        "[auto] старт: symbols=%s, tf=%s, fast=%d, slow=%d, quote=%.2f, loop=%ds, testnet=%s, dry=%s, "
+        "sell_on_death=%s, api=%s, exec_mode=%s/%s",
+        ",".join(SYMBOLS),
+        TIMEFRAME,
+        SMA_FAST,
+        SMA_SLOW,
+        QUOTE_USDT,
+        LOOP_SEC,
+        TESTNET,
+        DRY_RUN,
+        SELL_ON_DEATH,
+        API_BASE,
+        MODE,
+        SOURCE,
     )
     if USE_RISK_AUTOSIZE and SL_PCT <= 0:
         LOG.warning("[auto] USE_RISK_AUTOSIZE включен, но SL_PCT=0 — сервер не сможет рассчитать qty по риску.")
