@@ -4,12 +4,32 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .indicators import ema, cross_over, cross_under, rsi, bollinger_bands
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+from .indicators import bollinger_bands, cross_over, cross_under, ema, rsi
+
+
+ALLOWED_STRATEGY_KINDS = {
+    "ema",
+    "ema_cross",
+    "rsi_reversion",
+    "rsi_mean_reversion",
+    "bollinger",
+    "bollinger_breakout",
+}
 
 
 @dataclass(frozen=True)
@@ -26,6 +46,125 @@ class FrequencyFilterConfig:
     max_signals_per_day: Optional[int] = None
 
 
+class StrategySchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(..., min_length=1)
+    kind: str = Field(..., min_length=1)
+    weight: float = Field(default=1.0, ge=0.0)
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name", "kind", mode="before")
+    @classmethod
+    def _coerce_str(cls, value: Any) -> str:
+        if value is None:
+            raise ValueError("must not be empty")
+        return str(value).strip()
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, value: str) -> str:
+        kind = value.lower()
+        if kind not in ALLOWED_STRATEGY_KINDS:
+            raise ValueError(f"Unsupported strategy kind: {value}")
+        return kind
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def _ensure_params(cls, value: Any) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("params must be a mapping")
+        return dict(value)
+
+    def to_definition(self) -> StrategyDefinition:
+        return StrategyDefinition(
+            name=self.name,
+            kind=self.kind,
+            weight=float(self.weight),
+            params=self.params,
+        )
+
+
+class FrequencyFilterSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    min_bars_between: int = Field(default=0, ge=0)
+    max_signals_per_day: Optional[int] = Field(default=None, ge=1)
+
+    @field_validator("min_bars_between", mode="before")
+    @classmethod
+    def _coerce_min(cls, value: Any) -> int:
+        if value is None:
+            return 0
+        return int(value)
+
+    @field_validator("max_signals_per_day", mode="before")
+    @classmethod
+    def _coerce_max(cls, value: Any) -> Optional[int]:
+        if value in (None, "", "null"):
+            return None
+        ivalue = int(value)
+        if ivalue <= 0:
+            raise ValueError("max_signals_per_day must be positive")
+        return ivalue
+
+
+class EnsembleOptions(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class StrategyConfigSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    strategies: List[StrategySchema] = Field(default_factory=list)
+    ensemble_threshold: Optional[float] = Field(default=None)
+    ensemble: Optional[EnsembleOptions] = None
+    frequency_filter: FrequencyFilterSchema = Field(default_factory=FrequencyFilterSchema)
+
+    _resolved_threshold: float = PrivateAttr(default=0.5)
+
+    @field_validator("ensemble_threshold", mode="before")
+    @classmethod
+    def _coerce_threshold(cls, value: Any) -> Optional[float]:
+        if value in (None, "", "null"):
+            return None
+        return float(value)
+
+    @model_validator(mode="after")
+    def _validate_config(self) -> "StrategyConfigSchema":
+        if not self.strategies:
+            raise ValueError("At least one strategy must be specified")
+        if len({s.name for s in self.strategies}) != len(self.strategies):
+            raise ValueError("Strategy names must be unique")
+        if not any(s.weight > 0 for s in self.strategies):
+            raise ValueError("At least one strategy must have weight > 0")
+
+        threshold = self.ensemble_threshold
+        if threshold is None and self.ensemble is not None:
+            threshold = self.ensemble.threshold
+        if threshold is None:
+            threshold = 0.5
+        if not 0.0 <= float(threshold) <= 1.0:
+            raise ValueError("Ensemble threshold must be between 0 and 1")
+        self._resolved_threshold = float(threshold)
+        return self
+
+    def to_dataclass(self) -> "StrategyEnsembleConfig":
+        freq = FrequencyFilterConfig(
+            min_bars_between=int(self.frequency_filter.min_bars_between),
+            max_signals_per_day=self.frequency_filter.max_signals_per_day,
+        )
+        return StrategyEnsembleConfig(
+            strategies=[s.to_definition() for s in self.strategies],
+            ensemble_threshold=self._resolved_threshold,
+            frequency_filter=freq,
+        )
+
+
 @dataclass(frozen=True)
 class StrategyEnsembleConfig:
     strategies: List[StrategyDefinition] = field(default_factory=list)
@@ -36,35 +175,35 @@ class StrategyEnsembleConfig:
     def from_mapping(mapping: Dict[str, Any]) -> "StrategyEnsembleConfig":
         mapping = dict(mapping or {})
         raw_strategies = mapping.get("strategies") or []
-        strategies: List[StrategyDefinition] = []
+        normalized: List[Dict[str, Any]] = []
         for idx, item in enumerate(raw_strategies):
             if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or item.get("id") or f"strategy_{idx}")
-            kind = str(item.get("type") or item.get("kind") or "ema_cross")
-            weight = float(item.get("weight", 1.0))
-            params = dict(item.get("params") or {})
-            strategies.append(StrategyDefinition(name=name, kind=kind, weight=weight, params=params))
+                raise ValueError(f"Strategy definition at index {idx} must be a mapping")
+            normalized.append(
+                {
+                    "name": item.get("name") or item.get("id") or f"strategy_{idx}",
+                    "kind": item.get("kind") or item.get("type"),
+                    "weight": item.get("weight", 1.0),
+                    "params": item.get("params") or {},
+                }
+            )
 
-        ensemble_cfg = mapping.get("ensemble") or {}
-        threshold = float(mapping.get("ensemble_threshold", ensemble_cfg.get("threshold", 0.5)))
+        payload: Dict[str, Any] = {
+            "strategies": normalized,
+            "ensemble_threshold": mapping.get("ensemble_threshold"),
+        }
+        if mapping.get("ensemble") is not None:
+            payload["ensemble"] = mapping.get("ensemble")
+        freq_raw = mapping.get("frequency_filter")
+        if freq_raw is not None:
+            payload["frequency_filter"] = freq_raw
 
-        freq_raw = mapping.get("frequency_filter") or {}
-        freq_cfg = FrequencyFilterConfig(
-            min_bars_between=int(freq_raw.get("min_bars_between", 0)),
-            max_signals_per_day=(
-                int(freq_raw.get("max_signals_per_day"))
-                if freq_raw.get("max_signals_per_day") not in (None, "", "null")
-                else None
-            ),
-        )
+        try:
+            schema = StrategyConfigSchema.model_validate(payload)
+        except ValidationError as exc:
+            raise ValueError(f"Invalid strategy config: {exc}") from exc
 
-        return StrategyEnsembleConfig(
-            strategies=strategies,
-            ensemble_threshold=threshold,
-            frequency_filter=freq_cfg,
-        )
-
+        return schema.to_dataclass()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Вспомогательные утилиты времени

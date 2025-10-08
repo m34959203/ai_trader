@@ -47,15 +47,40 @@ class AutoHealingOrchestrator:
         data = path.read_text(encoding="utf-8")
         return StateSnapshot.from_json(data)
 
+    def register_restore(
+        self,
+        name: str,
+        callback: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self.restore_callbacks[name] = callback
+
+    async def trigger(self, name: str, payload: Optional[Dict[str, Any]] = None) -> bool:
+        cb = self.restore_callbacks.get(name)
+        if cb is None:
+            return False
+        await cb(payload or {})
+        return True
+
     async def restore(self, name: str) -> bool:
         snap = await self.load_snapshot(name)
         if snap is None:
             return False
-        cb = self.restore_callbacks.get(name)
-        if cb is None:
-            return False
-        await cb(snap.payload)
-        return True
+        return await self.trigger(name, snap.payload)
+
+    async def replay(self, name: Optional[str] = None) -> int:
+        count = 0
+        if not self.state_dir.exists():
+            return 0
+        for path in sorted(self.state_dir.glob("*.json")):
+            try:
+                snap = StateSnapshot.from_json(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if name and snap.name != name:
+                continue
+            if await self.trigger(snap.name, snap.payload):
+                count += 1
+        return count
 
     async def topology_restart(self, components: Dict[str, Callable[[], Awaitable[None]]]) -> None:
         for name, action in components.items():

@@ -81,6 +81,12 @@ try:
 except Exception:
     _HAS_AUTOPILOT = False
 
+try:
+    from routers.metrics import router as metrics_router
+    _HAS_METRICS = True
+except Exception:
+    _HAS_METRICS = False
+
 # Аналитика
 try:
     from .analysis.analyze_market import analyze_market, DEFAULT_CONFIG, AnalysisConfig  # type: ignore
@@ -121,6 +127,12 @@ try:
     _HAS_AUTO_BG = True
 except Exception:
     _HAS_AUTO_BG = False
+
+try:
+    from tasks.news_ingest import background_loop as news_bg
+    _HAS_NEWS_BG = True
+except Exception:
+    _HAS_NEWS_BG = False
 
 
 APP_VERSION = os.getenv("APP_VERSION", "0.11.1")
@@ -180,6 +192,9 @@ FEATURES: Dict[str, bool] = {
 # Управление бэкграунд-тасками: включаем по умолчанию для prod/staging окружений
 _BG_DEFAULT = APP_ENV in {"prod", "production", "staging"}
 ENABLE_BG_TASKS = env_bool("ENABLE_BG_TASKS", _BG_DEFAULT)
+ENABLE_NEWS_INGEST = env_bool("ENABLE_NEWS_INGEST", ENABLE_BG_TASKS)
+NEWS_REFRESH_INTERVAL_SEC = env_int("NEWS_REFRESH_INTERVAL_SEC", 900)
+NEWS_REFRESH_INITIAL_DELAY_SEC = env_int("NEWS_REFRESH_INITIAL_DELAY_SEC", 10)
 
 # Binance / WS окружение
 BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY", "")
@@ -358,6 +373,7 @@ async def lifespan(app: FastAPI):
     app.state.keepalive_task = None
     app.state.ohlcv_bg_task  = None
     app.state.auto_bg_task   = None
+    app.state.news_bg_task   = None
     app.state.watchdog_task  = None
     app.state._watchdog      = None
 
@@ -476,6 +492,14 @@ async def lifespan(app: FastAPI):
         app.state.ohlcv_bg_task = asyncio.create_task(ohlcv_bg(), name="ohlcv_bg")
     if ENABLE_BG_TASKS and _HAS_AUTO_BG:
         app.state.auto_bg_task = asyncio.create_task(auto_bg(), name="auto_bg")
+    if ENABLE_BG_TASKS and ENABLE_NEWS_INGEST and _HAS_NEWS_BG:
+        app.state.news_bg_task = asyncio.create_task(
+            news_bg(
+                interval_seconds=NEWS_REFRESH_INTERVAL_SEC,
+                initial_delay=NEWS_REFRESH_INITIAL_DELAY_SEC,
+            ),
+            name="news_ingest",
+        )
 
     # Process watchdog
     app.state._watchdog = EventLoopWatchdog(interval=5.0, max_consecutive_misses=12)
@@ -494,6 +518,7 @@ async def lifespan(app: FastAPI):
                 getattr(app.state, "reconcile_task", None),
                 getattr(app.state, "ohlcv_bg_task", None),
                 getattr(app.state, "auto_bg_task", None),
+                getattr(app.state, "news_bg_task", None),
                 getattr(app.state, "watchdog_task", None),
             ]
             for t in tasks:
@@ -763,6 +788,9 @@ if FEATURES["autopilot"] and _HAS_AUTOPILOT:
 
 if _HAS_UI and FEATURES["ui"]:
     app.include_router(ui_router, tags=["ui"])
+
+if _HAS_METRICS:
+    app.include_router(metrics_router, tags=["monitoring"])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fallback-маршруты для OHLCV (если по какой-то причине роутер не подключился)
