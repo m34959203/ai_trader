@@ -14,7 +14,7 @@ import uuid
 from typing import Any, Dict, Iterable, Optional
 
 from services.broker_gateway import BrokerGateway, BrokerGatewayError, OrderRequest, OrderResponse
-from services.trading_service import decide_and_execute
+from services.trading_service import decide_and_execute, evaluate_pre_trade_controls
 
 LOG = logging.getLogger("ai_trader.live_trading")
 
@@ -59,6 +59,7 @@ class LiveTradingCoordinator:
             "error": None,
             "request_id": None,
             "retries": 0,
+            "precheck": None,
         }
 
         if decision["trading_blocked"]:
@@ -89,6 +90,26 @@ class LiveTradingCoordinator:
         side = decision["signal"].get("signal")
         if side not in {"buy", "sell"}:
             LOG.info("Signal %s does not translate into executable side", side)
+            return summary
+
+        precheck = evaluate_pre_trade_controls(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            price=price,
+            decision=decision,
+            features=features,
+            order_type=order_type,
+        )
+        summary["precheck"] = precheck
+        if not precheck["ok"]:
+            summary["error"] = "pre_trade_checks_failed"
+            summary["error_details"] = precheck["violations"]
+            LOG.warning(
+                "Pre-trade controls blocked order for %s: %s",
+                symbol,
+                ", ".join(v["code"] for v in precheck["violations"]),
+            )
             return summary
 
         client_order_id = uuid.uuid4().hex

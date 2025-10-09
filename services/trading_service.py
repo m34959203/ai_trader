@@ -162,6 +162,199 @@ def _env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None:
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def evaluate_pre_trade_controls(
+    *,
+    symbol: str,
+    side: Literal["buy", "sell"],
+    quantity: float,
+    price: float,
+    decision: Dict[str, Any],
+    features: Dict[str, Any],
+    order_type: str = "market",
+) -> Dict[str, Any]:
+    """Run broker-level guardrails before an :class:`OrderRequest` is created.
+
+    The evaluation covers three safety nets required by the production
+    checklist:
+
+    • Margin availability — ensure the notional (with buffer) fits into the
+      deployable equity/margin bucket.
+    • Broker stop constraints — block orders whose stop distance violates the
+      configured minimum enforced by the broker.
+    • Volume/volatility guardrails — avoid oversized participation when the
+      venue liquidity or volatility is outside approved ranges.
+
+    Returns a diagnostic payload containing violations (if any) together with
+    contextual metrics so that callers can attach the information to audit
+    logs or API responses.
+    """
+
+    limits = decision.get("limits", {}) if isinstance(decision, dict) else {}
+    available_margin = float(
+        limits.get("equity")
+        or features.get("available_margin")
+        or features.get("margin_available")
+        or features.get("equity")
+        or 0.0
+    )
+    required_margin = max(0.0, float(quantity) * float(price))
+
+    margin_buffer_pct = _env_float("PRECHECK_MARGIN_BUFFER_PCT", 0.05)
+    min_margin = required_margin * (1.0 + margin_buffer_pct)
+
+    rc = load_risk_config()
+    min_stop_pct = max(0.0, _env_float("BROKER_MIN_STOP_PCT", rc.min_sl_distance_pct))
+
+    inferred_stop_pct_sources = [
+        (decision.get("signal", {}) if isinstance(decision, dict) else {}).get("stop_loss_pct"),
+        features.get("stop_loss_pct"),
+        features.get("stop_distance_pct"),
+    ]
+    inferred_stop_pct = next((float(s) for s in inferred_stop_pct_sources if s), None)
+    if (inferred_stop_pct is None or inferred_stop_pct <= 0) and price > 0:
+        atr = float(features.get("atr", 0.0) or 0.0)
+        inferred_stop_pct = atr / float(price) if atr > 0 else None
+    if inferred_stop_pct is None or inferred_stop_pct <= 0:
+        inferred_stop_pct = rc.min_sl_distance_pct
+
+    max_order_equity_pct = _env_float("MAX_ORDER_EQUITY_PCT", 0.25)
+    order_equity_ratio = (required_margin / available_margin) if available_margin > 0 else None
+
+    avg_volume = float(
+        features.get("avg_volume")
+        or features.get("average_volume")
+        or features.get("volume")
+        or 0.0
+    )
+    max_volume_fraction = _env_float("MAX_ORDER_VOLUME_FRACTION", 0.1)
+    max_volume_quantity: Optional[float]
+    if avg_volume > 0:
+        max_volume_quantity = avg_volume * max_volume_fraction
+    else:
+        max_volume_quantity = None
+
+    volatility_measure = float(
+        features.get("volatility")
+        or features.get("vol")
+        or limits.get("atr_pct")
+        or 0.0
+    )
+    max_volatility = _env_float("MAX_ALLOWED_VOLATILITY", 0.2)
+
+    violations: List[Dict[str, Any]] = []
+    advisories: List[str] = []
+
+    if available_margin <= 0:
+        violations.append(
+            {
+                "code": "margin_unavailable",
+                "message": "Available margin is unknown or zero; refuse to route order.",
+                "details": {"available_margin": available_margin},
+            }
+        )
+    elif available_margin < min_margin:
+        violations.append(
+            {
+                "code": "margin_shortfall",
+                "message": "Required margin exceeds allowed buffer.",
+                "details": {
+                    "available_margin": available_margin,
+                    "required_margin": required_margin,
+                    "buffer_pct": margin_buffer_pct,
+                    "min_margin": min_margin,
+                },
+            }
+        )
+
+    if inferred_stop_pct < min_stop_pct:
+        violations.append(
+            {
+                "code": "broker_stop_distance",
+                "message": "Planned stop distance violates broker minimum.",
+                "details": {
+                    "stop_pct": inferred_stop_pct,
+                    "min_stop_pct": min_stop_pct,
+                    "order_type": order_type,
+                },
+            }
+        )
+
+    if order_equity_ratio is not None and order_equity_ratio > max_order_equity_pct:
+        violations.append(
+            {
+                "code": "equity_participation_limit",
+                "message": "Order notional breaches equity participation cap.",
+                "details": {
+                    "order_equity_ratio": order_equity_ratio,
+                    "max_order_equity_pct": max_order_equity_pct,
+                },
+            }
+        )
+
+    if max_volume_quantity is None:
+        advisories.append("volume_data_unavailable")
+    elif quantity > max_volume_quantity:
+        violations.append(
+            {
+                "code": "volume_limit",
+                "message": "Requested quantity exceeds configured share of venue volume.",
+                "details": {
+                    "quantity": quantity,
+                    "max_volume_quantity": max_volume_quantity,
+                    "avg_volume": avg_volume,
+                    "max_volume_fraction": max_volume_fraction,
+                },
+            }
+        )
+
+    if volatility_measure <= 0:
+        advisories.append("volatility_data_unavailable")
+    elif volatility_measure > max_volatility:
+        violations.append(
+            {
+                "code": "volatility_limit",
+                "message": "Market volatility above governance threshold.",
+                "details": {
+                    "volatility": volatility_measure,
+                    "max_volatility": max_volatility,
+                },
+            }
+        )
+
+    return {
+        "ok": not violations,
+        "violations": violations,
+        "advisories": advisories,
+        "context": {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+            "required_margin": required_margin,
+            "available_margin": available_margin,
+            "margin_buffer_pct": margin_buffer_pct,
+            "order_equity_ratio": order_equity_ratio,
+            "max_order_equity_pct": max_order_equity_pct,
+            "stop_distance_pct": inferred_stop_pct,
+            "min_stop_pct": min_stop_pct,
+            "avg_volume": avg_volume,
+            "max_volume_fraction": max_volume_fraction,
+            "volatility": volatility_measure,
+            "max_volatility": max_volatility,
+        },
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TradingService
 # ──────────────────────────────────────────────────────────────────────────────
