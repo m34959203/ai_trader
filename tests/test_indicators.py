@@ -28,7 +28,7 @@ def test_cross_over_under():
 
 
 def test_force_index_and_obv():
-    idx = pd.date_range("2024-01-01", periods=4, freq="H")
+    idx = pd.date_range("2024-01-01", periods=4, freq="h")
     close = pd.Series([100.0, 105.0, 102.0, 110.0], index=idx)
     volume = pd.Series([10.0, 11.0, 9.0, 15.0], index=idx)
 
@@ -59,7 +59,7 @@ def test_candlestick_and_resample():
     assert patterns.loc[dates[2], "bullish_engulfing"]
     assert patterns.loc[dates[3], "doji"]
 
-    minute_idx = pd.date_range("2024-01-01", periods=4, freq="T")
+    minute_idx = pd.date_range("2024-01-01", periods=4, freq="min")
     minute_df = pd.DataFrame(
         {
             "open": [1, 2, 3, 4],
@@ -71,8 +71,8 @@ def test_candlestick_and_resample():
         index=minute_idx,
     )
 
-    resampled = resample_ohlcv(minute_df, "2T")
-    assert list(resampled.index) == list(pd.date_range("2024-01-01", periods=2, freq="2T"))
+    resampled = resample_ohlcv(minute_df, "2min")
+    assert list(resampled.index) == list(pd.date_range("2024-01-01", periods=2, freq="2min"))
     first = resampled.iloc[0]
     assert first.open == 1
     assert first.high == 3

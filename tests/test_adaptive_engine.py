@@ -4,7 +4,7 @@ from src.ai.adaptive import AdaptiveConfidenceEngine
 
 
 def make_df():
-    idx = pd.date_range("2024-01-01", periods=100, freq="H", tz="UTC")
+    idx = pd.date_range("2024-01-01", periods=100, freq="h", tz="UTC")
     base = pd.DataFrame({
         "open": 100 + pd.Series(range(100)) * 0.1,
         "high": 100 + pd.Series(range(100)) * 0.1 + 0.5,

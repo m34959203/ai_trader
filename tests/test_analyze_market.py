@@ -33,16 +33,17 @@ from src.analysis.analyze_market import (
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _make_df(bars: int, *, freq: str = "H", seed: int = 7) -> pd.DataFrame:
+def _make_df(bars: int, *, freq: str = "h", seed: int = 7) -> pd.DataFrame:
     """
     Генерируем синтетические OHLCV с DatetimeIndex (UTC).
     Минимально «похожая» серия: случайное блуждание + шум.
     """
     assert bars > 0, "bars must be positive"
+    normalized_freq = freq.lower()
     rng = pd.date_range(
         end=pd.Timestamp.now(tz="UTC"),   # FIX: безопасная tz-aware метка времени
         periods=bars,
-        freq=freq,
+        freq=normalized_freq,
     )
     rs = np.random.RandomState(seed)
     price = 100 + rs.randn(bars).cumsum() * 0.5
@@ -98,7 +99,7 @@ def _make_trend_df(
     bars: int,
     *,
     up: bool = True,
-    freq: str = "H",
+    freq: str = "h",
     slope: float = 0.25,
     noise: float = 0.05,
 ) -> pd.DataFrame:
@@ -107,7 +108,8 @@ def _make_trend_df(
     Также создаём локальный пивот high/low ближе к концу ряда для формирования уровня.
     """
     assert bars >= 220, "для стабильности индикаторов и фракталов нужно >=220 баров"
-    idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=bars, freq=freq)  # FIX
+    trend_freq = freq.lower()
+    idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=bars, freq=trend_freq)  # FIX
 
     base = 100.0
     direction = 1.0 if up else -1.0
@@ -169,7 +171,7 @@ def test_basic_output_schema_and_bounds():
 def test_mtf_key_when_slow_df_passed():
     """При передаче df_4h ожидаем появление блока mtf с полем trend_4h."""
     cfg = DEFAULT_CONFIG
-    fast = _make_df(cfg.min_bars_fast + 40, freq="H", seed=11)
+    fast = _make_df(cfg.min_bars_fast + 40, freq="h", seed=11)
     slow = _make_df(cfg.min_bars_slow + 20, freq="4H", seed=13)
 
     out = analyze_market(fast, slow)
@@ -182,7 +184,7 @@ def test_mtf_key_when_slow_df_passed():
 def test_input_df_not_mutated():
     """Функция не должна мутировать входной DataFrame (по крайней мере по значениям close)."""
     cfg = DEFAULT_CONFIG
-    df = _make_df(cfg.min_bars_fast + 40, freq="H", seed=17)
+    df = _make_df(cfg.min_bars_fast + 40, freq="h", seed=17)
     # снимем копию столбца для сравнения
     close_before = df["close"].copy()
     _ = analyze_market(df)
@@ -194,7 +196,7 @@ def test_input_df_not_mutated():
 def test_accepts_explicit_config_override():
     """Параметры порогов можно безопасно переопределять копией конфига (frozen dataclass → replace)."""
     cfg = replace(DEFAULT_CONFIG, buy_threshold=55, sell_threshold=45)
-    df = _make_df(cfg.min_bars_fast + 40, freq="H", seed=23)
+    df = _make_df(cfg.min_bars_fast + 40, freq="h", seed=23)
     out = analyze_market(df, config=cfg)
     _assert_basic_schema(out)
     assert out["signal"] in {"buy", "sell", "flat"}  # корректное значение
@@ -207,7 +209,7 @@ def test_handles_leading_nans_gracefully():
     """
     cfg = DEFAULT_CONFIG
     bars = cfg.min_bars_fast + 50
-    df = _make_df(bars, freq="H", seed=29).copy()
+    df = _make_df(bars, freq="h", seed=29).copy()
 
     # Внесём NaN в первые 5 баров (типичный тёплый старт индикаторов)
     for col in ("open", "high", "low", "close", "volume"):
