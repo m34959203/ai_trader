@@ -144,6 +144,13 @@ except Exception:
     _HAS_METRICS = False
 
 try:
+    from routers.reports import router as reports_router
+    _HAS_REPORTS = True
+except Exception:
+    reports_router = None  # type: ignore
+    _HAS_REPORTS = False
+
+try:
     from services.model_router import DEFAULT_MODEL_CONFIG, ModelRouter, router_singleton
     _HAS_MODEL_ROUTER = True
 except Exception:  # pragma: no cover
@@ -205,6 +212,12 @@ try:
     _HAS_NEWS_BG = True
 except Exception:
     _HAS_NEWS_BG = False
+
+try:
+    from tasks.reports import background_loop as reports_bg
+    _HAS_REPORTS_BG = True
+except Exception:
+    _HAS_REPORTS_BG = False
 
 
 APP_VERSION = os.getenv("APP_VERSION", "0.11.1")
@@ -330,6 +343,8 @@ FEATURES: Dict[str, bool] = {
 _BG_DEFAULT = APP_ENV in {"prod", "production", "staging"}
 ENABLE_BG_TASKS = env_bool("ENABLE_BG_TASKS", _BG_DEFAULT)
 ENABLE_NEWS_INGEST = env_bool("ENABLE_NEWS_INGEST", ENABLE_BG_TASKS)
+ENABLE_REPORTS_BG = env_bool("ENABLE_REPORTS_BG", ENABLE_BG_TASKS)
+REPORTS_INTERVAL_MINUTES = env_int("REPORTS_INTERVAL_MINUTES", 60)
 NEWS_REFRESH_INTERVAL_SEC = env_int("NEWS_REFRESH_INTERVAL_SEC", 900)
 NEWS_REFRESH_INITIAL_DELAY_SEC = env_int("NEWS_REFRESH_INITIAL_DELAY_SEC", 10)
 
@@ -708,6 +723,11 @@ async def lifespan(app: FastAPI):
             ),
             name="news_ingest",
         )
+    if ENABLE_BG_TASKS and ENABLE_REPORTS_BG and _HAS_REPORTS_BG:
+        app.state.reports_bg_task = asyncio.create_task(
+            reports_bg(interval_minutes=REPORTS_INTERVAL_MINUTES),
+            name="reports_bg",
+        )
 
     # Process watchdog
     app.state._watchdog = EventLoopWatchdog(interval=5.0, max_consecutive_misses=12)
@@ -727,6 +747,7 @@ async def lifespan(app: FastAPI):
                 getattr(app.state, "ohlcv_bg_task", None),
                 getattr(app.state, "auto_bg_task", None),
                 getattr(app.state, "news_bg_task", None),
+                getattr(app.state, "reports_bg_task", None),
                 getattr(app.state, "watchdog_task", None),
             ]
             for t in tasks:
@@ -1027,6 +1048,9 @@ if _HAS_UI and FEATURES["ui"]:
 
 if _HAS_METRICS:
     app.include_router(metrics_router, tags=["monitoring"])
+
+if _HAS_REPORTS and reports_router is not None:
+    app.include_router(reports_router, tags=["reports"])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fallback-маршруты для OHLCV (если по какой-то причине роутер не подключился)

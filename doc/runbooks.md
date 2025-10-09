@@ -77,4 +77,16 @@
 - **Alert routing:** Apply `monitoring/alertmanager.yaml` (or merge it into an existing Alertmanager stack) so PagerDuty handles `severity=critical` while Slack receives all notifications. Include `trace_id` in templates for log correlation.
 - **Log shipping:** Deploy Fluent Bit/Vector per `monitoring/logging_stack.md` so JSON logs with `trace_id` flow into the central store (Loki/ELK). Validate that alerts carry matching IDs before enabling paging.
 
+## 8. Live Trading Operator Control & Notifications
+- **UI dashboards:** `/ui` now exposes dedicated widgets for real-time PnL, broker connectivity, live trade journal, and risk limits. The controls pull data from `/live/pnl`, `/live/broker`, `/live/trades`, and `/live/limits` respectively. Operators should keep the dashboard pinned during trading sessions and rely on the global refresh selector to throttle polling when bandwidth is constrained.
+- **Strategy gating:** Each strategy row exposes enable/disable toggles and per-strategy caps. Updates flow through `PATCH /live/strategies/{name}` and are reflected instantly in the coordinator—attempted orders from disabled strategies will be blocked with `strategy_disabled`. Record every change (who/why) in the operations log, including the previous and new risk caps.
+- **Daily guardrails:** The limits panel surfaces equity-at-start, current equity, realized PnL, and drawdown. When daily loss approaches configured thresholds (`REPORTS_INTERVAL_MINUTES`, `per_trade_cap`, `daily_max_loss_pct`), the on-call operator must confirm whether automatic halts fired and, if necessary, set the “enabled” toggle to false for affected strategies.
+- **Report generation:** Scheduled CSV/PDF exports run via `tasks.reports.background_loop` (configurable with `ENABLE_REPORTS_BG` / `REPORTS_INTERVAL_MINUTES`). Manual regeneration is available from the UI button or `POST /reports/generate`. The latest artefacts can be downloaded at `/reports/download/{csv|pdf}` and archived alongside compliance evidence.
+- **Notification hooks:** Wire Slack/PagerDuty alerts to trigger on:
+  - Broker disconnected for ≥30s (`broker.connected == false` from `/live/broker`).
+  - Daily drawdown ≥ configured stop or realized PnL below tolerance.
+  - Strategy auto-blocks (watch for `strategy_disabled` and `strategy_daily_limit` errors in `/live/trades`).
+  - Report task failures (logs tagged `ai_trader.reports`). Alerts should include direct links to the dashboard and the relevant report artefacts.
+- **On-call checklist:** Upon alert, confirm broker health, review latest trades, adjust strategy toggles if needed, regenerate reports, and log the incident in the runbook tracker. Always validate that the UI refreshes successfully after mitigations (use the “Обновить” button above the trades table).
+
 Keep this document alongside deployment checklists to ensure Stage 2 and Stage 3 runbooks remain up to date.

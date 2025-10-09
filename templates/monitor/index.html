@@ -113,7 +113,7 @@
       </form>
     </div>
 
-    <!-- 4-column grid -->
+    <!-- Dashboard grid -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
       <!-- Balance (STABLE WRAPPER) -->
       <section id="balance-box"
@@ -165,6 +165,58 @@
         hx-swap="outerHTML"
         data-tooltip="Sharpe и волатильность BTCUSDT/1h.">
         <div id="metrics"><div class="text-sm text-gray-500">Загрузка метрик…</div></div>
+      </section>
+
+      <!-- Live PnL -->
+      <section id="live-pnl-box"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
+        hx-get="/ui/partials/live_pnl"
+        hx-trigger="load, refresh, every 5s"
+        hx-include="#ui-form"
+        hx-indicator=".htmx-indicator"
+        hx-target="#live-pnl"
+        hx-swap="outerHTML"
+        data-tooltip="Реализованный PnL за день и текущая оценка equity.">
+        <div id="live-pnl"><div class="text-sm text-gray-500">Загрузка live PnL…</div></div>
+      </section>
+
+      <!-- Broker status -->
+      <section id="broker-box"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4"
+        hx-get="/ui/partials/broker_status"
+        hx-trigger="load, refresh, every 10s"
+        hx-include="#ui-form"
+        hx-indicator=".htmx-indicator"
+        hx-target="#broker-status"
+        hx-swap="outerHTML"
+        data-tooltip="Статус соединения с брокером и активные ордера.">
+        <div id="broker-status"><div class="text-sm text-gray-500">Загрузка статуса брокера…</div></div>
+      </section>
+
+      <!-- Live trades -->
+      <section id="live-trades-box"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-2"
+        hx-get="/ui/partials/live_trades?limit=25"
+        hx-trigger="load, refresh, every 7s"
+        hx-include="#ui-form"
+        hx-indicator=".htmx-indicator"
+        hx-target="#live-trades"
+        hx-swap="outerHTML"
+        data-tooltip="Последние сделки, отправленные через live-coordinator.">
+        <div id="live-trades"><div class="text-sm text-gray-500">Загрузка сделок…</div></div>
+      </section>
+
+      <!-- Limits & reports -->
+      <section id="limits-box"
+        class="bg-white border border-gray-200 rounded-md shadow-sm p-4 lg:col-span-2"
+        hx-get="/ui/partials/limits"
+        hx-trigger="load, refresh, every 30s"
+        hx-include="#ui-form"
+        hx-indicator=".htmx-indicator"
+        hx-target="#limits"
+        hx-swap="outerHTML"
+        data-tooltip="Дневные лимиты риска, управление стратегиями и отчёты.">
+        <div id="limits"><div class="text-sm text-gray-500">Загрузка лимитов…</div></div>
       </section>
     </div>
 
@@ -218,15 +270,19 @@
     }
     function applyIntervals(){
       const sec=parseInt(document.getElementById('refreshSec').value||'5',10);
-      ['balance-box','positions-box','orders-box','metrics-box'].forEach(id=>setBoxInterval(id,sec));
+      ['balance-box','positions-box','orders-box','metrics-box','live-pnl-box','broker-box','live-trades-box','limits-box'].forEach(id=>setBoxInterval(id,sec));
       persistControls();
       refreshAll();
     }
     function refreshAll(){
-      ['balance-box','positions-box','orders-box','metrics-box'].forEach(id=>{
+      ['balance-box','positions-box','orders-box','metrics-box','live-pnl-box','broker-box','live-trades-box','limits-box'].forEach(id=>{
         const el=document.getElementById(id);
         if (el && window.htmx && htmx.trigger) { htmx.trigger(el,'refresh'); }
       });
+    }
+    function refreshPanel(id){
+      const el=document.getElementById(id);
+      if (el && window.htmx && htmx.trigger) { htmx.trigger(el,'refresh'); }
     }
 
     // controls -> change
@@ -279,6 +335,51 @@
 
     window.addEventListener('offline', ()=>{ showToast('Вы офлайн.','error'); showGlobalError('Нет подключения к интернету.'); });
     window.addEventListener('online',  ()=> showToast('Соединение восстановлено.','ok'));
+
+    // ------------------------ Strategy controls & reports ------------------------
+    async function submitStrategy(name){
+      const row=document.querySelector(`[data-strategy="${CSS.escape(name)}"]`);
+      if(!row) return;
+      const enabledInput=row.querySelector('input[data-field="enabled"]');
+      const riskInput=row.querySelector('input[data-field="risk"]');
+      const tradesInput=row.querySelector('input[data-field="max-trades"]');
+      const notesInput=row.querySelector('input[data-field="notes"]');
+      const payload={};
+      if(enabledInput){ payload.enabled = !!enabledInput.checked; }
+      if(riskInput){ const val=riskInput.value.trim(); payload.max_risk_fraction = val===''?null:parseFloat(val); }
+      if(tradesInput){ const val=tradesInput.value.trim(); payload.max_daily_trades = val===''?null:parseInt(val,10); }
+      if(notesInput){ payload.notes = notesInput.value.trim(); }
+      try{
+        const resp=await fetch(`/live/strategies/${encodeURIComponent(name)}`, {
+          method:'PATCH', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(payload)
+        });
+        if(!resp.ok){
+          const text=await resp.text();
+          throw new Error(text || resp.statusText);
+        }
+        showToast(`Стратегия ${name} обновлена`,'ok');
+        refreshPanel('limits-box');
+      }catch(err){
+        showToast(`Не удалось обновить ${name}: ${err.message||err}`,'error');
+        showGlobalError(`Ошибка обновления стратегии ${name}`);
+      }
+    }
+    function toggleStrategy(name, checkbox){ submitStrategy(name); }
+    async function generateReports(){
+      try{
+        const resp=await fetch('/reports/generate', { method:'POST' });
+        if(!resp.ok){
+          const text=await resp.text();
+          throw new Error(text || resp.statusText);
+        }
+        showToast('Отчёты пересозданы','ok');
+        refreshPanel('limits-box');
+      }catch(err){
+        showToast(`Не удалось обновить отчёты: ${err.message||err}`,'error');
+        showGlobalError('Ошибка генерации отчётов');
+      }
+    }
 
     // boot
     document.addEventListener('DOMContentLoaded', ()=>{ initControlsFromStorage(); applyIntervals(); });

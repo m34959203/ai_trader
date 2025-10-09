@@ -6,13 +6,20 @@ from fastapi import APIRouter, HTTPException, Request
 
 from services.broker_gateway import BrokerGatewayError
 from schemas.live_trading import (
+    LiveBrokerStatus,
     LiveCancelOrderResponse,
+    LiveLimitsResponse,
     LiveOrdersResponse,
     LiveOrderStatusResponse,
+    LivePnLSnapshot,
     LiveStatusResponse,
     LiveSyncResponse,
     LiveTradeRequest,
     LiveTradeResponse,
+    LiveTradesResponse,
+    StrategyListResponse,
+    StrategyState,
+    StrategyUpdateRequest,
 )
 
 router = APIRouter(prefix="/live", tags=["live"])
@@ -49,6 +56,7 @@ async def live_trade(request: Request, payload: LiveTradeRequest) -> LiveTradeRe
             payload.features,
             news_text=payload.news_text,
             order_type=payload.order_type,
+            strategy=payload.strategy,
         )
     except BrokerGatewayError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -106,3 +114,66 @@ async def live_sync(request: Request) -> LiveSyncResponse:
     except BrokerGatewayError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return LiveSyncResponse(**snapshot)
+
+
+@router.get("/pnl", response_model=LivePnLSnapshot)
+async def live_pnl(request: Request) -> LivePnLSnapshot:
+    coordinator = _get_coordinator(request)
+    snapshot = coordinator.pnl_snapshot()
+    return LivePnLSnapshot(**snapshot)
+
+
+@router.get("/broker", response_model=LiveBrokerStatus)
+async def live_broker(request: Request, include_orders: bool = True) -> LiveBrokerStatus:
+    coordinator = _get_coordinator(request)
+    status = coordinator.broker_status(include_orders=include_orders)
+    return LiveBrokerStatus(**status)
+
+
+@router.get("/trades", response_model=LiveTradesResponse)
+async def live_trades(
+    request: Request,
+    limit: int = 50,
+) -> LiveTradesResponse:
+    coordinator = _get_coordinator(request)
+    trades = coordinator.list_trades(limit=limit)
+    return LiveTradesResponse(trades=trades)
+
+
+@router.get("/limits", response_model=LiveLimitsResponse)
+async def live_limits(request: Request) -> LiveLimitsResponse:
+    coordinator = _get_coordinator(request)
+    payload = coordinator.limits_snapshot()
+    return LiveLimitsResponse(
+        risk_config=payload.get("risk_config", {}),
+        daily=payload.get("daily", {}),
+        strategies=payload.get("strategies", []),
+    )
+
+
+@router.get("/strategies", response_model=StrategyListResponse)
+async def live_strategies(request: Request) -> StrategyListResponse:
+    coordinator = _get_coordinator(request)
+    return StrategyListResponse(strategies=coordinator.list_strategy_controls())
+
+
+@router.patch("/strategies/{name}", response_model=StrategyState)
+async def update_strategy(
+    request: Request,
+    name: str,
+    payload: StrategyUpdateRequest,
+) -> StrategyState:
+    coordinator = _get_coordinator(request)
+    if hasattr(payload, "model_dump"):
+        data = payload.model_dump(exclude_unset=True)
+    else:  # pragma: no cover - pydantic v1 fallback
+        data = payload.dict(exclude_unset=True)  # type: ignore[attr-defined]
+    updated = coordinator.update_strategy_control(
+        name,
+        enabled=data.get("enabled"),
+        max_risk_fraction=data.get("max_risk_fraction"),
+        max_daily_trades=data.get("max_daily_trades"),
+        notes=data.get("notes"),
+        provided=data.keys(),
+    )
+    return StrategyState(**updated)

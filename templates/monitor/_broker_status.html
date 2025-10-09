@@ -1,0 +1,86 @@
+<div id="broker-status" class="space-y-4">
+  <div class="flex items-center justify-between">
+    <h2 class="text-lg font-semibold">Статус брокера</h2>
+    <span class="text-xs text-gray-400">Обновлено: {{ broker.updated_at }}</span>
+  </div>
+  <div class="grid grid-cols-2 gap-3 text-sm">
+    <div class="bg-gray-50 border border-gray-200 rounded-md p-3">
+      <div class="text-gray-500">Соединение</div>
+      <div class="font-medium {{ 'text-emerald-600' if broker.connected else 'text-rose-600' }}">{{ 'OK' if broker.connected else 'Ошибка' }}</div>
+    </div>
+    <div class="bg-gray-50 border border-gray-200 rounded-md p-3">
+      <div class="text-gray-500">Шлюз</div>
+      <div class="font-medium">{{ broker.gateway or '—' }}</div>
+    </div>
+    <div class="bg-gray-50 border border-gray-200 rounded-md p-3">
+      <div class="text-gray-500">Активных ордеров</div>
+      <div class="font-medium">{{ broker.open_orders|length }}</div>
+    </div>
+    <div class="bg-gray-50 border border-gray-200 rounded-md p-3">
+      <div class="text-gray-500">Позиции</div>
+      <div class="font-medium">{{ broker.positions|length }}</div>
+    </div>
+  </div>
+  {% if broker.last_error %}
+    <div class="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded p-2">Последняя ошибка: {{ broker.last_error }}</div>
+  {% endif %}
+  <div>
+    <h3 class="text-sm font-semibold text-gray-700">Ордера</h3>
+    {% if broker.open_orders %}
+      <table class="mt-2 w-full text-xs border border-gray-200 rounded">
+        <thead class="bg-gray-100 text-gray-600">
+          <tr>
+            <th class="px-2 py-1 text-left">ID</th>
+            <th class="px-2 py-1 text-left">Символ</th>
+            <th class="px-2 py-1 text-left">Статус</th>
+            <th class="px-2 py-1 text-right">Исполнено</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for order in broker.open_orders[:6] %}
+            {% set raw = order.raw or {} %}
+            {% set req = raw.request if raw and raw.request is defined else {} %}
+            {% set sym = req.symbol if req and req.symbol is defined else (raw.symbol if raw and raw.symbol is defined else '—') %}
+            <tr class="border-t">
+              <td class="px-2 py-1 font-mono text-gray-600">{{ order.request_id }}</td>
+              <td class="px-2 py-1">{{ sym }}</td>
+              <td class="px-2 py-1">{{ order.status }}</td>
+              <td class="px-2 py-1 text-right">{{ order.filled_quantity }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="text-xs text-gray-500">Нет активных ордеров.</div>
+    {% endif %}
+  </div>
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+    <div>
+      <h3 class="text-sm font-semibold text-gray-700">Позиции</h3>
+      {% if broker.positions %}
+        <ul class="mt-2 space-y-1">
+          {% for sym, qty in broker.positions.items()|list|sort %}
+            <li class="flex justify-between border border-gray-200 rounded px-2 py-1"><span>{{ sym }}</span><span class="font-mono">{{ qty }}</span></li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="text-gray-500">Нет позиций.</div>
+      {% endif %}
+    </div>
+    <div>
+      <h3 class="text-sm font-semibold text-gray-700">Баланс</h3>
+      {% if broker.balances %}
+        <ul class="mt-2 space-y-1">
+          {% for asset, info in broker.balances.items()|list|sort %}
+            <li class="border border-gray-200 rounded px-2 py-1">
+              <div class="flex justify-between"><span class="font-semibold">{{ asset }}</span><span class="font-mono">{{ info.total if info.total is not none else '—' }}</span></div>
+              <div class="text-gray-500">Free: {{ info.free if info.free is not none else '—' }}, Locked: {{ info.locked if info.locked is not none else '—' }}</div>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="text-gray-500">Баланс недоступен.</div>
+      {% endif %}
+    </div>
+  </div>
+</div>

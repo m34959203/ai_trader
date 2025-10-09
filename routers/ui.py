@@ -168,6 +168,71 @@ def _maybe_204(request: Request, key: str, signature_obj: Any) -> Optional[Respo
     _LAST_DIGEST[key] = new_digest
     return None
 
+
+def _live_coordinator(request: Request):
+    return getattr(request.app.state, "live_trading", None)
+
+
+def _pnl_signature(pnl: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ts": str(pnl.get("ts")),
+        "start": None if pnl.get("start_equity") is None else float(pnl.get("start_equity")),
+        "current": None if pnl.get("current_equity") is None else float(pnl.get("current_equity")),
+        "realized": None if pnl.get("realized_pnl") is None else float(pnl.get("realized_pnl")),
+        "dd": None if pnl.get("drawdown_pct") is None else float(pnl.get("drawdown_pct")),
+        "n": int(pnl.get("trades_count") or 0),
+    }
+
+
+def _broker_signature(status: Dict[str, Any]) -> Dict[str, Any]:
+    positions = status.get("positions") or {}
+    pos_sample = sorted([(str(k), float(v)) for k, v in list(positions.items())[:5]])
+    orders = status.get("open_orders") or []
+    return {
+        "connected": bool(status.get("connected")),
+        "gateway": status.get("gateway"),
+        "orders": len(orders),
+        "positions": pos_sample,
+        "error": status.get("last_error"),
+    }
+
+
+def _trades_signature(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    sample = []
+    for trade in (trades or [])[:5]:
+        sample.append(
+            (
+                str(trade.get("ts")),
+                trade.get("symbol"),
+                trade.get("strategy"),
+                bool(trade.get("executed")),
+                trade.get("status"),
+                trade.get("request_id"),
+            )
+        )
+    return {"n": len(trades or []), "sample": sample}
+
+
+def _limits_signature(payload: Dict[str, Any]) -> Dict[str, Any]:
+    risk = payload.get("risk_config") or {}
+    strategies = payload.get("strategies") or []
+    strat_sample = [
+        (
+            s.get("name"),
+            bool(s.get("enabled")),
+            s.get("max_risk_fraction"),
+            s.get("max_daily_trades"),
+            s.get("trades_today"),
+        )
+        for s in strategies[:5]
+    ]
+    return {
+        "per_trade": risk.get("per_trade_cap"),
+        "daily_loss": risk.get("daily_max_loss_pct"),
+        "max_trades": risk.get("max_trades_per_day"),
+        "strategies": strat_sample,
+    }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Root dashboard
 # ──────────────────────────────────────────────────────────────────────────────
@@ -510,6 +575,83 @@ async def partial_metrics(
         return _error_fragment("metrics", "Таймаут при расчёте метрик")
     except Exception as e:
         return _error_fragment("metrics", f"Не удалось вычислить метрики: {e!s}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Partials — live trading dashboard widgets
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/partials/live_pnl", response_class=HTMLResponse)
+async def partial_live_pnl(request: Request):
+    coordinator = _live_coordinator(request)
+    if coordinator is None:
+        return _error_fragment("live-pnl", "Live trading не настроен")
+    try:
+        snapshot = coordinator.pnl_snapshot()
+    except Exception as exc:  # pragma: no cover - defensive
+        return _error_fragment("live-pnl", f"Не удалось получить PnL: {exc!s}")
+
+    if (r := _maybe_204(request, "live_pnl", _pnl_signature(snapshot))) is not None:
+        return r
+    return _render_fragment("monitor/_live_pnl.html", request, {"pnl": snapshot})
+
+
+@router.get("/partials/broker_status", response_class=HTMLResponse)
+async def partial_broker_status(request: Request):
+    coordinator = _live_coordinator(request)
+    if coordinator is None:
+        return _error_fragment("broker-status", "Live trading не настроен")
+    try:
+        status = coordinator.broker_status()
+    except Exception as exc:  # pragma: no cover - defensive
+        return _error_fragment("broker-status", f"Не удалось получить статус брокера: {exc!s}")
+
+    if (r := _maybe_204(request, "broker_status", _broker_signature(status))) is not None:
+        return r
+    return _render_fragment("monitor/_broker_status.html", request, {"broker": status})
+
+
+@router.get("/partials/live_trades", response_class=HTMLResponse)
+async def partial_live_trades(
+    request: Request,
+    limit: int = Query(20, ge=1, le=200),
+):
+    coordinator = _live_coordinator(request)
+    if coordinator is None:
+        return _error_fragment("live-trades", "Live trading не настроен")
+    try:
+        trades = coordinator.list_trades(limit=limit)
+    except Exception as exc:  # pragma: no cover - defensive
+        return _error_fragment("live-trades", f"Не удалось получить сделки: {exc!s}")
+
+    if (r := _maybe_204(request, f"live_trades:{limit}", _trades_signature(trades))) is not None:
+        return r
+    return _render_fragment("monitor/_live_trades.html", request, {"trades": trades, "limit": limit})
+
+
+@router.get("/partials/limits", response_class=HTMLResponse)
+async def partial_limits(request: Request):
+    coordinator = _live_coordinator(request)
+    if coordinator is None:
+        limits = {"risk_config": {}, "daily": {}, "strategies": []}
+    else:
+        try:
+            limits = coordinator.limits_snapshot()
+        except Exception as exc:  # pragma: no cover - defensive
+            return _error_fragment("limits", f"Не удалось получить лимиты: {exc!s}")
+
+    reports_info: Dict[str, Any] = {}
+    try:
+        from tasks import reports as reports_tasks  # type: ignore
+
+        reports_info = reports_tasks.get_reports_summary()
+    except Exception:
+        reports_info = {}
+
+    if (r := _maybe_204(request, "limits", _limits_signature(limits))) is not None:
+        return r
+
+    ctx = {"limits": limits, "reports": reports_info}
+    return _render_fragment("monitor/_limits.html", request, ctx)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Health
