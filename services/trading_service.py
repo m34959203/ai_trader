@@ -1123,18 +1123,25 @@ def _to_market_features(symbol: str, feats: Dict[str, Any]) -> MarketFeatures:
     return cast(MarketFeatures, data)
 
 
-def decide_and_execute(symbol: str, feats: Dict[str, Any], news_text: Optional[str] | None = None) -> Dict[str, Any]:
+def decide_and_execute(
+    symbol: str,
+    feats: Dict[str, Any],
+    news_text: Optional[str] | None = None,
+    *,
+    router: Optional["ModelRouter"] = None,
+) -> Dict[str, Any]:
     """Generate a model-driven decision with Kelly-capped risk sizing."""
 
-    if router_singleton is None:
+    active_router = router or router_singleton
+    if active_router is None:
         raise RuntimeError("Model router is not initialised")
 
     features = _to_market_features(symbol, feats)
-    signal = router_singleton.signal(features)
-    sentiment = router_singleton.sentiment(news_text or "")
-    regime = router_singleton.regime(features)
+    signal = active_router.signal(features)
+    sentiment = active_router.sentiment(news_text or "")
+    regime = active_router.regime(features)
 
-    risk_cfg = router_singleton.risk_config
+    risk_cfg = active_router.risk_config
     per_trade_cap = float(risk_cfg.get("per_trade_cap", 0.02))
     daily_loss_limit = float(risk_cfg.get("daily_loss_limit", 0.06))
 

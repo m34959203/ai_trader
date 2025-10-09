@@ -19,7 +19,9 @@
 ### Trading, Simulation, and Risk Controls
 - `routers/trading.py` exposes paper-trading endpoints (e.g., `/paper/backtest`) that return win-rate, PnL, Sharpe metrics, and optional trade/equity exports for journaling.【F:routers/trading.py†L520-L656】
 - `src/paper.py` implements a one-position paper trader with SL/TP, trailing stops, fee accounting, and detailed trade logs compatible with the API schemas.【F:src/paper.py†L1-L168】
-- `services/trading_service.py` encapsulates execution with per-trade and daily risk limits, portfolio guardrails, executor failover hooks, and auto-heal registration for live trading modes. The new `decide_and_execute` helper combines model outputs with Kelly-capped risk sizing and daily drawdown brakes for autonomous trading.【F:services/trading_service.py†L1-L80】【F:services/trading_service.py†L1118-L1160】
+- `services/trading_service.py` encapsulates execution with per-trade and daily risk limits, portfolio guardrails, executor failover hooks, and auto-heal registration for live trading modes. The new `decide_and_execute` helper combines model outputs with Kelly-capped risk sizing and daily drawdown brakes for autonomous trading.【F:services/trading_service.py†L1-L80】【F:services/trading_service.py†L1123-L1168】
+- `services/broker_gateway.py` defines broker-agnostic order contracts and the `SimulatedBrokerGateway` used for dry-runs, providing a stable surface for wiring real brokerage integrations while keeping unit tests deterministic.【F:services/broker_gateway.py†L1-L129】
+- `services/live_trading.py` introduces a `LiveTradingCoordinator` that fuses `decide_and_execute` with broker routing, computing Kelly-sized quantities, honouring risk brakes, and surfacing execution acknowledgements for observability and UI consumption.【F:services/live_trading.py†L1-L113】
 - `services/auto_heal.py` persists executor snapshots and replays restore callbacks, providing recovery support leveraged by the trading service and tested in resilience suites.【F:services/auto_heal.py†L1-L64】
 
 ### AI Decision Fabric & Diagnostics
@@ -51,6 +53,8 @@
 | `src/paper.py` | Paper-trading simulator handling SL/TP, trailing stops, and journaling.【F:src/paper.py†L1-L168】 |
 | `src/strategy.py` | Strategy ensemble definitions, validation, and signal helpers.【F:src/strategy.py†L1-L120】 |
 | `services/trading_service.py` | Execution, risk management, and auto-heal orchestration for live/paper modes.【F:services/trading_service.py†L1-L200】 |
+| `services/broker_gateway.py` | Broker order contracts and a simulated gateway for live-trading dry runs.【F:services/broker_gateway.py†L1-L129】 |
+| `services/live_trading.py` | Coordinator translating AI decisions into broker orders with risk sizing.【F:services/live_trading.py†L1-L113】 |
 | `services/auto_heal.py` | Snapshot-based recovery orchestrator for trading executors.【F:services/auto_heal.py†L1-L64】 |
 | `routers/trading.py` | API endpoints for signals, paper trading, and equity exports.【F:routers/trading.py†L520-L656】 |
 | `routers/metrics.py` | Monitoring endpoints for Prometheus metrics and SLO status.【F:routers/metrics.py†L1-L19】 |
