@@ -1,0 +1,24 @@
+<div id="{{ panel_id }}" class="border border-indigo-200 bg-indigo-50 text-indigo-900 rounded-md p-4 text-sm">
+  <div class="flex items-start space-x-3">
+    <div class="text-lg" aria-hidden="true">⚙️</div>
+    <div class="space-y-2">
+      <div class="font-semibold">{{ title }}</div>
+      {% if panel_label %}
+        <div class="text-xs text-indigo-700">Панель «{{ panel_label }}» доступна после включения live trading.</div>
+      {% endif %}
+      {% if description %}
+        <p class="leading-snug">{{ description | safe }}</p>
+      {% endif %}
+      {% if steps %}
+        <ol class="list-decimal list-inside space-y-1">
+          {% for step in steps %}
+            <li>{{ step | safe }}</li>
+          {% endfor %}
+        </ol>
+      {% endif %}
+      {% if doc_hint %}
+        <p class="text-xs text-indigo-700">{{ doc_hint | safe }}</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
