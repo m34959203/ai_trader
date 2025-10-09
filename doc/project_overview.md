@@ -2,7 +2,8 @@
 
 ## Delivery Status
 - **Stage 2 (Advanced Market Intelligence)** is fully delivered: the indicator library, news-aware analysis pipeline, background ingestion worker, strategy validation, and runtime dependencies are complete and regression-tested.【F:doc/stage2_status.md†L1-L17】
-- **Stage 3 (Paper Trading & Resilience)** is also 100 % ready: enhanced backtesting exports, automated risk controls, auto-heal orchestration, observability endpoints, and operational runbooks are in place with dependencies declared.【F:doc/stage3_status.md†L1-L21】
+- **Stage 3 (Paper Trading & Resilience)** is also 100 % ready: enhanced backtesting exports, automated risk controls, auto-heal orchestration, observability endpoints, and operational runbooks are in place with dependencies declared.【F:doc/stage3_status.md†L1-L24】
+- **Stage 4 (Live Trading & Operator Experience)** is in progress: broker certification, production observability, compliance, and UI deliverables remain outstanding and are catalogued in the Stage 4 readiness report.【F:doc/stage4_status.md†L1-L56】
 
 ## Core Capabilities
 ### Market Intelligence & Alternative Data
