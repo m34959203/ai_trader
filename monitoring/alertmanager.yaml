@@ -1,0 +1,25 @@
+route:
+  receiver: slack
+  group_by: ['alertname']
+  routes:
+    - matchers:
+        - severity = 'critical'
+      receiver: pagerduty
+      continue: true
+
+receivers:
+  - name: slack
+    slack_configs:
+      - send_resolved: true
+        channel: '#trading-alerts'
+        api_url: '${SLACK_WEBHOOK_URL}'
+        title: '{{ .CommonAnnotations.summary }}'
+        text: >-
+          *Alert:* {{ .CommonLabels.alertname }} ({{ .Status }})
+          *Trace ID:* {{ index .CommonLabels "trace_id" }}
+          *Description:* {{ .CommonAnnotations.description }}
+  - name: pagerduty
+    pagerduty_configs:
+      - routing_key: '${PAGERDUTY_ROUTING_KEY}'
+        severity: '{{ default "error" .CommonLabels.severity }}'
+        description: '{{ .CommonAnnotations.summary }}'

@@ -32,10 +32,17 @@
 ## 3. Prometheus / SLO Monitoring
 - Metrics endpoint: `GET /metrics` (Prometheus exposition format).
 - SLO API: `GET /observability/slo` returns JSON with `target`, `actual`, `met` for tracked SLOs.
+- Broker latency snapshot: `GET /observability/broker-latency` summarises recent Binance round-trips and SLO compliance.
+- Thread health feed: `GET /observability/thread-health` exposes background task failures (`market_stream_consumer`, `ws_watchdog`, auto-heal, etc.).
+- Market data quality: `GET /observability/market-data` returns freshness scores and missing bar counters per symbol/interval.
 - Default tracked SLOs:
   - `order_success` ≥ 98%
   - `latency_under_2s` ≥ 95%
   - `executor_availability` ≥ 99%
+  - `broker_latency_under_1s` ≥ 97%
+  - `market_data_quality_score` ≥ 95%
+  - `market_data_freshness` ≥ 98%
+  - `stream_thread_recovery` ≥ 99%
 - Grafana onboarding:
   1. Point Prometheus scrape job at `https://<host>/metrics`.
   2. Import dashboard using the provided metrics names (`ai_trader_order_latency_seconds`, `ai_trader_orders_total`, etc.).
@@ -62,5 +69,12 @@
 - **Implementation controls:** Use feature flags and blue/green deployments where possible. Pre-prod validation must include integration tests (`pytest tests/test_broker_gateway_live.py -q`) and reconciliation dry-runs.
 - **Post-change verification:** Within 24 hours of deployment, confirm health dashboards, trade throughput, and reconciliation status. Document verification evidence in the change ticket and update the release log.
 - **Audit trail:** Persist change metadata (ticket ID, approvers, git SHA, deployment timestamp) in the WORM trade journal alongside operational logs for full traceability.
+
+## 7. HA Kubernetes Deployment Checklist
+- **Terraform module:** `deploy/terraform` provisions the namespace, ConfigMap, Deployment, Service, HPA, and PodDisruptionBudget. Set `image_repository`, `image_tag`, and point `slack_webhook_url`/`pagerduty_routing_key` to secret-backed variables.
+- **Helm chart:** `deploy/helm` mirrors the Terraform layout for GitOps pipelines. Override `values.yaml` to tune replicas, autoscaling, and resource limits. Health probes hit `/healthz`, `/_readyz`, and `/health/deep`.
+- **Prometheus/Grafana:** Ensure the cluster scrape config watches the new namespace. The pod annotations expose `/metrics`; dashboards should track `ai_trader_broker_latency_seconds`, `ai_trader_market_data_quality`, and thread failure counters.
+- **Alert routing:** Apply `monitoring/alertmanager.yaml` (or merge it into an existing Alertmanager stack) so PagerDuty handles `severity=critical` while Slack receives all notifications. Include `trace_id` in templates for log correlation.
+- **Log shipping:** Deploy Fluent Bit/Vector per `monitoring/logging_stack.md` so JSON logs with `trace_id` flow into the central store (Loki/ELK). Validate that alerts carry matching IDs before enabling paging.
 
 Keep this document alongside deployment checklists to ensure Stage 2 and Stage 3 runbooks remain up to date.

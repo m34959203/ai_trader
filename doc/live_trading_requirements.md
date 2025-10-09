@@ -37,7 +37,11 @@ process.
 | Service | Usage | Environment variables | Notes |
 | --- | --- | --- | --- |
 | Prometheus / Grafana | Metrics and dashboards | `PROMETHEUS_PUSHGATEWAY_URL` (if push-mode), `PROMETHEUS_BASIC_AUTH` (if required) | The API already exposes `/metrics`; configure scraping credentials on the infrastructure side. |
-| Alerting (PagerDuty/Slack) | Incident notifications | `SLACK_WEBHOOK_URL`, `PAGERDUTY_ROUTING_KEY`, etc. | Optional but recommended for 24/7 monitoring. |
+| Alerting (PagerDuty/Slack) | Incident notifications | `SLACK_WEBHOOK_URL`, `PAGERDUTY_ROUTING_KEY` | Populate from your secret store and mount `monitoring/alertmanager.yaml` into Alertmanager so Slack receives all alerts and PagerDuty handles `severity=critical`. |
+
+Alert payloads include the structured logging `trace_id`, enabling on-call engineers
+to cross-reference alerts with JSON logs shipped via Fluent Bit/Vector (see
+`monitoring/logging_stack.md`).
 
 ## 5. Operational Safety Nets
 

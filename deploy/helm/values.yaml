@@ -1,0 +1,49 @@
+replicaCount: 3
+
+image:
+  repository: registry.example.com/ai-trader
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  limits:
+    cpu: 750m
+    memory: 1Gi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+env:
+  APP_ENV: prod
+  LOG_LEVEL: INFO
+  FEATURE_LIVE: "true"
+
+alerting:
+  slackWebhookUrl: ""
+  pagerdutyRoutingKey: ""
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 60
+
+persistence:
+  enabled: false
+
+serviceAccount:
+  create: false
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path: /metrics
+  prometheus.io/port: "8000"
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1

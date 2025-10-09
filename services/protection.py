@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import Any, Dict, List, Optional, Literal
 
@@ -10,7 +9,10 @@ from db import crud_orders
 
 from executors.api_binance import BinanceExecutor
 
-LOG = logging.getLogger("ai_trader.protection")
+from utils.structured_logging import get_logger
+
+
+LOG = get_logger("ai_trader.protection")
 
 async def _select_executor(mode: Literal["binance","sim"], testnet: bool) -> BinanceExecutor:
     # из существующей логики — создаём такой же инстанс

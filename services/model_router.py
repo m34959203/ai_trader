@@ -1,7 +1,6 @@
 """Centralised access point for AI models used by the trading service."""
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -13,7 +12,10 @@ except Exception:  # pragma: no cover
 from src.models import create_model
 from src.models.base import MarketFeatures, ModelConfig, RegimeOutput, SentimentOutput, SignalOutput
 
-LOG = logging.getLogger("ai_trader.model_router")
+from utils.structured_logging import get_logger
+
+
+LOG = get_logger("ai_trader.model_router")
 
 
 DEFAULT_MODEL_CONFIG = {

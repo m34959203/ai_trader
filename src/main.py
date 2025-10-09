@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 import logging
 import asyncio
 from typing import Literal, Optional, Any, Dict, List
@@ -25,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response, PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ──────────────────────────────────────────────────────────────────────────────
 # .env
@@ -36,6 +38,38 @@ except Exception:
     pass
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Логирование
+# ──────────────────────────────────────────────────────────────────────────────
+LOG_LEVEL = str(os.getenv("LOG_LEVEL", "INFO")).upper()
+configure_structured_logging(level=LOG_LEVEL)
+LOG = get_logger("ai_trader.app")
+EXEC_LOG = get_logger("ai_trader.exec_report")
+
+TRACE_HEADER_NAME = "X-Trace-Id"
+_TRACE_FALLBACK_HEADERS = ("X-Request-ID", "X-Correlation-ID")
+
+
+class TraceIdMiddleware(BaseHTTPMiddleware):
+    """Populate the structured logging context with a per-request trace ID."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        incoming = request.headers.get(TRACE_HEADER_NAME)
+        if not incoming:
+            for header in _TRACE_FALLBACK_HEADERS:
+                incoming = request.headers.get(header)
+                if incoming:
+                    break
+        trace_id = (incoming or uuid.uuid4().hex).strip()
+        token = set_trace_id(trace_id)
+        request.state.trace_id = trace_id
+        request.state.trace_token = token
+        response = await call_next(request)
+        response.headers[TRACE_HEADER_NAME] = trace_id
+        reset_trace_id(token)
+        request.state.trace_token = None
+        return response
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Локальные импорты
 # ──────────────────────────────────────────────────────────────────────────────
 from .data_loader import get_prices
@@ -43,6 +77,15 @@ from .data_loader import get_prices
 # БД
 from db.session import engine, Base, apply_startup_pragmas_and_schema, shutdown_engine, get_session  # get_session нужно фолбэкам
 from db import crud  # тоже нужно фолбэкам
+
+from monitoring.observability import OBSERVABILITY
+from utils.structured_logging import (
+    configure_structured_logging,
+    current_trace_id,
+    get_logger,
+    reset_trace_id,
+    set_trace_id,
+)
 
 # Роутеры
 try:
@@ -265,16 +308,6 @@ def _configure_live_trading(app: FastAPI, exec_config: Dict[str, Any]):
     return coordinator, gateway
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Логирование
-# ──────────────────────────────────────────────────────────────────────────────
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | ai_trader | %(name)s | %(message)s",
-)
-LOG = logging.getLogger("ai_trader.app")
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Флаги/конфиг
 # ──────────────────────────────────────────────────────────────────────────────
 FEATURES: Dict[str, bool] = {
@@ -337,7 +370,7 @@ class EventLoopWatchdog:
         self.max_misses = max_consecutive_misses
         self._misses = 0
         self._stop = False
-        self.log = logging.getLogger("ai_trader.watchdog")
+        self.log = get_logger("ai_trader.watchdog")
 
     async def run(self) -> None:
         while not self._stop:
@@ -417,40 +450,67 @@ async def _check_binance(testnet: bool = True) -> Dict[str, Any]:
 async def _consume_market_stream(app: FastAPI) -> None:
     assert app.state.stream_router is not None
     RING_MAX = 1024
-    async for bar in app.state.stream_router.run():
-        app.state.market_last_event_ts = int(time.time())
-        try:
-            app.state.market_ring.append({
-                "asset": bar.asset, "tf": bar.tf, "ts": bar.ts,
-                "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close, "volume": bar.volume,
-            })
-            if len(app.state.market_ring) > RING_MAX:
-                app.state.market_ring = app.state.market_ring[-RING_MAX:]
-        except Exception:
-            pass
+    try:
+        async for bar in app.state.stream_router.run():
+            app.state.market_last_event_ts = int(time.time())
+            try:
+                app.state.market_ring.append({
+                    "asset": bar.asset, "tf": bar.tf, "ts": bar.ts,
+                    "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close, "volume": bar.volume,
+                })
+                if len(app.state.market_ring) > RING_MAX:
+                    app.state.market_ring = app.state.market_ring[-RING_MAX:]
+            except Exception:
+                pass
+    except Exception as exc:
+        OBSERVABILITY.record_thread_failure(
+            thread="market_stream_consumer",
+            stage="consume_market_stream",
+            recovered=False,
+            reason=str(exc),
+        )
+        raise
 
 async def _consume_user_stream(app: FastAPI) -> None:
     assert app.state.user_ws is not None
-    async for evt in app.state.user_ws.start_user():
-        app.state.user_last_event_ts = int(time.time())
-        t = evt.get("type")
-        if t == "executionReport":
-            data = evt.get("data", {})
-            logging.getLogger("ai_trader.exec_report").debug("ExecReport: %s", data)
+    try:
+        async for evt in app.state.user_ws.start_user():
+            app.state.user_last_event_ts = int(time.time())
+            t = evt.get("type")
+            if t == "executionReport":
+                data = evt.get("data", {})
+                EXEC_LOG.debug("ExecReport: %s", data)
+    except Exception as exc:
+        OBSERVABILITY.record_thread_failure(
+            thread="user_stream_consumer",
+            stage="consume_user_stream",
+            recovered=False,
+            reason=str(exc),
+        )
+        raise
 
 async def _ws_watchdog(app: FastAPI, heartbeat_sec: int) -> None:
     interval = max(5, int(heartbeat_sec // 3))
-    while True:
-        await asyncio.sleep(interval)
-        now = int(time.time())
-        if app.state.market_ws_task:
-            lag = now - int(getattr(app.state, "market_last_event_ts", 0) or 0)
-            if lag > heartbeat_sec:
-                LOG.warning("Market WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
-        if app.state.user_ws_task:
-            lag = now - int(getattr(app.state, "user_last_event_ts", 0) or 0)
-            if lag > heartbeat_sec:
-                LOG.warning("User WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            now = int(time.time())
+            if app.state.market_ws_task:
+                lag = now - int(getattr(app.state, "market_last_event_ts", 0) or 0)
+                if lag > heartbeat_sec:
+                    LOG.warning("Market WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
+            if app.state.user_ws_task:
+                lag = now - int(getattr(app.state, "user_last_event_ts", 0) or 0)
+                if lag > heartbeat_sec:
+                    LOG.warning("User WS heartbeat lag: %ss (>%ss)", lag, heartbeat_sec)
+    except Exception as exc:
+        OBSERVABILITY.record_thread_failure(
+            thread="ws_watchdog",
+            stage="watchdog_loop",
+            recovered=False,
+            reason=str(exc),
+        )
+        raise
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -578,9 +638,15 @@ async def lifespan(app: FastAPI):
                 cfg,
                 api_key=BINANCE_API_KEY or None,
                 api_secret=BINANCE_API_SECRET or None,
-                logger=logging.getLogger("ai_trader.stream_router"),
+                logger=get_logger("ai_trader.stream_router"),
             )
             app.state.market_ws_task = asyncio.create_task(_consume_market_stream(app), name="market_ws")
+            OBSERVABILITY.record_thread_failure(
+                thread="market_stream_consumer",
+                stage="startup",
+                recovered=True,
+                reason=None,
+            )
             LOG.info("Market WS task started: %s @ %s", MARKET_WS_SYMBOLS, MARKET_WS_INTERVALS)
         except Exception as e:  # pragma: no cover
             LOG.warning("Failed to start Market WS task: %r", e)
@@ -592,15 +658,21 @@ async def lifespan(app: FastAPI):
                 api_key=BINANCE_API_KEY,
                 api_secret=BINANCE_API_SECRET or None,
                 testnet=BINANCE_TESTNET,
-                logger=logging.getLogger("ai_trader.binance.ws.user"),
+                logger=get_logger("ai_trader.binance.ws.user"),
             )
             app.state.binance_rest = BinanceREST(
                 api_key=BINANCE_API_KEY,
                 api_secret=BINANCE_API_SECRET or None,
                 testnet=BINANCE_TESTNET,
-                logger=logging.getLogger("ai_trader.binance.rest"),
+                logger=get_logger("ai_trader.binance.rest"),
             )
             app.state.user_ws_task = asyncio.create_task(_consume_user_stream(app), name="user_ws")
+            OBSERVABILITY.record_thread_failure(
+                thread="user_stream_consumer",
+                stage="startup",
+                recovered=True,
+                reason=None,
+            )
             LOG.info("User WS task started (testnet=%s)", BINANCE_TESTNET)
         except Exception as e:  # pragma: no cover
             LOG.warning("Failed to start User WS task: %r", e)
@@ -609,6 +681,12 @@ async def lifespan(app: FastAPI):
     if (app.state.market_ws_task or app.state.user_ws_task):
         try:
             app.state.keepalive_task = asyncio.create_task(_ws_watchdog(app, WS_HEARTBEAT_SEC), name="ws_watchdog")
+            OBSERVABILITY.record_thread_failure(
+                thread="ws_watchdog",
+                stage="startup",
+                recovered=True,
+                reason=None,
+            )
             LOG.info("WS watchdog started: heartbeat=%ss", int(WS_HEARTBEAT_SEC))
         except Exception as e:  # pragma: no cover
             LOG.warning("Failed to start WS watchdog: %r", e)
@@ -726,6 +804,7 @@ app = FastAPI(
 # ──────────────────────────────────────────────────────────────────────────────
 # Middlewares
 # ──────────────────────────────────────────────────────────────────────────────
+app.add_middleware(TraceIdMiddleware)
 trusted_hosts = env_list("TRUSTED_HOSTS", "")
 if trusted_hosts:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
@@ -756,20 +835,32 @@ app.add_middleware(GZipMiddleware, minimum_size=gzip_min)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
+    trace_id = getattr(request.state, "trace_id", current_trace_id())
+    token = getattr(request.state, "trace_token", None)
+    response = JSONResponse(
         status_code=exc.status_code,
-        headers={"Cache-Control": "no-store"},
-        content={"ok": False, "error": str(exc.detail), "path": str(request.url.path)},
+        headers={"Cache-Control": "no-store", TRACE_HEADER_NAME: trace_id},
+        content={"ok": False, "error": str(exc.detail), "path": str(request.url.path), "trace_id": trace_id},
     )
+    if token is not None:
+        reset_trace_id(token)
+        request.state.trace_token = None
+    return response
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     LOG.exception("Unhandled exception at %s: %r", request.url.path, exc)
-    return JSONResponse(
+    trace_id = getattr(request.state, "trace_id", current_trace_id())
+    token = getattr(request.state, "trace_token", None)
+    response = JSONResponse(
         status_code=500,
-        headers={"Cache-Control": "no-store"},
-        content={"ok": False, "error": "Internal Server Error", "path": str(request.url.path)},
+        headers={"Cache-Control": "no-store", TRACE_HEADER_NAME: trace_id},
+        content={"ok": False, "error": "Internal Server Error", "path": str(request.url.path), "trace_id": trace_id},
     )
+    if token is not None:
+        reset_trace_id(token)
+        request.state.trace_token = None
+    return response
 
 # ──────────────────────────────────────────────────────────────────────────────
 # META + HEALTH
