@@ -43,6 +43,19 @@ def _load_cache() -> Dict[str, Any]:
 
 CACHE: Dict[str, Any] = _load_cache()
 
+
+def _touch_cache(key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    now = int(time.time())
+    payload = dict(payload)
+    payload.setdefault("_ts", now)
+    payload["_last_ts"] = now
+    CACHE[key] = payload
+    try:
+        _persist_cache()
+    except Exception:
+        pass
+    return payload
+
 def _persist_cache() -> None:
     try:
         # лёгкая «уборка» просроченных и ограничение размера
@@ -271,6 +284,50 @@ async def analyze_news(title: str, summary: str, *, model: Optional[str] = None)
     CACHE[key] = {**parsed, "_ts": now, "_last_ts": now}
     _persist_cache()
     return parsed
+
+
+def analyze_news_item(
+    title: str,
+    summary: str = "",
+    *,
+    allow_remote: bool = True,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Синхронный хелпер вокруг :func:`analyze_news`."""
+
+    key = _cache_key(title, summary)
+    cached = CACHE.get(key)
+    now = int(time.time())
+    if isinstance(cached, dict):
+        if CACHE_TTL_SEC <= 0 or (now - int(cached.get("_ts", 0))) <= CACHE_TTL_SEC:
+            cached["_last_ts"] = now
+            return {
+                "summary": str(cached.get("summary", summary or title)),
+                "sentiment": int(cached.get("sentiment", 0)),
+                "importance": str(cached.get("importance", "low")),
+            }
+
+    result: Optional[Dict[str, Any]] = None
+    if allow_remote and OPENROUTER_KEY:
+        try:
+            import asyncio
+
+            result = asyncio.run(analyze_news(title, summary, model=model))
+        except RuntimeError:
+            # если уже есть запущенный цикл — фолбэк к эвристике (чтобы не блокировать)
+            result = None
+        except Exception:
+            result = None
+
+    if not result:
+        result = _heuristic(title, summary)
+
+    stored = _touch_cache(key, result)
+    return {
+        "summary": str(stored.get("summary", summary or title)),
+        "sentiment": int(stored.get("sentiment", 0)),
+        "importance": str(stored.get("importance", "low")),
+    }
 
 # удобный синхронный запуск на случай CLI-отладки
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ class Signal(BaseModel):
 
 class SignalsResponse(BaseModel):
     signals: List[Dict[str, Any]]
+    mode: Optional[str] = Field(None, description="Какой генератор сигналов использовался (ema|ensemble)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

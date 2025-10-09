@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import logging
+import os
+import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Optional, List, Literal, Iterable, Tuple, TypeVar
-from datetime import datetime, timezone, date
+from datetime import date, datetime, timezone
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, TypeVar, cast
 
 # Совместимые интерфейсы (ожидаемые типы/классы)
 from executors import (  # type: ignore
@@ -20,11 +21,15 @@ from executors import (  # type: ignore
 )
 
 # Риск-конфиг и утилиты портфельного риска
+from monitoring.observability import OBSERVABILITY
 from services.auto_heal import AutoHealingOrchestrator, StateSnapshot
+from services.model_router import router_singleton
 from services.security import AccessController, Role, SecretVault, TwoFactorGuard
 from utils.assets import load_assets
 from utils.logging_utils import install_sensitive_filter
 from utils.risk_config import load_risk_config
+from src.models.base import MarketFeatures
+from src.utils_math import clamp01
 try:
     # Необязательная зависимость (если добавляли ранее)
     from risk.risk_manager import (
@@ -94,6 +99,15 @@ class RiskLimits:
     auto_adjust_amount: bool = True
     default_quote_ccy: str = "USDT"
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "per_trade_risk_pct": self.per_trade_risk_pct,
+            "daily_loss_limit_pct": self.daily_loss_limit_pct,
+            "daily_max_trades": self.daily_max_trades,
+            "auto_adjust_amount": self.auto_adjust_amount,
+            "default_quote_ccy": self.default_quote_ccy,
+        }
+
 
 @dataclass(frozen=True)
 class TradingConfig:
@@ -129,6 +143,17 @@ class TradingConfig:
             security=dict(raw.get("security") or {}),
         )
 
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "testnet": self.testnet,
+            "binance": dict(self.binance or {}),
+            "sim": dict(self.sim or {}),
+            "ui": dict(self.ui or {}),
+            "risk": self.risk.to_dict(),
+            "security": dict(self.security or {}),
+        }
+
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -161,6 +186,13 @@ class TradingService:
         install_sensitive_filter(LOG, fields=("api_key", "api_secret"))
         self._assets = load_assets()
         self._auto_healer = AutoHealingOrchestrator()
+        self._auto_heal_tasks: Set[asyncio.Task[Any]] = set()
+        self._auto_heal_pending_replay = False
+        self._auto_healer.register_restore("trading_executor", self._restore_executor_from_snapshot)
+        self._schedule_auto_heal_task(
+            self._auto_healer.replay(name="trading_executor"),
+            allow_defer=True,
+        )
         self._ui_executor: Optional[UIExecutorAgent] = None
         self._failover_count = 0
         cfg = TradingConfig.from_mapping(config)
@@ -199,6 +231,15 @@ class TradingService:
     # ------------ lifecycle ------------
     async def close(self) -> None:
         """Освобождает ресурсы текущего исполнителя (HTTP-сессии и т.п.)."""
+        for task in list(self._auto_heal_tasks):
+            if not task.done():
+                task.cancel()
+        for task in list(self._auto_heal_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # pragma: no cover - best effort cleanup
+                pass
+        self._auto_heal_tasks.clear()
         try:
             await self._executor.close()  # type: ignore[attr-defined]
         except Exception:
@@ -210,6 +251,9 @@ class TradingService:
                 pass
 
     async def __aenter__(self) -> "TradingService":
+        if self._auto_heal_pending_replay:
+            await self._auto_healer.replay(name="trading_executor")
+            self._auto_heal_pending_replay = False
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -230,6 +274,38 @@ class TradingService:
             self._ui_executor = UIExecutorAgent(testnet=self._testnet, config=self._raw_config.ui or {})
         return self._ui_executor
 
+    def _schedule_auto_heal_task(self, coro: Awaitable[Any], *, allow_defer: bool = False) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            if allow_defer:
+                self._auto_heal_pending_replay = True
+            return
+
+        task: asyncio.Task[Any] = loop.create_task(coro)  # type: ignore[arg-type]
+
+        def _on_done(done: asyncio.Task[Any]) -> None:
+            self._auto_heal_tasks.discard(done)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # pragma: no cover - diagnostic logging
+                LOG.debug("Auto-heal task finished with error: %r", exc)
+
+        task.add_done_callback(_on_done)
+        self._auto_heal_tasks.add(task)
+
+    async def _restore_executor_from_snapshot(self, payload: Dict[str, Any]) -> None:
+        try:
+            await self._swap_executor_if_needed(
+                mode=payload.get("mode"),
+                testnet=payload.get("testnet"),
+                config=payload.get("config"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOG.debug("Auto-heal restore failed: %r", exc)
+
     async def _with_failover(
         self,
         func: Callable[[Executor], Awaitable[T]],
@@ -241,28 +317,34 @@ class TradingService:
             return await func(self._executor)
         except Exception as exc:
             LOG.warning("Primary executor failure during %s: %r", context, exc)
+            snapshot_payload = {
+                "context": context,
+                "mode": self._mode,
+                "testnet": self._testnet,
+                "config": self._raw_config.to_mapping(),
+                "error": repr(exc),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "failovers": self._failover_count + 1,
+            }
             await self._auto_healer.write_snapshot(
-                StateSnapshot(
-                    name="executor_failover",
-                    payload={
-                        "context": context,
-                        "mode": self._mode,
-                        "testnet": self._testnet,
-                        "error": repr(exc),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "failovers": self._failover_count + 1,
-                    },
-                )
+                StateSnapshot(name="trading_executor", payload=snapshot_payload)
             )
+            self._schedule_auto_heal_task(self._auto_healer.trigger("trading_executor", snapshot_payload))
             if not allow_ui or self._mode == "ui":
+                OBSERVABILITY.record_failover(context=context, recovered=False)
                 raise
             self._failover_count += 1
             ui = self._get_ui_executor()
+            recovered = False
             try:
-                return await func(ui)
+                result = await func(ui)
+                recovered = True
+                return result
             except Exception as ui_exc:
                 LOG.error("UI failover failed during %s: %r", context, ui_exc)
                 raise
+            finally:
+                OBSERVABILITY.record_failover(context=context, recovered=recovered)
 
     async def _swap_executor_if_needed(
         self,
@@ -741,15 +823,25 @@ class TradingService:
                 client_order_id=client_tag,
             )
 
+        started = time.perf_counter()
         res = await self._with_failover(_execute, context=f"open_market:{symbol}")
 
+        success = True
         try:
-            # считаем сделкой только не-отклонённый результат
             status = getattr(res, "status", None) or (res.get("status") if isinstance(res, dict) else None)
-            if not status or str(status).lower() not in {"rejected", "expired"}:
+            normalized = str(status).lower() if status is not None else ""
+            success = normalized not in {"rejected", "expired"}
+            if success:
                 self._bump_day_trades()
         except Exception:
             self._bump_day_trades()
+            success = True
+
+        OBSERVABILITY.record_order(
+            symbol=symbol,
+            success=success,
+            latency=time.perf_counter() - started,
+        )
 
         if warn:
             LOG.info("open_market(%s %s) warn=%s qty=%.8f", symbol, side, warn, approved_amount)
@@ -821,14 +913,25 @@ class TradingService:
                 client_order_id=client_tag,
             )
 
+        started = time.perf_counter()
         res = await self._with_failover(_execute, context=f"open_limit:{symbol}")
 
+        success = True
         try:
             status = getattr(res, "status", None) or (res.get("status") if isinstance(res, dict) else None)
-            if not status or str(status).lower() not in {"rejected", "expired"}:
+            normalized = str(status).lower() if status is not None else ""
+            success = normalized not in {"rejected", "expired"}
+            if success:
                 self._bump_day_trades()
         except Exception:
             self._bump_day_trades()
+            success = True
+
+        OBSERVABILITY.record_order(
+            symbol=symbol,
+            success=success,
+            latency=time.perf_counter() - started,
+        )
 
         if warn:
             LOG.info("open_limit(%s %s @ %.8f) warn=%s qty=%.8f", symbol, side, price, warn, approved_amount)
@@ -1012,3 +1115,70 @@ class TradingService:
                 "roles": list(self._access.roles.keys()),
             },
         }
+
+
+def _to_market_features(symbol: str, feats: Dict[str, Any]) -> MarketFeatures:
+    data: Dict[str, Any] = {k: v for k, v in (feats or {}).items() if v is not None}
+    data.setdefault("symbol", symbol)
+    return cast(MarketFeatures, data)
+
+
+def decide_and_execute(
+    symbol: str,
+    feats: Dict[str, Any],
+    news_text: Optional[str] | None = None,
+    *,
+    router: Optional["ModelRouter"] = None,
+) -> Dict[str, Any]:
+    """Generate a model-driven decision with Kelly-capped risk sizing."""
+
+    active_router = router or router_singleton
+    if active_router is None:
+        raise RuntimeError("Model router is not initialised")
+
+    features = _to_market_features(symbol, feats)
+    signal = active_router.signal(features)
+    sentiment = active_router.sentiment(news_text or "")
+    regime = active_router.regime(features)
+
+    risk_cfg = active_router.risk_config
+    per_trade_cap = float(risk_cfg.get("per_trade_cap", 0.02))
+    daily_loss_limit = float(risk_cfg.get("daily_loss_limit", 0.06))
+
+    base_fraction = clamp01(signal["confidence"] * 0.5)
+    risk_fraction = min(per_trade_cap, per_trade_cap * base_fraction)
+    if signal["signal"] == "hold":
+        risk_fraction = 0.0
+
+    if sentiment["label"] == "neg" or regime["regime"] == "storm":
+        risk_fraction *= 0.5
+
+    price = float(features.get("price", 0.0) or 0.0)
+    atr = float(features.get("atr", 0.0) or 0.0)
+    atr_pct = clamp01(atr / price) if price > 0 else 0.0
+    if atr_pct > 0:
+        risk_fraction *= clamp01(1.0 - min(0.9, atr_pct))
+
+    equity = float(features.get("equity", feats.get("account_equity", 0.0)) or 0.0)
+    day_pnl = float(features.get("day_pnl", feats.get("daily_pnl", 0.0)) or 0.0)
+
+    trading_blocked = False
+    if equity > 0 and day_pnl <= -daily_loss_limit * equity:
+        trading_blocked = True
+        risk_fraction = 0.0
+
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "sentiment": sentiment,
+        "regime": regime,
+        "risk_fraction": float(risk_fraction),
+        "trading_blocked": trading_blocked,
+        "limits": {
+            "per_trade_cap": per_trade_cap,
+            "daily_loss_limit": daily_loss_limit,
+            "atr_pct": atr_pct,
+            "equity": equity,
+            "day_pnl": day_pnl,
+        },
+    }
