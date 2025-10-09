@@ -193,3 +193,158 @@ async def test_ui_partial_orders_ok(monkeypatch):
             "order",  # английский маркер на случай другой локализации шаблона
         ]
         assert any(m in body for m in ok_markers)
+
+
+class _DummyLiveCoordinator:
+    def __init__(self) -> None:
+        self._pnl = {
+            "ts": "2024-04-01T00:00:00Z",
+            "start_equity": 10_000.0,
+            "current_equity": 10_750.5,
+            "realized_pnl": 320.25,
+            "drawdown_pct": 0.0123,
+            "trades_count": 7,
+        }
+        self._broker = {
+            "updated_at": "2024-04-01T00:05:00Z",
+            "connected": True,
+            "gateway": "binance",
+            "open_orders": [
+                {
+                    "request_id": "ord-1",
+                    "status": "new",
+                    "filled_quantity": 0.0,
+                    "raw": {"request": {"symbol": "BTCUSDT"}},
+                }
+            ],
+            "positions": {"BTCUSDT": 0.25},
+            "balances": {"USDT": {"total": 12000.0, "free": 9500.0, "locked": 2500.0}},
+            "last_error": None,
+        }
+        self._trades = [
+            {
+                "ts": "2024-04-01T00:03:00Z",
+                "symbol": "BTCUSDT",
+                "strategy": "alpha",
+                "side": "buy",
+                "quantity": 0.1,
+                "price": 65_000.0,
+                "notional": 6_500.0,
+                "status": "filled",
+                "executed": True,
+                "request_id": "req-123",
+            }
+        ]
+        self._limits = {
+            "risk_config": {
+                "per_trade_cap": 0.02,
+                "daily_max_loss_pct": 0.05,
+                "max_trades_per_day": 25,
+            },
+            "daily": {
+                "start_equity": 10_000.0,
+                "current_equity": 10_750.5,
+                "realized_pnl": 320.25,
+            },
+            "strategies": [
+                {
+                    "name": "alpha",
+                    "enabled": True,
+                    "max_risk_fraction": 0.02,
+                    "max_daily_trades": 15,
+                    "trades_today": 3,
+                    "updated_at": "2024-04-01T00:04:00Z",
+                }
+            ],
+        }
+
+    def pnl_snapshot(self):
+        return dict(self._pnl)
+
+    def broker_status(self):
+        return dict(self._broker)
+
+    def list_trades(self, limit: int = 20):
+        return list(self._trades[:limit])
+
+    def limits_snapshot(self):
+        return dict(self._limits)
+
+
+@pytest.mark.asyncio
+async def test_live_widgets_require_setup(monkeypatch):
+    import routers.ui as ui
+    from src.main import app
+
+    ui._LAST_DIGEST.clear()
+    monkeypatch.setattr(app.state, "live_trading", None, raising=False)
+
+    async with _client() as ac:
+        for path in [
+            "/ui/partials/live_pnl",
+            "/ui/partials/broker_status",
+            "/ui/partials/live_trades",
+            "/ui/partials/limits",
+        ]:
+            resp = await ac.get(path)
+            assert resp.status_code == 200, resp.text
+            body = resp.text
+            assert "Live trading не настроен" in body
+            assert "doc/live_trading_requirements.md" in body
+
+
+@pytest.mark.asyncio
+async def test_live_widgets_render_with_coordinator(monkeypatch):
+    import routers.ui as ui
+    from src.main import app
+
+    coordinator = _DummyLiveCoordinator()
+    ui._LAST_DIGEST.clear()
+    monkeypatch.setattr(app.state, "live_trading", coordinator, raising=False)
+    monkeypatch.setattr(
+        "tasks.reports.get_reports_summary",
+        lambda: {
+            "generated_at": "2024-04-01T00:06:00Z",
+            "csv": {"size": 2048},
+            "pdf": {"size": 4096},
+        },
+    )
+
+    async with _client() as ac:
+        pnl_resp = await ac.get("/ui/partials/live_pnl")
+        assert pnl_resp.status_code == 200, pnl_resp.text
+        assert "Live PnL" in pnl_resp.text
+        assert "10 750.5" in pnl_resp.text or "10750.5" in pnl_resp.text
+
+        broker_resp = await ac.get("/ui/partials/broker_status")
+        assert broker_resp.status_code == 200, broker_resp.text
+        assert "Статус брокера" in broker_resp.text
+        assert "binance" in broker_resp.text
+
+        trades_resp = await ac.get("/ui/partials/live_trades", params={"limit": 10})
+        assert trades_resp.status_code == 200, trades_resp.text
+        assert "Live сделки" in trades_resp.text
+        assert "alpha" in trades_resp.text
+
+        limits_resp = await ac.get("/ui/partials/limits")
+        assert limits_resp.status_code == 200, limits_resp.text
+        assert "Риск-лимиты" in limits_resp.text
+        assert "alpha" in limits_resp.text
+        assert "CSV" in limits_resp.text
+
+
+@pytest.mark.asyncio
+async def test_live_pnl_htmx_returns_204_when_snapshot_not_changed(monkeypatch):
+    import routers.ui as ui
+    from src.main import app
+
+    coordinator = _DummyLiveCoordinator()
+    ui._LAST_DIGEST.clear()
+    monkeypatch.setattr(app.state, "live_trading", coordinator, raising=False)
+
+    async with _client() as ac:
+        first = await ac.get("/ui/partials/live_pnl", headers={"HX-Request": "true"})
+        assert first.status_code == 200, first.text
+
+        second = await ac.get("/ui/partials/live_pnl", headers={"HX-Request": "true"})
+        assert second.status_code == 204, second.text
