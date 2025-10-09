@@ -30,3 +30,23 @@ def test_sim_balance():
 def test_open_requires_params():
     r = client.post("/exec/open?mode=binance&testnet=true")  # без обязательных
     assert r.status_code in (400, 422)
+
+
+def test_sim_stop_limit_order():
+    r = client.post(
+        "/exec/open",
+        params={
+            "mode": "sim",
+            "testnet": "true",
+            "type": "stop_limit",
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "qty": 0.001,
+            "price": 61000,
+            "stop_price": 60500,
+        },
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["type"] == "stop_limit"
+    assert data["stop_price"] == 60500

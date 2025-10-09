@@ -45,7 +45,7 @@ API_PREFIX = "/api/v3"
 class Executor:
     name: str
 
-    async def open_order(self, **kwargs) -> Dict[str, Any]:
+    async def open_order(self, **kwargs) -> Dict[str, Any]:  # pragma: no cover - интерфейс
         raise NotImplementedError
 
     async def close_order(self, **kwargs) -> Dict[str, Any]:
@@ -451,7 +451,14 @@ class _BinanceSpotClient:
         *,
         symbol: str,
         side: Literal["BUY", "SELL"],
-        type: Literal["MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"],
+        type: Literal[
+            "MARKET",
+            "LIMIT",
+            "STOP_LOSS_LIMIT",
+            "TAKE_PROFIT_LIMIT",
+            "STOP_LOSS",
+            "TAKE_PROFIT",
+        ],
         quantity: Optional[float] = None,
         quoteOrderQty: Optional[float] = None,
         price: Optional[float] = None,
@@ -731,6 +738,44 @@ class BinanceExecutor(Executor):
                 float(d_stop) if d_stop is not None else None,
             )
 
+        # STOP-market (только стоп-цена + qty/quote)
+        if type_u in ("STOP_LOSS", "TAKE_PROFIT"):
+            d_stop = _dec(stop_price) if stop_price is not None else None
+            if d_stop is not None and tick_size and tick_size > 0:
+                d_stop = _floor_to_step(d_stop, tick_size)
+                d_stop = _clamp(d_stop, min_price, max_price)
+
+            d_qty = None
+            d_quote = quote_qty
+            if qty is not None:
+                d_qty = _dec(qty)
+                step = m_step_size or step_size
+                qmin = m_min_qty or min_qty
+                qmax = m_max_qty or max_qty
+                if step and step > 0:
+                    d_qty = _floor_to_step(d_qty, step)
+                if qmin and d_qty < qmin:
+                    d_qty = qmin
+                if qmax and d_qty > qmax:
+                    d_qty = qmax
+                if min_notional:
+                    last = await self.client.get_ticker_price(sym)
+                    if last and last > 0:
+                        notion = d_qty * last
+                        if notion < min_notional:
+                            need_qty = (min_notional / last)
+                            if step and step > 0:
+                                need_qty = _floor_to_step(need_qty, step)
+                            if qmin and need_qty < qmin:
+                                need_qty = qmin
+                            d_qty = need_qty
+            return (
+                float(d_qty) if d_qty is not None else None,
+                None,
+                d_quote,
+                float(d_stop) if d_stop is not None else None,
+            )
+
         # MARKET
         if type_u == "MARKET":
             if qty is not None:
@@ -838,16 +883,35 @@ class BinanceExecutor(Executor):
         *,
         symbol: str,
         side: Literal["buy", "sell"],
-        type: Literal["market", "limit"] = "market",
+        type: str = "market",
         qty: Optional[float] = None,
         price: Optional[float] = None,
+        stop_price: Optional[float] = None,
         timeInForce: Optional[str] = None,
         client_order_id: Optional[str] = None,
         quote_qty: Optional[float] = None,
         test: bool = False,
     ) -> Dict[str, Any]:
         side_u = side.upper()
-        type_u = type.upper()
+        requested_type = (type or "market").lower()
+        aliases = {
+            "stop": "stop_limit",
+            "stop_loss_limit": "stop_limit",
+            "stop_loss": "stop_market",
+            "take_profit": "take_profit_market",
+        }
+        norm_type = aliases.get(requested_type, requested_type)
+        type_map = {
+            "market": "MARKET",
+            "limit": "LIMIT",
+            "stop_limit": "STOP_LOSS_LIMIT",
+            "stop_market": "STOP_LOSS",
+            "take_profit_limit": "TAKE_PROFIT_LIMIT",
+            "take_profit_market": "TAKE_PROFIT",
+        }
+        type_u = type_map.get(norm_type)
+        if not type_u:
+            raise ValueError(f"Unsupported order type: {type}")
 
         # Быстрая валидация
         if type_u == "LIMIT":
@@ -856,39 +920,53 @@ class BinanceExecutor(Executor):
         elif type_u == "MARKET":
             if qty is None and quote_qty is None:
                 raise ValueError("MARKET order requires qty or quote_qty")
+        elif type_u in {"STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"}:
+            if qty is None or price is None or stop_price is None:
+                raise ValueError("STOP LIMIT order requires qty, price and stop_price")
+        elif type_u in {"STOP_LOSS", "TAKE_PROFIT"}:
+            if stop_price is None:
+                raise ValueError("STOP MARKET order requires stop_price")
+            if qty is None and quote_qty is None:
+                raise ValueError("STOP MARKET order requires qty or quote_qty")
         else:
             raise ValueError("Unsupported order type")
 
-        # По умолчанию TIF для LIMIT
-        if type_u == "LIMIT" and not timeInForce:
+        # По умолчанию TIF для лимитных и стоп-лимитных
+        if type_u in {"LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"} and not timeInForce:
             timeInForce = "GTC"
 
         # Приведение по правилам символа
-        qty_adj, price_adj, quote_qty_adj, _ = await self._apply_symbol_rules(
+        qty_adj, price_adj, quote_qty_adj, stop_adj = await self._apply_symbol_rules(
             symbol=symbol,
             type_u=type_u,
             side_u=side_u,
             qty=qty,
             price=price,
             quote_qty=quote_qty,
+            stop_price=stop_price,
         )
 
         # clientOrderId <= 36
         if not client_order_id:
             client_order_id = _short_client_id("cli")
 
-        resp = await self.client.post_order(
-            symbol=symbol,
-            side=side_u,
-            type=type_u,
-            quantity=qty_adj,
-            quoteOrderQty=quote_qty_adj,
-            price=price_adj,
-            timeInForce=timeInForce,
-            newClientOrderId=client_order_id,
-            newOrderRespType="FULL",  # чтобы получить fills/комиссии
-            test=test,
-        )
+        order_kwargs: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side_u,
+            "type": type_u,
+            "quantity": qty_adj,
+            "quoteOrderQty": quote_qty_adj if type_u in {"MARKET", "STOP_LOSS", "TAKE_PROFIT"} else None,
+            "price": price_adj if type_u in {"LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"} else None,
+            "stopPrice": stop_adj if type_u in {"STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT", "STOP_LOSS", "TAKE_PROFIT"} else None,
+            "timeInForce": timeInForce if type_u in {"LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"} else None,
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "FULL",  # чтобы получить fills/комиссии
+            "test": test,
+        }
+        # очистим None (post_order сам выполнит str конверсию)
+        order_kwargs = {k: v for k, v in order_kwargs.items() if v is not None}
+
+        resp = await self.client.post_order(**order_kwargs)
 
         # Если это тестовый ордер — Binance возвращает {} при успехе
         if test:
@@ -898,9 +976,10 @@ class BinanceExecutor(Executor):
                 "test_order": True,
                 "symbol": symbol.upper(),
                 "side": side.lower(),
-                "type": type.lower(),
-                "qty": float(qty_adj or 0.0),
-                "price": float(price_adj or 0.0) if price_adj else None,
+                "type": norm_type,
+                "qty": float(qty_adj or 0.0) if qty_adj is not None else None,
+                "price": float(price_adj) if price_adj is not None else None,
+                "stop_price": float(stop_adj) if stop_adj is not None else None,
                 "status": "TEST_OK",
                 "raw": resp,
             }
@@ -919,10 +998,14 @@ class BinanceExecutor(Executor):
         # цена для отчёта: limit → price_adj, market → avg_fill_price (или price из ответа)
         avg_px = self._avg_fill_price(resp)
         out_price = None
-        if type_u == "LIMIT":
+        if type_u in {"LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"}:
             out_price = float(resp.get("price") or (price_adj or 0.0) or 0.0)
         else:
             out_price = float(avg_px or 0.0)
+
+        stop_price_out = resp.get("stopPrice")
+        if stop_price_out is None and stop_adj is not None:
+            stop_price_out = stop_adj
 
         return {
             "exchange": "binance",
@@ -931,12 +1014,13 @@ class BinanceExecutor(Executor):
             "client_order_id": str(resp.get("clientOrderId") or client_order_id),
             "symbol": symbol.upper(),
             "side": side.lower(),
-            "type": type.lower(),
+            "type": norm_type,
             "price": out_price,
             "qty": float(resp.get("origQty") or (qty_adj or 0.0) or 0.0),
             "executed_qty": float(resp.get("executedQty") or 0.0),
             "cummulative_quote": float(resp.get("cummulativeQuoteQty") or 0.0),
             "status": resp.get("status") or "NEW",
+            "stop_price": float(stop_price_out) if stop_price_out is not None else None,
             "raw": resp,
         }
 

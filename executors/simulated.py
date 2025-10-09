@@ -106,6 +106,7 @@ class SimulatedExecutor:
             type=entry_type,
             qty=qty,
             price=entry_price,
+            stop_price=None,
             timeInForce=timeInForce,
             client_order_id=client_order_id,
             quote_qty=quote_qty,
@@ -122,6 +123,7 @@ class SimulatedExecutor:
         type: str = "market",
         qty: Optional[float] = None,
         price: Optional[float] = None,
+        stop_price: Optional[float] = None,
         timeInForce: Optional[str] = None,
         client_order_id: Optional[str] = None,
         quote_qty: Optional[float] = None,
@@ -129,13 +131,29 @@ class SimulatedExecutor:
         symbol = str(symbol).upper().replace(" ", "")
         side = str(side).lower()
         typ = str(type).lower()
+        aliases = {
+            "stop": "stop_limit",
+            "stop_loss_limit": "stop_limit",
+            "stop_loss": "stop_market",
+            "take_profit": "take_profit_market",
+        }
+        typ = aliases.get(typ, typ)
 
         # текущая/лимитная цена
-        px = float(price) if (typ == "limit" and price is not None) else float(await self.get_price(symbol))
+        current = float(await self.get_price(symbol))
+        trigger = float(stop_price) if stop_price is not None else current
+        if typ == "limit":
+            px = float(price) if price is not None else current
+        elif typ in {"stop_limit", "take_profit_limit"}:
+            px = float(price) if price is not None else trigger
+        elif typ in {"stop_market", "take_profit_market"}:
+            px = trigger
+        else:
+            px = current
 
         # если передали quote_qty — сконвертим в базовую
         if (qty is None or float(qty) <= 0.0) and quote_qty is not None:
-            qty = float(quote_qty) / px
+            qty = float(quote_qty) / px if px > 0 else float(quote_qty)
         if qty is None or qty <= 0:
             raise ValueError("qty must be positive in simulator")
 
@@ -177,6 +195,7 @@ class SimulatedExecutor:
             "price": px,
             "qty": qty,
             "status": "FILLED",
+            "stop_price": float(stop_price) if stop_price is not None else None,
             "raw": {
                 "mock": True,
                 "orderId": order_id,
