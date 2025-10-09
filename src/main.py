@@ -8,7 +8,7 @@ import uuid
 import logging
 import asyncio
 from typing import Literal, Optional, Any, Dict, List
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 try:
@@ -27,6 +27,17 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response, PlainTextResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Локальные импорты, требующиеся до инициализации логирования
+# ──────────────────────────────────────────────────────────────────────────────
+from utils.structured_logging import (
+    configure_structured_logging,
+    current_trace_id,
+    get_logger,
+    reset_trace_id,
+    set_trace_id,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # .env
@@ -79,13 +90,6 @@ from db.session import engine, Base, apply_startup_pragmas_and_schema, shutdown_
 from db import crud  # тоже нужно фолбэкам
 
 from monitoring.observability import OBSERVABILITY
-from utils.structured_logging import (
-    configure_structured_logging,
-    current_trace_id,
-    get_logger,
-    reset_trace_id,
-    set_trace_id,
-)
 
 # Роутеры
 try:
@@ -843,7 +847,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"ok": False, "error": str(exc.detail), "path": str(request.url.path), "trace_id": trace_id},
     )
     if token is not None:
-        reset_trace_id(token)
+        with suppress(ValueError):
+            reset_trace_id(token)
         request.state.trace_token = None
     return response
 
@@ -858,7 +863,8 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         content={"ok": False, "error": "Internal Server Error", "path": str(request.url.path), "trace_id": trace_id},
     )
     if token is not None:
-        reset_trace_id(token)
+        with suppress(ValueError):
+            reset_trace_id(token)
         request.state.trace_token = None
     return response
 
