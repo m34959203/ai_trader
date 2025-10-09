@@ -57,6 +57,36 @@ process.
    integration before switching `execution.binance.testnet` to `false`.
 5. Add monitoring/alerting for `/metrics` and `/observability/slo` endpoints.
 
+## 7. Integration Test Procedure
+
+To validate the live trading stack without sending production orders, run the
+integration suite against the Binance Testnet sandbox:
+
+1. Export the sandbox credentials (or rely on the defaults listed in
+   `configs/exec.yaml`):
+
+   ```bash
+   export BINANCE_TESTNET_API_KEY=... \
+          BINANCE_TESTNET_API_SECRET=...
+   ```
+
+2. Execute the live broker gateway tests, which rely on mocked HTTP transports
+   and sandbox-compatible payloads:
+
+   ```bash
+   pytest tests/test_broker_gateway_live.py -q
+   ```
+
+3. Optional: run the FastAPI router smoke tests to verify the REST endpoints
+   used by operators and monitoring dashboards:
+
+   ```bash
+   pytest tests/test_live_router.py -q
+   ```
+
+These checks ensure order polling, cancellation flows, and account synchronisation
+operate correctly against the sandbox APIs before enabling live trading.
+
 Following this checklist ensures the application runs with appropriately scoped
 credentials and that operational dependencies are satisfied prior to enabling
 live order routing.

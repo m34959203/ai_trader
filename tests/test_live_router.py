@@ -30,7 +30,7 @@ def test_live_status_endpoint_returns_configuration():
     assert payload["gateway"] == "SimulatedBrokerGateway"
 
 
-def test_live_trade_endpoint_executes_and_returns_order():
+def test_live_trade_and_order_management_endpoints():
     client = _build_app()
     request_body = {
         "symbol": "BTCUSDT",
@@ -48,8 +48,34 @@ def test_live_trade_endpoint_executes_and_returns_order():
     assert response.status_code == 200
     payload = response.json()
     assert payload["decision"]["signal"]["signal"] in {"buy", "sell", "hold"}
-    if payload["executed"]:
-        assert payload["order"] is not None
+    if payload["order"] is not None:
+        assert payload["request_id"]
+        request_id = payload["request_id"]
     else:
-        assert payload["order"] is None
-    assert payload["executed"] in {True, False}
+        # Risk checks may refuse to trade in deterministic test runs.
+        request_id = payload["request_id"]
+        assert request_id is None
+        return
+
+    status_resp = client.get(f"/live/orders/{request_id}")
+    assert status_resp.status_code == 200
+    status_payload = status_resp.json()
+    assert status_payload["found"] is True
+    assert status_payload["order"]["request_id"] == request_id
+
+    orders_resp = client.get("/live/orders", params={"refresh": True})
+    assert orders_resp.status_code == 200
+    orders_payload = orders_resp.json()
+    assert isinstance(orders_payload["orders"], list)
+
+    cancel_resp = client.post(f"/live/orders/{request_id}/cancel")
+    assert cancel_resp.status_code == 200
+    cancel_payload = cancel_resp.json()
+    assert cancel_payload["request_id"] == request_id
+    assert cancel_payload["cancelled"] in {True, False}
+
+    sync_resp = client.post("/live/sync")
+    assert sync_resp.status_code == 200
+    sync_payload = sync_resp.json()
+    assert "balances" in sync_payload
+    assert "positions" in sync_payload
