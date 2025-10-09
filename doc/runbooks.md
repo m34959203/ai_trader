@@ -50,4 +50,17 @@
   - Daily limits configured in `TradingConfig.risk`.
   - Use `/trading/close_all` for emergency position flattening.
 
+## 5. Compliance: KYC / AML Governance
+- **Counterparty due diligence:** Maintain an up-to-date registry of all brokers, exchanges, and liquidity venues. Collect legal entity identifiers, licensing status, and risk ratings. Re-certify annually and whenever onboarding a new venue.
+- **Customer verification:** When activating client-facing features (signal distribution or managed accounts), enforce KYC tiering: identity verification, proof-of-funds, and sanctions screening via an approved provider (e.g., Refinitiv, ComplyAdvantage). Log verification artefacts in the compliance vault.
+- **AML surveillance:** Stream trade and transfer data into the AML rules engine. Configure red-flag scenarios (structuring, rapid in/out, sanctioned jurisdiction traffic) and auto-escalate alerts to compliance within 24 hours. Retain alert dispositioning records for seven years.
+- **Regulator reporting:** Produce monthly SAR/STR summaries and, where applicable, MiFID II/EMIR transaction reports. Schedule exports via `tasks/compliance/reporting.py` (cron) and archive encrypted copies in WORM storage.
+
+## 6. Change-Management Workflow
+- **Request intake:** All production changes (code, infrastructure, configuration, secret rotation) require a change request ticket with risk impact, rollback plan, and stakeholder approvals.
+- **CAB review:** Convene a weekly Change Advisory Board (engineering lead, security officer, compliance) to review queued changes. Emergency fixes still require a retroactive CAB sign-off.
+- **Implementation controls:** Use feature flags and blue/green deployments where possible. Pre-prod validation must include integration tests (`pytest tests/test_broker_gateway_live.py -q`) and reconciliation dry-runs.
+- **Post-change verification:** Within 24 hours of deployment, confirm health dashboards, trade throughput, and reconciliation status. Document verification evidence in the change ticket and update the release log.
+- **Audit trail:** Persist change metadata (ticket ID, approvers, git SHA, deployment timestamp) in the WORM trade journal alongside operational logs for full traceability.
+
 Keep this document alongside deployment checklists to ensure Stage 2 and Stage 3 runbooks remain up to date.

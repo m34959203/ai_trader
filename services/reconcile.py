@@ -1,9 +1,14 @@
 # services/reconcile.py
 from __future__ import annotations
 
-import os
+import json
 import logging
+import os
 import time
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+from threading import Lock
 from typing import Dict, Any, List, Optional, Literal, Iterable, Tuple
 
 from db import crud_orders
@@ -25,6 +30,92 @@ __all__ = [
     "reconcile_periodic",
     "get_periodic_config_from_env",
 ]
+
+
+@dataclass(slots=True)
+class WormJournalEntry:
+    sequence: int
+    timestamp: int
+    prev_checksum: str
+    payload: Dict[str, Any]
+    checksum: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "timestamp": self.timestamp,
+            "prev_checksum": self.prev_checksum,
+            "payload": dict(self.payload),
+            "checksum": self.checksum,
+        }
+
+
+class WormJournal:
+    """Append-only trade ledger with chained checksums."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = Lock()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _read_last(self) -> Optional[Dict[str, Any]]:
+        if not self._path.exists():
+            return None
+        try:
+            with self._path.open("r", encoding="utf-8") as handle:
+                last_line = ""
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        last_line = line
+                if not last_line:
+                    return None
+                return json.loads(last_line)
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            LOG.warning("Failed to read WORM journal tail: %s", exc)
+            return None
+
+    def _make_entry(self, payload: Dict[str, Any]) -> WormJournalEntry:
+        last = self._read_last()
+        prev_checksum = str(last.get("checksum")) if isinstance(last, dict) else "0" * 64
+        sequence = int(last.get("sequence", 0)) + 1 if isinstance(last, dict) else 1
+        base = {
+            "sequence": sequence,
+            "timestamp": int(time.time() * 1000),
+            "prev_checksum": prev_checksum,
+            "payload": dict(payload),
+        }
+        checksum = sha256(json.dumps(base, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return WormJournalEntry(sequence=sequence, timestamp=base["timestamp"], prev_checksum=prev_checksum, payload=payload, checksum=checksum)
+
+    def append(self, payload: Dict[str, Any]) -> WormJournalEntry:
+        with self._lock:
+            entry = self._make_entry(payload)
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry.to_dict(), sort_keys=True) + "\n")
+            return entry
+
+
+def _worm_journal_path() -> Path:
+    override = os.getenv("WORM_JOURNAL_PATH")
+    if override:
+        return Path(override).expanduser()
+    root = Path(__file__).resolve().parents[1]
+    return root / "state" / "worm" / "trade_journal.log"
+
+
+_WORM_JOURNAL: Optional[WormJournal] = None
+
+
+def _get_worm_journal() -> WormJournal:
+    global _WORM_JOURNAL
+    if _WORM_JOURNAL is None:
+        _WORM_JOURNAL = WormJournal(_worm_journal_path())
+    return _WORM_JOURNAL
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Executor selection (robust to different Sim signatures)
@@ -259,6 +350,13 @@ async def reconcile_positions(
         per_symbol: List[Dict[str, Any]] = []
         planned_actions: List[Dict[str, Any]] = []
         performed_actions: List[Dict[str, Any]] = []
+        worm_detected: List[Dict[str, Any]] = []
+        worm_adjustments: List[Dict[str, Any]] = []
+        try:
+            worm_journal = _get_worm_journal()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOG.error("Failed to initialise WORM journal: %s", exc)
+            worm_journal = None
 
         for sym in symbols_all:
             a = float(actual_map.get(sym, 0.0))
@@ -293,6 +391,23 @@ async def reconcile_positions(
                 }
                 planned_actions.append(action)
 
+                if worm_journal is not None:
+                    try:
+                        entry = worm_journal.append(
+                            {
+                                "event": "reconcile_mismatch",
+                                "symbol": sym,
+                                "actual_qty": a,
+                                "journal_qty": j,
+                                "delta": delta,
+                                "tolerance": tol,
+                                "auto_fix_enabled": bool(auto_fix),
+                            }
+                        )
+                        worm_detected.append(entry.to_dict())
+                    except Exception as exc:  # pragma: no cover - diagnostics only
+                        LOG.error("WORM journal append failed (mismatch %s): %s", sym, exc)
+
         # 4) Авто-фиксация журнала (без торгов на бирже!)
         if mismatches and auto_fix:
             async with get_session() as session:
@@ -311,6 +426,21 @@ async def reconcile_positions(
                         extra_raw={"note": act["note"]},
                     )
                     performed_actions.append(act)
+                    if worm_journal is not None:
+                        try:
+                            entry = worm_journal.append(
+                                {
+                                    "event": "auto_adjustment",
+                                    "symbol": act["symbol"],
+                                    "side": act["side"],
+                                    "qty": float(act["qty"]),
+                                    "reason": act["reason"],
+                                    "note": act["note"],
+                                }
+                            )
+                            worm_adjustments.append(entry.to_dict())
+                        except Exception as exc:  # pragma: no cover - diagnostics only
+                            LOG.error("WORM journal append failed (adjustment %s): %s", act["symbol"], exc)
             LOG.info("Reconcile auto-fix applied (%d records)", len(performed_actions))
         elif mismatches:
             LOG.warning("RECONCILE: %d mismatches found (auto_fix=%s)", len(mismatches), auto_fix)
@@ -333,6 +463,11 @@ async def reconcile_positions(
             },
             "positions": actual_positions,
             "balance": actual_balance,
+            "worm_journal": {
+                "path": str(worm_journal.path) if worm_journal is not None else None,
+                "mismatches": worm_detected,
+                "adjustments": worm_adjustments,
+            },
             "meta": {
                 "mode": mode,
                 "testnet": testnet,
