@@ -19,6 +19,8 @@ from urllib.parse import urlencode
 
 import httpx
 
+from monitoring.observability import OBSERVABILITY
+
 OrderSide = str
 OrderType = str
 OrderStatus = str
@@ -330,24 +332,52 @@ class BinanceBrokerGateway:
         if signed:
             payload = self._signed_params(payload)
 
+        operation = f"{method.upper()} {path}"
+        start = self._time()
         try:
             if method.upper() in {"GET", "DELETE"}:
                 response = self._client.request(method, path, params=payload)
             else:
                 response = self._client.request(method, path, data=payload)
         except httpx.HTTPError as exc:  # pragma: no cover - network failures mocked in tests
+            OBSERVABILITY.record_broker_latency(
+                broker="binance",
+                operation=operation,
+                latency=self._time() - start,
+                status="http_error",
+            )
             raise BrokerGatewayError(f"HTTP error calling Binance: {exc}") from exc
 
+        latency = self._time() - start
         if response.status_code >= 400:
             try:
                 detail = response.json()
             except Exception:
                 detail = response.text
+            OBSERVABILITY.record_broker_latency(
+                broker="binance",
+                operation=operation,
+                latency=latency,
+                status=f"error_{response.status_code}",
+            )
             raise BrokerGatewayError(f"Binance error {response.status_code}: {detail}")
         try:
-            return response.json()
+            data = response.json()
         except ValueError as exc:  # pragma: no cover - defensive
+            OBSERVABILITY.record_broker_latency(
+                broker="binance",
+                operation=operation,
+                latency=latency,
+                status="decode_error",
+            )
             raise BrokerGatewayError("Failed to decode Binance response") from exc
+        OBSERVABILITY.record_broker_latency(
+            broker="binance",
+            operation=operation,
+            latency=latency,
+            status="success",
+        )
+        return data
 
     def _signed_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         payload = {key: self._normalise_param(value) for key, value in params.items()}

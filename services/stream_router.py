@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
+from logging import Logger
 from typing import AsyncIterator, Dict, Iterable, List, Optional, Set, Tuple
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -11,6 +11,8 @@ from typing import AsyncIterator, Dict, Iterable, List, Optional, Set, Tuple
 # ──────────────────────────────────────────────────────────────────────────────
 from ai_trader.sources.binance_ws import BinanceWS
 from ai_trader.sources.binance import fetch as fetch_klines_sync, BinanceREST
+from monitoring.observability import OBSERVABILITY
+from utils.structured_logging import get_logger
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Конфигурация, типы
@@ -59,6 +61,29 @@ K = Tuple[str, str]  # (symbol, interval)
 # ──────────────────────────────────────────────────────────────────────────────
 # Вспомогательные
 # ──────────────────────────────────────────────────────────────────────────────
+_INTERVAL_BASE_SECONDS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+}
+
+
+def _interval_to_seconds(interval: str) -> Optional[int]:
+    try:
+        unit = interval[-1]
+        value = int(interval[:-1])
+    except (ValueError, IndexError):  # pragma: no cover - defensive parsing
+        return None
+    if unit == "M":  # month (approximate 30 days)
+        return value * 30 * 86400
+    base = _INTERVAL_BASE_SECONDS.get(unit)
+    if base is None:
+        return None
+    return value * base
+
+
 def _bar_key(symbol: str, interval: str, ts_sec: int) -> Tuple[str, str, int]:
     return (symbol.upper(), interval, int(ts_sec))
 
@@ -105,12 +130,12 @@ class StreamRouter:
         self,
         cfg: StreamConfig,
         *,
-        logger: Optional[logging.Logger] = None,
+        logger: Optional[Logger] = None,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
     ) -> None:
         self.cfg = cfg
-        self._log = logger or logging.getLogger("ai_trader.stream_router")
+        self._log = logger or get_logger("ai_trader.stream_router")
         self._stop = asyncio.Event()
 
         # Последний известный закрытый бар (по open_time, сек) на ключ (symbol, tf)
@@ -127,7 +152,7 @@ class StreamRouter:
             api_key=api_key,
             api_secret=api_secret,
             testnet=cfg.testnet,
-            logger=logging.getLogger("ai_trader.binance.ws"),
+            logger=get_logger("ai_trader.binance.ws"),
         )
 
         # REST для listenKey (если нужен user stream в другой части приложения)
@@ -135,7 +160,7 @@ class StreamRouter:
             api_key=api_key or "",
             api_secret=api_secret or None,
             testnet=cfg.testnet,
-            logger=logging.getLogger("ai_trader.binance.rest"),
+            logger=get_logger("ai_trader.binance.rest"),
         )
 
         # фоновые задачи
@@ -168,6 +193,15 @@ class StreamRouter:
                 bar = await self._queue.get()
                 yield bar
                 self._queue.task_done()
+        except Exception as exc:
+            self._log.exception("StreamRouter run failed: %r", exc)
+            OBSERVABILITY.record_thread_failure(
+                thread="stream_router",
+                stage="run",
+                recovered=False,
+                reason=str(exc),
+            )
+            raise
         finally:
             await self.stop()
 
@@ -212,6 +246,12 @@ class StreamRouter:
                 raise
             except Exception as e:
                 self._log.warning("WS phase failed: %r → fallback to REST polling", e)
+                OBSERVABILITY.record_thread_failure(
+                    thread="stream_router",
+                    stage="ws_loop",
+                    recovered=True,
+                    reason=str(e),
+                )
 
                 # Fallback REST-пулинг до следующей попытки WS
                 await self._rest_poll_until(lambda: self._stop.is_set(), poll_sec=self.cfg.rest_poll_sec)
@@ -404,7 +444,33 @@ class StreamRouter:
         # всё ок — «видели» и продвигаем
         self._seen.add(triple)
         self._last_closed_ts[key] = bar.ts
+        self._record_market_quality(bar, last_ts)
         return True
+
+    def _record_market_quality(self, bar: Bar, last_ts: int) -> None:
+        interval_seconds = _interval_to_seconds(bar.tf)
+        missing_bars = 0
+        if interval_seconds and last_ts > 0:
+            gap = bar.ts - last_ts
+            if gap > interval_seconds:
+                missing_bars = max(0, (gap // interval_seconds) - 1)
+        staleness = max(time.time() - bar.ts, 0.0)
+        freshness_penalty = 0.0
+        if interval_seconds:
+            if staleness > interval_seconds * 5:
+                freshness_penalty = 0.4
+            elif staleness > interval_seconds * 2:
+                freshness_penalty = 0.2
+        score = 1.0 - (0.2 * missing_bars) - freshness_penalty
+        score = max(0.0, min(1.0, score))
+        OBSERVABILITY.record_market_data_quality(
+            source=bar.source or "binance",
+            symbol=bar.asset,
+            interval=bar.tf,
+            score=score,
+            staleness_seconds=staleness,
+            missing_bars=missing_bars,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

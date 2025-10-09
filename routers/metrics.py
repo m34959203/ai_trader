@@ -17,3 +17,18 @@ async def prometheus_metrics() -> Response:
 @router.get("/observability/slo")
 async def slo_status() -> dict:
     return {"slos": OBSERVABILITY.slo_report()}
+
+
+@router.get("/observability/broker-latency")
+async def broker_latency_snapshot() -> dict:
+    return OBSERVABILITY.broker_latency_snapshot()
+
+
+@router.get("/observability/thread-health")
+async def thread_health_snapshot() -> dict:
+    return OBSERVABILITY.thread_failure_snapshot()
+
+
+@router.get("/observability/market-data")
+async def market_data_snapshot() -> dict:
+    return OBSERVABILITY.market_data_snapshot()

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -26,10 +25,10 @@ from services.auto_heal import AutoHealingOrchestrator, StateSnapshot
 from services.model_router import router_singleton
 from services.security import AccessController, Role, SecretVault, TwoFactorGuard
 from utils.assets import load_assets
-from utils.logging_utils import install_sensitive_filter
 from utils.risk_config import load_risk_config
 from src.models.base import MarketFeatures
 from src.utils_math import clamp01
+from utils.structured_logging import get_logger
 try:
     # Необязательная зависимость (если добавляли ранее)
     from risk.risk_manager import (
@@ -78,7 +77,7 @@ except Exception:  # pragma: no cover
         used = portfolio_risk_used(pos_list, equity=equity, min_sl_distance_pct=min_sl_distance_pct)
         return (used + float(new_position_risk_fraction)) <= float(portfolio_max_risk_pct)
 
-LOG = logging.getLogger("ai_trader.trading_service")
+LOG = get_logger("ai_trader.trading_service", mask_fields=("api_key", "api_secret"))
 
 T = TypeVar("T")
 
@@ -376,7 +375,6 @@ class TradingService:
         testnet: bool = True,
         config: Optional[Dict[str, Any]] = None,
     ):
-        install_sensitive_filter(LOG, fields=("api_key", "api_secret"))
         self._assets = load_assets()
         self._auto_healer = AutoHealingOrchestrator()
         self._auto_heal_tasks: Set[asyncio.Task[Any]] = set()
@@ -485,6 +483,16 @@ class TradingService:
                 pass
             except Exception as exc:  # pragma: no cover - diagnostic logging
                 LOG.debug("Auto-heal task finished with error: %r", exc)
+                try:
+                    stage = getattr(done.get_coro(), "__name__", "auto_heal_task")
+                except Exception:  # pragma: no cover - defensive
+                    stage = "auto_heal_task"
+                OBSERVABILITY.record_thread_failure(
+                    thread="auto_heal",
+                    stage=stage,
+                    recovered=False,
+                    reason=str(exc),
+                )
 
         task.add_done_callback(_on_done)
         self._auto_heal_tasks.add(task)
@@ -495,6 +503,12 @@ class TradingService:
                 mode=payload.get("mode"),
                 testnet=payload.get("testnet"),
                 config=payload.get("config"),
+            )
+            OBSERVABILITY.record_thread_failure(
+                thread="auto_heal",
+                stage="restore_executor",
+                recovered=True,
+                reason=None,
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             LOG.debug("Auto-heal restore failed: %r", exc)
@@ -510,6 +524,7 @@ class TradingService:
             return await func(self._executor)
         except Exception as exc:
             LOG.warning("Primary executor failure during %s: %r", context, exc)
+            failure_reason = repr(exc)
             snapshot_payload = {
                 "context": context,
                 "mode": self._mode,
@@ -525,6 +540,12 @@ class TradingService:
             self._schedule_auto_heal_task(self._auto_healer.trigger("trading_executor", snapshot_payload))
             if not allow_ui or self._mode == "ui":
                 OBSERVABILITY.record_failover(context=context, recovered=False)
+                OBSERVABILITY.record_thread_failure(
+                    thread="execution_failover",
+                    stage=context,
+                    recovered=False,
+                    reason=failure_reason,
+                )
                 raise
             self._failover_count += 1
             ui = self._get_ui_executor()
@@ -535,9 +556,16 @@ class TradingService:
                 return result
             except Exception as ui_exc:
                 LOG.error("UI failover failed during %s: %r", context, ui_exc)
+                failure_reason = f"primary={failure_reason}; ui={ui_exc!r}"
                 raise
             finally:
                 OBSERVABILITY.record_failover(context=context, recovered=recovered)
+                OBSERVABILITY.record_thread_failure(
+                    thread="execution_failover",
+                    stage=context,
+                    recovered=recovered,
+                    reason=None if recovered else failure_reason,
+                )
 
     async def _swap_executor_if_needed(
         self,

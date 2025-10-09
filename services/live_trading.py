@@ -9,14 +9,16 @@ decision together with the broker acknowledgement.
 
 from __future__ import annotations
 
-import logging
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
 from services.broker_gateway import BrokerGateway, BrokerGatewayError, OrderRequest, OrderResponse
 from services.trading_service import decide_and_execute, evaluate_pre_trade_controls
 
-LOG = logging.getLogger("ai_trader.live_trading")
+from utils.structured_logging import get_logger
+
+
+LOG = get_logger("ai_trader.live_trading")
 
 
 class LiveTradingCoordinator:

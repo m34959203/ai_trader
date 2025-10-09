@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import time
 from dataclasses import dataclass
@@ -22,7 +21,10 @@ try:  # optional simulated executor
 except Exception:  # pragma: no cover
     _HAS_SIM = False
 
-LOG = logging.getLogger("ai_trader.reconcile")
+from utils.structured_logging import get_logger
+
+
+LOG = get_logger("ai_trader.reconcile")
 
 __all__ = [
     "reconcile_positions",
