@@ -223,6 +223,13 @@ def _map_exc(e: Exception) -> JSONResponse:
         status = getattr(e, "status_code", 400) or 400
         code = getattr(e, "code", None)
         msg = getattr(e, "msg", str(e)) or repr(e)
+        if int(status) == 451:
+            friendly = (
+                "Binance API недоступен из вашего региона (HTTP 451). "
+                "Переключитесь в режим симуляции или используйте VPN/другой доступ."
+            )
+            details = {"message": friendly, "original": msg}
+            return _err("binance_restricted_location", http=int(status), code=code, error=details)
         return _err("binance_error", http=int(status), code=code, error={"message": msg})
     return _err("exec_error", http=400, error={"message": (str(e) or repr(e))})
 

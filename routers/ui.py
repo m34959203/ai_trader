@@ -140,6 +140,41 @@ def _unwrap_json(resp: Any) -> Dict[str, Any]:
         return resp
     return {}
 
+
+def _extract_error_info(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("error")
+    if not kind:
+        return None
+    details = payload.get("details")
+    message: Optional[str] = None
+    original: Optional[str] = None
+    if isinstance(details, dict):
+        raw_msg = details.get("message")
+        message = raw_msg if isinstance(raw_msg, str) else None
+        raw_original = details.get("original")
+        if isinstance(raw_original, str):
+            original = raw_original
+        elif isinstance(raw_msg, str):
+            original = raw_msg
+    if message is None:
+        msg_field = payload.get("message")
+        if isinstance(msg_field, str):
+            message = msg_field
+    if message is None:
+        detail_field = payload.get("detail")
+        if isinstance(detail_field, str):
+            message = detail_field
+    if message is None and isinstance(original, str):
+        message = original
+    return {
+        "kind": str(kind),
+        "message": message,
+        "code": payload.get("code"),
+        "original": original,
+    }
+
 def _to_float(v: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(v)
@@ -269,6 +304,21 @@ async def partial_balance(
     try:
         raw = await _with_timeout(_get_balance(mode=mode, testnet=testnet), BAL_POS_TIMEOUT)
         payload = _unwrap_json(raw)
+        err_info = _extract_error_info(payload)
+        if err_info:
+            _LAST_DIGEST.pop(f"balance:{mode}:{testnet}", None)
+            message = err_info.get("message") or "Не удалось получить баланс: ошибка брокера"
+            original = err_info.get("original")
+            if original and original not in message:
+                message = f"{message} (Binance: {original})"
+            sig_err = {
+                "kind": err_info.get("kind"),
+                "code": err_info.get("code"),
+                "message": message,
+            }
+            if (r := _maybe_204(request, f"balance_error:{mode}:{testnet}", sig_err)) is not None:
+                return r
+            return _error_fragment("balance", message)
         data = payload.get("data") or payload or {}
 
         balance_src = data.get("balance") or {}
@@ -324,6 +374,7 @@ async def partial_balance(
             "_demo": False,
         }
 
+        _LAST_DIGEST.pop(f"balance_error:{mode}:{testnet}", None)
         # Подпись «существенных» полей для 204
         sig = {
             "exchange": bal["exchange"],
@@ -378,9 +429,25 @@ async def partial_positions(
     try:
         raw = await _with_timeout(_list_positions(mode=mode, testnet=testnet), BAL_POS_TIMEOUT)
         payload = _unwrap_json(raw)
+        err_info = _extract_error_info(payload)
+        if err_info:
+            _LAST_DIGEST.pop(f"positions:{mode}:{testnet}", None)
+            message = err_info.get("message") or "Не удалось получить позиции: ошибка брокера"
+            original = err_info.get("original")
+            if original and original not in message:
+                message = f"{message} (Binance: {original})"
+            sig_err = {
+                "kind": err_info.get("kind"),
+                "code": err_info.get("code"),
+                "message": message,
+            }
+            if (r := _maybe_204(request, f"positions_error:{mode}:{testnet}", sig_err)) is not None:
+                return r
+            return _error_fragment("positions", message)
         data = payload.get("data") or payload
         positions = data.get("positions") or payload.get("positions") or []
 
+        _LAST_DIGEST.pop(f"positions_error:{mode}:{testnet}", None)
         # 204, если состав позиций не изменился
         sig = _positions_signature(positions)
         if (r := _maybe_204(request, f"positions:{mode}:{testnet}", sig)) is not None:

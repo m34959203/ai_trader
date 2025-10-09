@@ -169,6 +169,12 @@ class _BinanceSpotClient:
         self._all_tickers_cache: Dict[str, Tuple[Decimal, float]] = {}
         self._all_tickers_ttl: float = 2.0
 
+        # HTTP 451 (restricted location) guard
+        self._restricted_error: Optional[BinanceAPIError] = None
+        self._restricted_block_until: float = 0.0
+        self._restricted_block_ttl: float = 300.0  # 5 минут "тишины" перед повторами
+        self._restricted_notice_logged: bool = False
+
     async def close(self) -> None:
         try:
             await self._client.aclose()
@@ -216,6 +222,9 @@ class _BinanceSpotClient:
         now = time.time()
         if (now - self._last_sync_ts) < self._sync_interval_sec:
             return
+        if self._restricted_error is not None and now < self._restricted_block_until:
+            # Уже знаем про блокировку по гео — не шлём лишние запросы
+            return
         try:
             resp = await self._client.get(f"{API_PREFIX}/time")
             resp.raise_for_status()
@@ -226,6 +235,11 @@ class _BinanceSpotClient:
             self._last_sync_ts = now
             LOG.debug("Binance time synced, offset_ms=%d", self._time_offset_ms)
         except Exception as e:
+            if isinstance(e, httpx.HTTPStatusError) and getattr(e, "response", None) is not None:
+                status = e.response.status_code
+                if status == 451:
+                    err = self._parse_error(status, e.response.text, dict(e.response.headers))
+                    self._mark_restricted_location(err)
             LOG.warning("Binance time sync failed: %r", e)
 
     # ---- подпись ----
@@ -304,6 +318,27 @@ class _BinanceSpotClient:
           - 429/-1003/-1015           → экспоненциальный бэкофф (+ Retry-After)
           - сетевые ошибки            → экспоненциальный бэкофф
         """
+        now = time.time()
+        if self._restricted_block_until and now >= self._restricted_block_until:
+            self._restricted_block_until = 0.0
+            self._restricted_error = None
+            self._restricted_notice_logged = False
+
+        if self._restricted_error is not None and now < self._restricted_block_until:
+            err = self._restricted_error
+            LOG.debug(
+                "Binance request %s %s short-circuited due to restricted location block",
+                method,
+                path,
+            )
+            raise BinanceAPIError(
+                err.status_code,
+                err.code,
+                err.msg,
+                payload=err.payload,
+                headers=err.headers,
+            )
+
         await self._sync_server_time()
 
         attempt = 0
@@ -337,6 +372,9 @@ class _BinanceSpotClient:
                     await _sleep_async(sleep_s)
                     continue
 
+                if status == 451:
+                    self._mark_restricted_location(e)
+
                 LOG.error("Binance API error (no-retry): %s", e)
                 raise
 
@@ -350,6 +388,23 @@ class _BinanceSpotClient:
                     await _sleep_async(sleep_s)
                     continue
                 raise
+
+    def _mark_restricted_location(self, err: BinanceAPIError) -> None:
+        """Запоминаем ошибку гео-блокировки, чтобы не заспамить API."""
+        self._restricted_error = BinanceAPIError(
+            err.status_code,
+            err.code,
+            err.msg,
+            payload=getattr(err, "payload", None),
+            headers=getattr(err, "headers", None),
+        )
+        self._restricted_block_until = time.time() + self._restricted_block_ttl
+        if not self._restricted_notice_logged:
+            LOG.error(
+                "Binance API access blocked (HTTP 451). Suppressing further requests for %.0fs.",
+                self._restricted_block_ttl,
+            )
+            self._restricted_notice_logged = True
 
     # -------- Публичные утилиты (с кэшом) --------
     async def ping(self) -> None:

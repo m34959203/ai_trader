@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import pytest
 from httpx import AsyncClient, ASGITransport
+from fastapi.responses import JSONResponse
 
 # ВАЖНО: включаем UI ДО импорта приложения
 os.environ.setdefault("FEATURE_UI", "1")
@@ -78,6 +79,20 @@ async def _fake_last_orders(*_, **__):
     ]
 
 
+async def _restricted_error_response(*_, **__):
+    return JSONResponse(
+        status_code=451,
+        content={
+            "error": "binance_restricted_location",
+            "code": 0,
+            "details": {
+                "message": "Binance API недоступен из вашего региона (HTTP 451). Переключитесь в режим симуляции или используйте VPN/другой доступ.",
+                "original": "Binance API error 451 (code=0): Service unavailable from a restricted location",
+            },
+        },
+    )
+
+
 # ----------------------------
 # Тесты
 # ----------------------------
@@ -110,6 +125,20 @@ async def test_ui_partial_balance_ok(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ui_partial_balance_restricted(monkeypatch):
+    import routers.ui as ui
+
+    monkeypatch.setattr(ui, "_get_balance", _restricted_error_response)
+
+    async with _client() as ac:
+        r = await ac.get("/ui/partials/balance", params={"mode": "binance", "testnet": "false"})
+        assert r.status_code == 200, r.text
+        body = r.text
+        assert "Binance API недоступен из вашего региона" in body
+        assert "restricted location" in body
+
+
+@pytest.mark.asyncio
 async def test_ui_partial_positions_ok(monkeypatch):
     import routers.ui as ui
     monkeypatch.setattr(ui, "_list_positions", _fake_positions)
@@ -120,6 +149,20 @@ async def test_ui_partial_positions_ok(monkeypatch):
         body = r.text
         # Должны увидеть контейнер или один из тикеров
         assert ('id="positions"' in body) or ("BTCUSDT" in body) or ("ETHUSDT" in body)
+
+
+@pytest.mark.asyncio
+async def test_ui_partial_positions_restricted(monkeypatch):
+    import routers.ui as ui
+
+    monkeypatch.setattr(ui, "_list_positions", _restricted_error_response)
+
+    async with _client() as ac:
+        r = await ac.get("/ui/partials/positions", params={"mode": "binance", "testnet": "false"})
+        assert r.status_code == 200, r.text
+        body = r.text
+        assert "Binance API недоступен из вашего региона" in body
+        assert "restricted location" in body
 
 
 @pytest.mark.asyncio
