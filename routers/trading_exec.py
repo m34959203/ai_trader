@@ -62,7 +62,30 @@ except Exception:
         async def open_order(self, **kwargs):
             symbol = (kwargs.get("symbol") or "BTCUSDT").upper()
             side = (kwargs.get("side") or "buy").lower()
-            qty = float(kwargs.get("qty") or kwargs.get("quote_qty") or 0)
+            typ = (kwargs.get("type") or "market").lower()
+            aliases = {
+                "stop": "stop_limit",
+                "stop_loss_limit": "stop_limit",
+                "stop_loss": "stop_market",
+                "take_profit": "take_profit_market",
+            }
+            typ = aliases.get(typ, typ)
+            stop_price = kwargs.get("stop_price")
+            price = kwargs.get("price")
+            if typ in {"stop_limit", "take_profit_limit"}:
+                price = price if price is not None else stop_price
+            if typ in {"stop_market", "take_profit_market"}:
+                price = stop_price if stop_price is not None else price
+            price_f = float(price or 60000.0)
+
+            qty_val = kwargs.get("qty")
+            if (qty_val is None or float(qty_val or 0) <= 0) and kwargs.get("quote_qty") is not None:
+                quote = float(kwargs.get("quote_qty") or 0)
+                qty_val = quote / price_f if price_f else quote
+            qty = float(qty_val or 0)
+            if qty <= 0:
+                qty = 0.001
+
             order_id = f"sim-{os.urandom(3).hex()}"
             return {
                 "exchange": "sim",
@@ -71,9 +94,10 @@ except Exception:
                 "client_order_id": kwargs.get("client_order_id"),
                 "symbol": symbol,
                 "side": side,
-                "type": (kwargs.get("type") or "market").lower(),
-                "price": float(kwargs.get("price") or 60000.0),
+                "type": typ,
+                "price": price_f,
                 "qty": qty,
+                "stop_price": float(stop_price) if stop_price is not None else None,
                 "status": "FILLED",
                 "protection": {"sl_price": kwargs.get("sl_price"), "tp_price": kwargs.get("tp_price")},
                 "raw": {"mock": True, "orderId": order_id, "clientOrderId": kwargs.get("client_order_id")},
@@ -268,6 +292,7 @@ def _merge_params(
     side: Optional[str],
     qty: Optional[float],
     price: Optional[float],
+    stop_price: Optional[float],
     type_default: str,
     timeInForce: Optional[str],
     body: Optional[Dict[str, Any]],
@@ -278,6 +303,7 @@ def _merge_params(
         "side": (side if side is not None else payload.get("side")),
         "qty": (qty if qty is not None else payload.get("qty")),
         "price": (price if price is not None else payload.get("price")),
+        "stop_price": (stop_price if stop_price is not None else payload.get("stop_price") or payload.get("stopPrice")),
         "type": (payload.get("type") or type_default),
         "timeInForce": (timeInForce if timeInForce is not None else payload.get("timeInForce")),
         "client_order_id": payload.get("clientOrderId") or payload.get("client_order_id"),
@@ -498,10 +524,21 @@ async def _estimate_equity_usdt(executor) -> float:
 
     return float(total + add)
 
-async def _entry_price_for_order(executor, *, symbol: str, order_type: str, provided_price: Optional[float]) -> Optional[float]:
+async def _entry_price_for_order(
+    executor,
+    *,
+    symbol: str,
+    order_type: str,
+    provided_price: Optional[float],
+    stop_price: Optional[float] = None,
+) -> Optional[float]:
     t = (order_type or "market").lower()
     if t == "limit" and provided_price is not None:
         return float(provided_price)
+    if t in {"stop_limit", "take_profit_limit"} and provided_price is not None:
+        return float(provided_price)
+    if t in {"stop_market", "take_profit_market"} and stop_price is not None:
+        return float(stop_price)
     for name in ("get_price", "get_ticker_price", "price"):
         m = getattr(executor, name, None)
         if callable(m):
@@ -712,9 +749,21 @@ async def open_order(
     # query/body
     symbol: Optional[str] = Query(None),
     side: Optional[Literal["buy", "sell"]] = Query(None),
-    type: Literal["market", "limit"] = Query("market"),
+    type: Literal[
+        "market",
+        "limit",
+        "stop_limit",
+        "stop_market",
+        "take_profit_limit",
+        "take_profit_market",
+        "stop",
+        "stop_loss",
+        "stop_loss_limit",
+        "take_profit",
+    ] = Query("market"),
     qty: Optional[float] = Query(None),
     price: Optional[float] = Query(None),
+    stop_price: Optional[float] = Query(None, description="Stop trigger price for stop/TP orders"),
     quote_qty_q: Optional[float] = Query(None, alias="quote_qty", description="MARKET: сумма в квоте (например, 10 USDT)"),
     timeInForce: Optional[str] = Query(None, description="Напр. GTC для LIMIT"),
 
@@ -730,7 +779,14 @@ async def open_order(
     session: AsyncSession = Depends(get_session) if get_session else None,  # type: ignore
 ):
     p = _merge_params(
-        symbol=symbol, side=side, qty=qty, price=price, type_default=type, timeInForce=timeInForce, body=body
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        price=price,
+        stop_price=stop_price,
+        type_default=type,
+        timeInForce=timeInForce,
+        body=body,
     )
     if quote_qty_q is not None:
         p["quote_qty"] = quote_qty_q
@@ -742,13 +798,46 @@ async def open_order(
     # валидация
     if not p["symbol"] or not p["side"]:
         return _err("validation", http=422, error={"message": "symbol and side are required"})
-    t = (p["type"] or "market").lower()
+    raw_type = (p["type"] or "market").lower()
+    type_aliases = {
+        "stop": "stop_limit",
+        "stop_loss_limit": "stop_limit",
+        "stop_loss": "stop_market",
+        "take_profit": "take_profit_market",
+    }
+    t = type_aliases.get(raw_type, raw_type)
+    p["type"] = t
     if t == "limit":
         if p["qty"] is None or p["price"] is None:
             return _err("validation", http=422, error={"message": "LIMIT order requires both qty and price"})
     elif t == "market":
         if p["qty"] is None and p["quote_qty"] is None and p.get("sl_price") is None and p.get("sl_pct") is None:
-            return _err("validation", http=422, error={"message": "MARKET order requires qty or quote_qty (or sl to autosize)"} )
+            return _err(
+                "validation",
+                http=422,
+                error={"message": "MARKET order requires qty or quote_qty (or sl to autosize)"},
+            )
+    elif t in {"stop_limit", "take_profit_limit"}:
+        if p["qty"] is None or p.get("price") is None or p.get("stop_price") is None:
+            return _err(
+                "validation",
+                http=422,
+                error={"message": "STOP LIMIT order requires qty, price and stop_price"},
+            )
+    elif t in {"stop_market", "take_profit_market"}:
+        if p.get("stop_price") is None:
+            return _err("validation", http=422, error={"message": "STOP MARKET order requires stop_price"})
+        if (
+            p.get("qty") is None
+            and p.get("quote_qty") is None
+            and p.get("sl_price") is None
+            and p.get("sl_pct") is None
+        ):
+            return _err(
+                "validation",
+                http=422,
+                error={"message": "STOP MARKET order requires qty or quote_qty (or sl to autosize)"},
+            )
     else:
         return _err("validation", http=422, error={"message": "Unsupported order type"})
 
@@ -821,7 +910,13 @@ async def open_order(
     # autosizing / SL-TP
     qty_adjusted = False
     risk_note = None
-    entry_price = await _entry_price_for_order(ex, symbol=p["symbol"], order_type=p["type"], provided_price=p.get("price"))
+    entry_price = await _entry_price_for_order(
+        ex,
+        symbol=p["symbol"],
+        order_type=p["type"],
+        provided_price=p.get("price"),
+        stop_price=p.get("stop_price"),
+    )
     final_sl_price = None
     final_tp_price = p.get("tp_price")
 
@@ -870,7 +965,7 @@ async def open_order(
     try:
         async with asyncio.timeout(min(20.0, DEFAULT_OP_TIMEOUT + 5)):
             open_with_protection = getattr(ex, "open_with_protection", None)
-            if callable(open_with_protection):
+            if callable(open_with_protection) and p["type"] in {"market", "limit"}:
                 result = await open_with_protection(
                     symbol=p["symbol"],
                     side=p["side"],
@@ -890,6 +985,7 @@ async def open_order(
                     type=p["type"],
                     qty=p.get("qty"),
                     price=p.get("price"),
+                    stop_price=p.get("stop_price"),
                     timeInForce=p.get("timeInForce"),
                     client_order_id=p.get("client_order_id"),
                     quote_qty=p.get("quote_qty"),
@@ -905,6 +1001,7 @@ async def open_order(
             "qty": result.get("qty") or p.get("qty") or p.get("quote_qty"),
             "price": result.get("price") or p.get("price") or entry_price,
             "risk_note": risk_note,
+            "stop_price": result.get("stop_price") or p.get("stop_price"),
             "sl_price": final_sl_price,
             "sl_pct": p.get("sl_pct"),
             "tp_price": final_tp_price,
@@ -947,6 +1044,7 @@ async def open_order(
                     type=p["type"],
                     qty=response.get("qty"),
                     price=response.get("price"),
+                    stop_price=response.get("stop_price"),
                     status=response.get("status"),
                     order_id=response.get("order_id"),
                     client_order_id=response.get("client_order_id"),
@@ -957,6 +1055,7 @@ async def open_order(
                             "type": p["type"],
                             "qty": p.get("qty"),
                             "price": p.get("price"),
+                            "stop_price": p.get("stop_price"),
                             "timeInForce": p.get("timeInForce"),
                             "client_order_id": p.get("client_order_id"),
                             "quote_qty": p.get("quote_qty"),
