@@ -1,22 +1,32 @@
 mode: binance
 
+models:
+  signal: "signal:rf_rule"
+  sentiment: "sentiment:finbert"
+  regime: "regime:kmeans"
+
+risk:
+  per_trade_cap: 0.02  # 2%
+  daily_loss_limit: 0.06
+  risk_pct_per_trade: 0.01
+  daily_max_loss_pct: 0.02
+  max_trades_per_day: 15
+  deadman_max_stale_sec: 90
+  tz_name: Asia/Almaty
+
 binance:
   testnet: true
   base_url: https://testnet.binance.vision
-
-
-
-  recv_window: 10000     
-  timeout: 60             
-  max_retries: 7          
-  backoff_base: 0.75      
-  backoff_cap: 12   
+  recv_window: 10000
+  timeout: 60
+  max_retries: 7
+  backoff_base: 0.75
+  backoff_cap: 12
 
 ohlcv_storage:
   enabled: true
   symbols: [BTCUSDT]
   intervals: [1h]
-      
 
 sim:
   starting_balance_usdt: 10000
@@ -24,10 +34,3 @@ sim:
 
 ui:
   enabled: false
-
-risk:
-  risk_pct_per_trade: 0.01
-  daily_max_loss_pct: 0.02
-  max_trades_per_day: 15
-  deadman_max_stale_sec: 90
-  tz_name: Asia/Almaty

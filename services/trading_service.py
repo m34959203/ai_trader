@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, TypeVar
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, TypeVar, cast
 
 # Совместимые интерфейсы (ожидаемые типы/классы)
 from executors import (  # type: ignore
@@ -23,10 +23,13 @@ from executors import (  # type: ignore
 # Риск-конфиг и утилиты портфельного риска
 from monitoring.observability import OBSERVABILITY
 from services.auto_heal import AutoHealingOrchestrator, StateSnapshot
+from services.model_router import router_singleton
 from services.security import AccessController, Role, SecretVault, TwoFactorGuard
 from utils.assets import load_assets
 from utils.logging_utils import install_sensitive_filter
 from utils.risk_config import load_risk_config
+from src.models.base import MarketFeatures
+from src.utils_math import clamp01
 try:
     # Необязательная зависимость (если добавляли ранее)
     from risk.risk_manager import (
@@ -1112,3 +1115,63 @@ class TradingService:
                 "roles": list(self._access.roles.keys()),
             },
         }
+
+
+def _to_market_features(symbol: str, feats: Dict[str, Any]) -> MarketFeatures:
+    data: Dict[str, Any] = {k: v for k, v in (feats or {}).items() if v is not None}
+    data.setdefault("symbol", symbol)
+    return cast(MarketFeatures, data)
+
+
+def decide_and_execute(symbol: str, feats: Dict[str, Any], news_text: Optional[str] | None = None) -> Dict[str, Any]:
+    """Generate a model-driven decision with Kelly-capped risk sizing."""
+
+    if router_singleton is None:
+        raise RuntimeError("Model router is not initialised")
+
+    features = _to_market_features(symbol, feats)
+    signal = router_singleton.signal(features)
+    sentiment = router_singleton.sentiment(news_text or "")
+    regime = router_singleton.regime(features)
+
+    risk_cfg = router_singleton.risk_config
+    per_trade_cap = float(risk_cfg.get("per_trade_cap", 0.02))
+    daily_loss_limit = float(risk_cfg.get("daily_loss_limit", 0.06))
+
+    base_fraction = clamp01(signal["confidence"] * 0.5)
+    risk_fraction = min(per_trade_cap, per_trade_cap * base_fraction)
+    if signal["signal"] == "hold":
+        risk_fraction = 0.0
+
+    if sentiment["label"] == "neg" or regime["regime"] == "storm":
+        risk_fraction *= 0.5
+
+    price = float(features.get("price", 0.0) or 0.0)
+    atr = float(features.get("atr", 0.0) or 0.0)
+    atr_pct = clamp01(atr / price) if price > 0 else 0.0
+    if atr_pct > 0:
+        risk_fraction *= clamp01(1.0 - min(0.9, atr_pct))
+
+    equity = float(features.get("equity", feats.get("account_equity", 0.0)) or 0.0)
+    day_pnl = float(features.get("day_pnl", feats.get("daily_pnl", 0.0)) or 0.0)
+
+    trading_blocked = False
+    if equity > 0 and day_pnl <= -daily_loss_limit * equity:
+        trading_blocked = True
+        risk_fraction = 0.0
+
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "sentiment": sentiment,
+        "regime": regime,
+        "risk_fraction": float(risk_fraction),
+        "trading_blocked": trading_blocked,
+        "limits": {
+            "per_trade_cap": per_trade_cap,
+            "daily_loss_limit": daily_loss_limit,
+            "atr_pct": atr_pct,
+            "equity": equity,
+            "day_pnl": day_pnl,
+        },
+    }

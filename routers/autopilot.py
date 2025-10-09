@@ -4,14 +4,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+
+from services.model_router import ModelRouter, router_singleton
+from src.models.base import MarketFeatures
 
 LOG = logging.getLogger("ai_trader.autopilot")
 
-router = APIRouter(prefix="/autopilot", tags=["autopilot"])
+legacy_router = APIRouter(prefix="/autopilot", tags=["autopilot"])
 
 try:  # опциональный модуль авто-трейдера
     from tasks import auto_trader as auto_trader_module  # type: ignore
@@ -195,7 +198,7 @@ async def _stop_task_locked(timeout: float = 10.0) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@router.get("/config", response_model=ConfigResponse)
+@legacy_router.get("/config", response_model=ConfigResponse)
 async def get_autopilot_config() -> ConfigResponse:
     """Вернуть текущий конфиг авто-трейдера."""
     _ensure_runtime()
@@ -203,7 +206,7 @@ async def get_autopilot_config() -> ConfigResponse:
     return ConfigResponse(config=cfg.to_public_dict())
 
 
-@router.put("/config", response_model=ConfigResponse)
+@legacy_router.put("/config", response_model=ConfigResponse)
 async def update_autopilot_config(
     patch: AutoTraderConfigPatch = Body(default_factory=AutoTraderConfigPatch),
     restart: bool = Query(default=False),
@@ -232,7 +235,7 @@ async def update_autopilot_config(
     return ConfigResponse(config=get_config().to_public_dict())
 
 
-@router.post("/start", response_model=StartResponse)
+@legacy_router.post("/start", response_model=StartResponse)
 async def start_autopilot(
     patch: AutoTraderConfigPatch = Body(default_factory=AutoTraderConfigPatch),
     restart: bool = Query(default=False),
@@ -264,7 +267,7 @@ async def start_autopilot(
     return StartResponse(status="started", config=cfg.to_public_dict())
 
 
-@router.post("/stop", response_model=StopResponse)
+@legacy_router.post("/stop", response_model=StopResponse)
 async def stop_autopilot() -> StopResponse:
     """Остановить фоновый цикл авто-трейдера."""
 
@@ -275,7 +278,7 @@ async def stop_autopilot() -> StopResponse:
     return StopResponse(status="stopped" if stopped else "idle")
 
 
-@router.get("/status", response_model=StatusResponse)
+@legacy_router.get("/status", response_model=StatusResponse)
 async def status_autopilot() -> StatusResponse:
     """Получить состояние фонового автотрейдера."""
 
@@ -306,3 +309,61 @@ async def status_autopilot() -> StatusResponse:
 
     return StatusResponse(running=running, task_state=task_state, auto_trader=auto_status)
 
+
+
+class MarketFeaturesPayload(BaseModel):
+    symbol: Optional[str] = Field(default=None, description="Trading symbol")
+    price: Optional[float] = Field(default=None)
+    rsi: Optional[float] = Field(default=None)
+    macd: Optional[float] = Field(default=None)
+    macd_signal: Optional[float] = Field(default=None)
+    atr: Optional[float] = Field(default=None)
+    volume: Optional[float] = Field(default=None)
+    trend_ma_fast: Optional[float] = Field(default=None)
+    trend_ma_slow: Optional[float] = Field(default=None)
+    volatility: Optional[float] = Field(default=None)
+    equity: Optional[float] = Field(default=None)
+    day_pnl: Optional[float] = Field(default=None)
+    news_score: Optional[float] = Field(default=None)
+
+    model_config = ConfigDict(extra="allow")
+
+    def to_features(self) -> MarketFeatures:
+        data = self.model_dump(exclude_none=True)
+        return cast(MarketFeatures, data)
+
+
+class SentimentPayload(BaseModel):
+    text: str
+
+
+def _get_router() -> ModelRouter:
+    if router_singleton is None:
+        raise HTTPException(status_code=503, detail="Model router not initialised")
+    return router_singleton
+
+
+router = APIRouter(prefix="/ai", tags=["ai-models"])
+
+
+@router.post("/signal")
+async def ai_signal(payload: MarketFeaturesPayload, model_router: ModelRouter = Depends(_get_router)) -> Dict[str, Any]:
+    features = payload.to_features()
+    result = model_router.signal(features)
+    return {"features": features, "signal": result}
+
+
+@router.post("/sentiment")
+async def ai_sentiment(payload: SentimentPayload, model_router: ModelRouter = Depends(_get_router)) -> Dict[str, Any]:
+    sentiment = model_router.sentiment(payload.text)
+    return {"sentiment": sentiment, "text": payload.text}
+
+
+@router.post("/regime")
+async def ai_regime(payload: MarketFeaturesPayload, model_router: ModelRouter = Depends(_get_router)) -> Dict[str, Any]:
+    features = payload.to_features()
+    regime = model_router.regime(features)
+    return {"features": features, "regime": regime}
+
+
+__all__ = ["legacy_router", "router"]

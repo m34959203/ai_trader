@@ -19,8 +19,15 @@
 ### Trading, Simulation, and Risk Controls
 - `routers/trading.py` exposes paper-trading endpoints (e.g., `/paper/backtest`) that return win-rate, PnL, Sharpe metrics, and optional trade/equity exports for journaling.【F:routers/trading.py†L520-L656】
 - `src/paper.py` implements a one-position paper trader with SL/TP, trailing stops, fee accounting, and detailed trade logs compatible with the API schemas.【F:src/paper.py†L1-L168】
-- `services/trading_service.py` encapsulates execution with per-trade and daily risk limits, portfolio guardrails, executor failover hooks, and auto-heal registration for live trading modes.【F:services/trading_service.py†L1-L200】
+- `services/trading_service.py` encapsulates execution with per-trade and daily risk limits, portfolio guardrails, executor failover hooks, and auto-heal registration for live trading modes. The new `decide_and_execute` helper combines model outputs with Kelly-capped risk sizing and daily drawdown brakes for autonomous trading.【F:services/trading_service.py†L1-L80】【F:services/trading_service.py†L1118-L1160】
 - `services/auto_heal.py` persists executor snapshots and replays restore callbacks, providing recovery support leveraged by the trading service and tested in resilience suites.【F:services/auto_heal.py†L1-L64】
+
+### AI Decision Fabric & Diagnostics
+- `services/model_router.py` centralizes model instantiation from `configs/exec.yaml`, merging runtime overrides, exposing unified risk caps, and serving signal/sentiment/regime predictions through a single dependency-injection point.【F:services/model_router.py†L1-L135】
+- `src/models/base.py` defines the canonical market feature schema and protocols for signal, sentiment, and regime models, while concrete implementations (random-forest rule, FinBERT-lite, regime classifier) live under `src/models/*` with optional heavy-dependency fallbacks.【F:src/models/base.py†L1-L70】【F:src/models/signal/random_forest_rule.py†L1-L108】【F:src/models/nlp/finbert_sentiment.py†L1-L118】【F:src/models/regime/regime_classifier.py†L1-L93】
+- `routers/autopilot.py` now exposes `/ai/signal`, `/ai/sentiment`, and `/ai/regime` endpoints (alongside the legacy autopilot controller) so operators can inspect raw model outputs and trace feature inputs without starting background workers.【F:routers/autopilot.py†L1-L321】
+- `configs/exec.yaml` ships default bindings for the signal, sentiment, and regime engines along with risk caps, keeping deployments reproducible and ready for overrides.【F:configs/exec.yaml†L1-L35】
+- Placeholder adapters for drift detection, meta-label CLI, neural forecasting, and DRL consultants block out future roadmap items without introducing hard dependencies, supporting incremental rollout.【F:src/models/drift/adwin.py†L1-L44】【F:scripts/meta_label_cli.py†L1-L32】【F:src/models/forecast/neural.py†L1-L44】【F:src/models/drl/consultant.py†L1-L33】
 
 ### Observability & Operations
 - `monitoring/observability.py` registers Prometheus histograms, counters, and gauges while tracking SLO compliance through an `ObservabilityHub`.【F:monitoring/observability.py†L1-L95】

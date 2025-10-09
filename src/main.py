@@ -76,16 +76,26 @@ except Exception:
     _HAS_UI = False
 
 try:
-    from routers.autopilot import router as autopilot_router
+    from routers.autopilot import router as ai_router, legacy_router as autopilot_router
     _HAS_AUTOPILOT = True
 except Exception:
     _HAS_AUTOPILOT = False
+    ai_router = None  # type: ignore
+    autopilot_router = None  # type: ignore
 
 try:
     from routers.metrics import router as metrics_router
     _HAS_METRICS = True
 except Exception:
     _HAS_METRICS = False
+
+try:
+    from services.model_router import DEFAULT_MODEL_CONFIG, ModelRouter, router_singleton
+    _HAS_MODEL_ROUTER = True
+except Exception:  # pragma: no cover
+    ModelRouter = None  # type: ignore
+    router_singleton = None  # type: ignore
+    _HAS_MODEL_ROUTER = False
 
 # Аналитика
 try:
@@ -137,6 +147,7 @@ except Exception:
 
 APP_VERSION = os.getenv("APP_VERSION", "0.11.1")
 APP_ENV = (os.getenv("APP_ENV") or "dev").strip().lower()
+EXEC_CONFIG_PATH = Path(os.getenv("EXEC_CONFIG_PATH", "configs/exec.yaml")).resolve()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV utils
@@ -384,6 +395,24 @@ async def lifespan(app: FastAPI):
     app.state.market_last_event_ts = 0
     app.state.user_last_event_ts   = 0
     app.state.market_ring: List[Dict[str, Any]] = []
+
+    exec_config: Dict[str, Any] = DEFAULT_MODEL_CONFIG if _HAS_MODEL_ROUTER else {}
+    if _HAS_MODEL_ROUTER and router_singleton is not None:
+        try:
+            raw_cfg = ModelRouter.load_from_file(EXEC_CONFIG_PATH)
+            exec_config = raw_cfg or DEFAULT_MODEL_CONFIG
+        except Exception as exc:  # pragma: no cover
+            LOG.warning("Failed to load exec config %s: %s", EXEC_CONFIG_PATH, exc)
+            exec_config = DEFAULT_MODEL_CONFIG
+        try:
+            router_singleton.configure(exec_config)
+        except Exception as exc:  # pragma: no cover
+            LOG.error("Model router configuration failed: %s", exc)
+            exec_config = DEFAULT_MODEL_CONFIG
+        app.state.model_router = router_singleton
+    else:
+        app.state.model_router = None
+    app.state.exec_config = exec_config
 
     # Reconcile on start / periodic loop (если доступно и разрешено)
     if _HAS_RECONCILE and FEATURES.get("execution_api", False):
@@ -784,7 +813,10 @@ if _HAS_EXEC:
     app.include_router(exec_router, tags=["exec"])
 
 if FEATURES["autopilot"] and _HAS_AUTOPILOT:
-    app.include_router(autopilot_router, tags=["autopilot"])
+    if ai_router is not None:
+        app.include_router(ai_router, tags=["ai"])
+    if autopilot_router is not None:
+        app.include_router(autopilot_router, tags=["autopilot"])
 
 if _HAS_UI and FEATURES["ui"]:
     app.include_router(ui_router, tags=["ui"])
