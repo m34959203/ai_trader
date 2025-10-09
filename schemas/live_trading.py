@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -23,6 +23,11 @@ class LiveTradeResponse(BaseModel):
     order: Optional[Dict[str, Any]] = None
     executed: bool
     error: Optional[str] = None
+    request_id: Optional[str] = Field(
+        default=None,
+        description="Client order identifier assigned to the live broker request.",
+    )
+    retries: int = Field(0, description="Number of broker submission retries that occurred.")
 
 
 class LiveStatusResponse(BaseModel):
@@ -30,3 +35,24 @@ class LiveStatusResponse(BaseModel):
     gateway: Optional[str] = None
     risk: Dict[str, Any] = Field(default_factory=dict)
     limits: Dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveOrderStatusResponse(BaseModel):
+    request_id: str
+    found: bool
+    order: Optional[Dict[str, Any]] = None
+
+
+class LiveOrdersResponse(BaseModel):
+    orders: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class LiveCancelOrderResponse(BaseModel):
+    request_id: str
+    cancelled: bool
+    order: Optional[Dict[str, Any]] = None
+
+
+class LiveSyncResponse(BaseModel):
+    positions: Dict[str, float] = Field(default_factory=dict)
+    balances: Dict[str, Dict[str, float]] = Field(default_factory=dict)

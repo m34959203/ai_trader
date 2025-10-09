@@ -43,6 +43,8 @@ def test_live_trading_executes_order_when_risk_allows(live_router):
     assert result["executed"] is True
     assert result["order"] is not None
     assert result["order"]["status"] == "filled"
+    assert result["request_id"]
+    assert result["retries"] >= 0
     assert gateway.positions()["ETHUSDT"] > 0
 
 
@@ -69,4 +71,5 @@ def test_live_trading_respects_daily_loss_block(live_router):
     assert result["executed"] is False
     assert result["order"] is None
     assert result["error"] is None
+    assert result["request_id"] is None
 

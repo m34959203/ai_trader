@@ -82,7 +82,13 @@ class BrokerGateway(Protocol):
     def list_open_orders(self, symbol: Optional[str] = None) -> Iterable[OrderResponse]:
         ...
 
+    def get_order_status(self, request_id: str, *, symbol: Optional[str] = None) -> Optional[OrderResponse]:
+        ...
+
     def positions(self) -> MutableMapping[str, float]:
+        ...
+
+    def balances(self) -> MutableMapping[str, Dict[str, float]]:
         ...
 
 
@@ -132,8 +138,8 @@ class SimulatedBrokerGateway:
 
     def cancel_order(self, request_id: str) -> bool:  # pragma: no cover - unused in current unit tests
         for idx, order in enumerate(self._orders):
-            if order.request_id == request_id and order.status not in {"cancelled", "filled"}:
-                self._orders[idx] = OrderResponse(
+            if order.request_id == request_id and order.status not in {"cancelled", "canceled", "filled"}:
+                updated = OrderResponse(
                     request_id=order.request_id,
                     status="cancelled",
                     filled_quantity=order.filled_quantity,
@@ -141,6 +147,7 @@ class SimulatedBrokerGateway:
                     submitted_at=order.submitted_at,
                     raw=order.raw,
                 )
+                self._orders[idx] = updated
                 return True
         return False
 
@@ -148,12 +155,28 @@ class SimulatedBrokerGateway:
         return [
             order
             for order in self._orders
-            if order.status not in {"filled", "cancelled"}
+            if order.status not in {"filled", "cancelled", "canceled"}
             and (symbol is None or order.raw.get("request", {}).get("symbol") == symbol)
         ]
 
+    def get_order_status(self, request_id: str, *, symbol: Optional[str] = None) -> Optional[OrderResponse]:
+        for order in self._orders:
+            if order.request_id == request_id:
+                return order
+        return None
+
     def positions(self) -> MutableMapping[str, float]:
         return dict(self._positions)
+
+    def balances(self) -> MutableMapping[str, Dict[str, float]]:
+        balances: Dict[str, Dict[str, float]] = {}
+        for symbol, qty in self._positions.items():
+            balances[symbol] = {
+                "free": float(qty),
+                "locked": 0.0,
+                "total": abs(float(qty)),
+            }
+        return balances
 
     def _update_position(self, symbol: str, side: OrderSide, quantity: float) -> None:
         delta = quantity if side.lower() == "buy" else -quantity
@@ -261,10 +284,34 @@ class BinanceBrokerGateway:
             )
         return responses
 
+    def get_order_status(self, request_id: str, *, symbol: Optional[str] = None) -> Optional[OrderResponse]:
+        params: Dict[str, Any] = {"origClientOrderId": request_id}
+        if symbol:
+            params["symbol"] = symbol.upper()
+        else:
+            raise ValueError("symbol is required when querying Binance order status")
+        data = self._request("GET", "/api/v3/order", params, signed=True)
+        status = str(data.get("status", "UNKNOWN")).lower()
+        filled = float(data.get("executedQty", 0.0))
+        avg_price = self._extract_average_price(data)
+        request_id = str(data.get("clientOrderId") or data.get("orderId") or request_id)
+        return OrderResponse(
+            request_id=request_id,
+            status=status,
+            filled_quantity=filled,
+            average_price=avg_price,
+            submitted_at=float(data.get("time", self._time())),
+            raw=data,
+        )
+
     def positions(self) -> MutableMapping[str, float]:
+        balances = self.balances()
+        return {asset: data["total"] for asset, data in balances.items() if data["total"] > 0}
+
+    def balances(self) -> MutableMapping[str, Dict[str, float]]:
         account = self._request("GET", "/api/v3/account", {}, signed=True)
         balances = account.get("balances", [])
-        out: Dict[str, float] = {}
+        out: Dict[str, Dict[str, float]] = {}
         for balance in balances:
             asset = balance.get("asset")
             if not asset:
@@ -272,8 +319,7 @@ class BinanceBrokerGateway:
             free = float(balance.get("free", 0.0))
             locked = float(balance.get("locked", 0.0))
             total = free + locked
-            if total > 0:
-                out[str(asset)] = total
+            out[str(asset)] = {"free": free, "locked": locked, "total": total}
         return out
 
     # ------------------------------------------------------------------

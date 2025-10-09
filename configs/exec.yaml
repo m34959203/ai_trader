@@ -25,6 +25,8 @@ execution:
     timeout: 60
     api_key_env: BINANCE_TESTNET_API_KEY
     api_secret_env: BINANCE_TESTNET_API_SECRET
+    live_api_key_env: BINANCE_API_KEY
+    live_api_secret_env: BINANCE_API_SECRET
 
 binance:
   testnet: true
@@ -34,6 +36,10 @@ binance:
   max_retries: 7
   backoff_base: 0.75
   backoff_cap: 12
+  api_key_env: BINANCE_API_KEY
+  api_secret_env: BINANCE_API_SECRET
+  testnet_api_key_env: BINANCE_TESTNET_API_KEY
+  testnet_api_secret_env: BINANCE_TESTNET_API_SECRET
 
 ohlcv_storage:
   enabled: true
