@@ -14,7 +14,8 @@ Stage 3 focuses on the paper-trading loop, execution resilience, and observabili
 ## Security & Operational Hardening
 - Secrets are stored via the filesystem vault with RBAC+2FA guards, and trading-service logs scrub sensitive fields automatically. 【F:services/trading_service.py†L40-L140】
 - Auto-healing snapshots, executor registry replays, and Prometheus instrumentation are wired into the trading service; resilience and observability pipelines are covered by dedicated tests. 【F:monitoring/observability.py†L1-L120】【F:routers/metrics.py†L1-L80】【F:tests/test_resilience.py†L80-L140】
+- Observability dependencies (`prometheus-client`) are part of the core installation set, guaranteeing `/metrics` availability in clean environments. 【F:setup.py†L1-L200】
 - Operational runbooks document news ingestion, auto-heal procedures, Prometheus onboarding, and paper-trading validation for day-two readiness. 【F:doc/runbooks.md†L1-L80】
 
 ## Readiness Assessment
-Simulation, journaling, automated risk checks, and operational runbooks are production-ready with observability and auto-heal wiring in place. **Stage 3 is 100% complete.**
+Simulation, journaling, automated risk checks, and operational runbooks are production-ready with observability and auto-heal wiring in place, and all runtime dependencies are declared. **Stage 3 is 100% complete.**
