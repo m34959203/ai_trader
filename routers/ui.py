@@ -112,6 +112,41 @@ def _render_fragment(
     _apply_headers(response, _SEC_HEADERS, _NO_CACHE_HEADERS)
     return response
 
+
+_LIVE_HINT_DESCRIPTION = (
+    "API не создало координатор live trading, поэтому операционные виджеты недоступны. "
+    "Убедитесь, что приложение запущено с включённым флагом «FEATURE_LIVE» и корректными "
+    "ключами Binance."
+)
+_LIVE_HINT_STEPS = [
+    "Экспортируйте ключи <code>BINANCE_API_KEY</code> / <code>BINANCE_API_SECRET</code> и, для песочницы, "
+    "<code>BINANCE_TESTNET_API_KEY</code> / <code>BINANCE_TESTNET_API_SECRET</code>.",
+    "Проверьте <code>configs/exec.yaml</code>: выберите нужный шлюз в <code>execution.gateway</code> и установите "
+    "<code>execution.binance.testnet</code> в требуемое значение.",
+    "Запускайте API с окружением <code>FEATURE_LIVE=1</code>: <code>uvicorn src.main:app --host 0.0.0.0 --port 8000</code>.",
+]
+_LIVE_HINT_DOC = (
+    "Полный чеклист доступен в файле <code>doc/live_trading_requirements.md</code>."
+)
+
+
+def _render_live_hint(
+    request: Request,
+    panel_id: str,
+    panel_label: Optional[str] = None,
+    *,
+    title: str = "Live trading не настроен",
+) -> HTMLResponse:
+    ctx = {
+        "panel_id": panel_id,
+        "panel_label": panel_label,
+        "title": title,
+        "description": _LIVE_HINT_DESCRIPTION,
+        "steps": _LIVE_HINT_STEPS,
+        "doc_hint": _LIVE_HINT_DOC,
+    }
+    return _render_fragment("monitor/_live_setup_hint.html", request, ctx)
+
 def _error_fragment(element_id: str, message: str) -> HTMLResponse:
     """
     Возвращает фрагмент ошибки с гарантированным id — важно для HTMX swap.
@@ -650,7 +685,7 @@ async def partial_metrics(
 async def partial_live_pnl(request: Request):
     coordinator = _live_coordinator(request)
     if coordinator is None:
-        return _error_fragment("live-pnl", "Live trading не настроен")
+        return _render_live_hint(request, "live-pnl", panel_label="Live PnL")
     try:
         snapshot = coordinator.pnl_snapshot()
     except Exception as exc:  # pragma: no cover - defensive
@@ -665,7 +700,7 @@ async def partial_live_pnl(request: Request):
 async def partial_broker_status(request: Request):
     coordinator = _live_coordinator(request)
     if coordinator is None:
-        return _error_fragment("broker-status", "Live trading не настроен")
+        return _render_live_hint(request, "broker-status", panel_label="Статус брокера")
     try:
         status = coordinator.broker_status()
     except Exception as exc:  # pragma: no cover - defensive
@@ -683,7 +718,7 @@ async def partial_live_trades(
 ):
     coordinator = _live_coordinator(request)
     if coordinator is None:
-        return _error_fragment("live-trades", "Live trading не настроен")
+        return _render_live_hint(request, "live-trades", panel_label="Live сделки")
     try:
         trades = coordinator.list_trades(limit=limit)
     except Exception as exc:  # pragma: no cover - defensive
@@ -698,7 +733,7 @@ async def partial_live_trades(
 async def partial_limits(request: Request):
     coordinator = _live_coordinator(request)
     if coordinator is None:
-        limits = {"risk_config": {}, "daily": {}, "strategies": []}
+        return _render_live_hint(request, "limits", panel_label="Риск-лимиты")
     else:
         try:
             limits = coordinator.limits_snapshot()
