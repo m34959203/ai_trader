@@ -1,14 +1,27 @@
-"""FinBERT-backed sentiment estimator with rule-based fallback."""
+"""FinBERT-backed sentiment estimator with rule-based fallback.
+
+The implementation supports offline execution by caching the downloaded
+HuggingFace snapshot locally and validating its checksum before using the
+model. When the cache is available the model is loaded without attempting
+to access the internet which allows the trading stack to remain fully
+air-gapped.
+"""
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 from dataclasses import dataclass
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 
 from ..base import ISentimentModel, SentimentOutput
 from ...utils_math import clamp01
 
 LOG = logging.getLogger("ai_trader.models.sentiment.finbert")
+
+_CACHE_ENV_VAR = "AI_TRADER_MODEL_CACHE"
+_CHECKSUM_FILENAME = ".checksum"
 
 
 @dataclass
@@ -47,14 +60,24 @@ class FinBERTLite(ISentimentModel):
         }
 
     def _load_pipeline(self):  # pragma: no cover - heavy dependency guard
+        cache_path: Optional[Path] = None
+        try:
+            cache_path = self._ensure_local_model()
+        except Exception as exc:  # noqa: BLE001 - defensive path
+            LOG.warning("Failed to prepare local FinBERT cache (%s).", exc)
+
+        if cache_path is None:
+            LOG.warning("FinBERT cache is unavailable; sentiment pipeline disabled.")
+            return None
+
         try:
             from transformers import pipeline  # type: ignore
 
-            LOG.info("Loading FinBERT pipeline: %s", self._params.model_name)
+            LOG.info("Loading FinBERT pipeline from %s", cache_path)
             return pipeline(
                 "sentiment-analysis",
-                model=self._params.model_name,
-                tokenizer=self._params.model_name,
+                model=str(cache_path),
+                tokenizer=str(cache_path),
                 device=self._params.device,
             )
         except Exception as exc:  # noqa: BLE001
@@ -113,3 +136,88 @@ class FinBERTLite(ISentimentModel):
         if "pos" in label_raw:
             return "pos", abs(score)
         return "neu", 0.0
+
+    # ------------------------------------------------------------------
+    # Offline cache helpers
+    # ------------------------------------------------------------------
+    def _ensure_local_model(self) -> Optional[Path]:
+        """Download the model snapshot if needed and validate checksum.
+
+        Returns the path that can be passed to the HuggingFace pipeline or
+        ``None`` when no valid cache is available.
+        """
+
+        cache_root = self._resolve_cache_root()
+        model_dir = cache_root / self._sanitise_name(self._params.model_name)
+        checksum_path = model_dir / _CHECKSUM_FILENAME
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            from huggingface_hub import snapshot_download  # type: ignore
+
+            LOG.debug("Ensuring FinBERT snapshot in %s", model_dir)
+            snapshot_download(
+                repo_id=self._params.model_name,
+                local_dir=str(model_dir),
+                local_dir_use_symlinks=False,
+            )
+            checksum = self._compute_directory_checksum(model_dir)
+            checksum_path.write_text(checksum, encoding="utf-8")
+            LOG.info("FinBERT snapshot ready (checksum=%s)", checksum[:12])
+            return model_dir
+        except Exception as exc:  # noqa: BLE001 - offline fallback
+            LOG.warning("FinBERT snapshot download skipped (%s). Using cache only.", exc)
+            if checksum_path.exists():
+                checksum_valid = self._verify_checksum(model_dir, checksum_path)
+                if checksum_valid:
+                    LOG.info("FinBERT cache verified (checksum=%s)", checksum_valid[:12])
+                    return model_dir
+                LOG.error("FinBERT cache checksum mismatch; ignoring cached files.")
+            elif any(model_dir.iterdir()):
+                LOG.warning("FinBERT cache has no checksum; attempting best-effort validation.")
+                checksum = self._compute_directory_checksum(model_dir)
+                checksum_path.write_text(checksum, encoding="utf-8")
+                return model_dir
+
+        return None
+
+    @staticmethod
+    def _resolve_cache_root() -> Path:
+        env_override = os.environ.get(_CACHE_ENV_VAR)
+        if env_override:
+            return Path(env_override).expanduser().resolve()
+        project_root = Path(__file__).resolve().parents[4]
+        return project_root / "state" / "models"
+
+    @staticmethod
+    def _sanitise_name(name: str) -> str:
+        return name.replace("/", "__")
+
+    @classmethod
+    def _verify_checksum(cls, directory: Path, checksum_file: Path) -> Optional[str]:
+        try:
+            expected = checksum_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        actual = cls._compute_directory_checksum(directory)
+        return expected if expected and expected == actual else None
+
+    @staticmethod
+    def _iter_files(directory: Path) -> Iterable[Path]:
+        for item in sorted(directory.rglob("*")):
+            if item.is_file() and item.name != _CHECKSUM_FILENAME:
+                yield item
+
+    @classmethod
+    def _compute_directory_checksum(cls, directory: Path) -> str:
+        hasher = hashlib.sha256()
+        for file_path in cls._iter_files(directory):
+            relative = file_path.relative_to(directory)
+            hasher.update(str(relative).encode("utf-8"))
+            try:
+                with file_path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+            except OSError:
+                continue
+        return hasher.hexdigest()
