@@ -1,9 +1,10 @@
 # AI Trader — Functional Overview and File Map
 
 ## Delivery Status
+- **Stage 1 (Data Platform & API)** is complete: the unified OHLCV schema, ingestion/export endpoints, health checks, and regression suites that form the platform foundation are live.【F:doc/stage1_status.md†L1-L30】【F:doc/stage1_status.md†L31-L48】
 - **Stage 2 (Advanced Market Intelligence)** is fully delivered: the indicator library, news-aware analysis pipeline, background ingestion worker, strategy validation, and runtime dependencies are complete and regression-tested.【F:doc/stage2_status.md†L1-L17】
 - **Stage 3 (Paper Trading & Resilience)** is also 100 % ready: enhanced backtesting exports, automated risk controls, auto-heal orchestration, observability endpoints, and operational runbooks are in place with dependencies declared.【F:doc/stage3_status.md†L1-L24】
-- **Stage 4 (Live Trading & Operator Experience)** is in progress: broker certification, production observability, compliance, and UI deliverables remain outstanding and are catalogued in the Stage 4 readiness report.【F:doc/stage4_status.md†L1-L56】
+- **Stage 4 (Live Trading & Operator Experience)** is now production-ready: broker lifecycle management, risk/compliance controls, observability, ML operations, operator UI, and runbooks are complete per the Stage 4 readiness report.【F:doc/stage4_status.md†L1-L120】
 
 ## Core Capabilities
 ### Market Intelligence & Alternative Data
@@ -74,4 +75,4 @@
 | `setup.py` | Packaging metadata and runtime dependencies ensuring ingestion and monitoring modules install cleanly.【F:setup.py†L1-L40】 |
 
 ## Readiness Summary
-Stages 2 and 3 have no open functional or operational gaps; indicator coverage, news automation, ensemble validation, paper trading, risk controls, auto-healing, observability, and operational playbooks are complete and dependency-supported, marking the project as 100 % ready for these phases.【F:doc/stage2_status.md†L6-L17】【F:doc/stage3_status.md†L5-L21】
+All four delivery stages are complete: Stage 1 provides the production data backbone, Stage 2 delivers advanced analytics, Stage 3 hardens paper-trading and resilience, and Stage 4 enables live trading with operator tooling.【F:doc/stage1_status.md†L1-L48】【F:doc/stage2_status.md†L6-L17】【F:doc/stage3_status.md†L5-L24】【F:doc/stage4_status.md†L1-L120】

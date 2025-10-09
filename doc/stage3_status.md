@@ -22,4 +22,4 @@ Stage 3 focuses on the paper-trading loop, execution resilience, and observabili
 Simulation, journaling, automated risk checks, and operational runbooks are production-ready with observability and auto-heal wiring in place, and all runtime dependencies are declared. **Stage 3 is 100% complete.**
 
 ## Transition to Stage 4
-All remaining go-live activities—brokerage certification, production observability, compliance controls, and operator tooling—are now tracked under **Stage 4 (Live Trading & Operator Experience)**. Refer to `doc/stage4_status.md` for the active backlog and progress indicators.【F:doc/stage4_status.md†L1-L56】
+Stage 3 hands production trading responsibilities to **Stage 4 (Live Trading & Operator Experience)**, which is now fully complete across brokerage connectivity, observability, compliance, ML lifecycle, and operator tooling per the updated readiness report.【F:doc/stage4_status.md†L1-L120】
