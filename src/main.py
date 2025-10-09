@@ -76,10 +76,41 @@ except Exception:
     _HAS_UI = False
 
 try:
-    from routers.autopilot import router as autopilot_router
+    from routers.autopilot import router as ai_router, legacy_router as autopilot_router
     _HAS_AUTOPILOT = True
 except Exception:
     _HAS_AUTOPILOT = False
+    ai_router = None  # type: ignore
+    autopilot_router = None  # type: ignore
+
+try:
+    from routers.live_trading import router as live_router
+    _HAS_LIVE = True
+except Exception:  # pragma: no cover
+    live_router = None  # type: ignore
+    _HAS_LIVE = False
+
+try:
+    from routers.metrics import router as metrics_router
+    _HAS_METRICS = True
+except Exception:
+    _HAS_METRICS = False
+
+try:
+    from services.model_router import DEFAULT_MODEL_CONFIG, ModelRouter, router_singleton
+    _HAS_MODEL_ROUTER = True
+except Exception:  # pragma: no cover
+    ModelRouter = None  # type: ignore
+    router_singleton = None  # type: ignore
+    _HAS_MODEL_ROUTER = False
+
+try:  # pragma: no cover - optional depending on packaging
+    from services.broker_gateway import BinanceBrokerGateway, SimulatedBrokerGateway
+    from services.live_trading import LiveTradingCoordinator
+except Exception:  # pragma: no cover
+    BinanceBrokerGateway = None  # type: ignore
+    SimulatedBrokerGateway = None  # type: ignore
+    LiveTradingCoordinator = None  # type: ignore
 
 # Аналитика
 try:
@@ -122,9 +153,16 @@ try:
 except Exception:
     _HAS_AUTO_BG = False
 
+try:
+    from tasks.news_ingest import background_loop as news_bg
+    _HAS_NEWS_BG = True
+except Exception:
+    _HAS_NEWS_BG = False
+
 
 APP_VERSION = os.getenv("APP_VERSION", "0.11.1")
 APP_ENV = (os.getenv("APP_ENV") or "dev").strip().lower()
+EXEC_CONFIG_PATH = Path(os.getenv("EXEC_CONFIG_PATH", "configs/exec.yaml")).resolve()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV utils
@@ -153,6 +191,79 @@ def env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
+def _configure_live_trading(app: FastAPI, exec_config: Dict[str, Any]):
+    if not FEATURES.get("live_trading", False):
+        return None, None
+    if LiveTradingCoordinator is None:
+        LOG.warning("Live trading coordinator unavailable; feature disabled")
+        return None, None
+
+    router = getattr(app.state, "model_router", None)
+    if router is None:
+        LOG.warning("Live trading requires model router; configuration skipped")
+        return None, None
+
+    execution_cfg = dict(exec_config.get("execution") or {})
+    gateway_name = str(execution_cfg.get("gateway") or exec_config.get("mode") or "sim").lower()
+
+    min_quantity = float(execution_cfg.get("min_quantity", 1e-6))
+    quantity_rounding_raw = execution_cfg.get("quantity_rounding")
+    quantity_rounding = None if quantity_rounding_raw is None else int(quantity_rounding_raw)
+
+    if gateway_name == "binance":
+        if BinanceBrokerGateway is None:
+            LOG.warning("Binance gateway implementation not available; falling back")
+            return None, None
+        bin_cfg = {**(exec_config.get("binance") or {}), **(execution_cfg.get("binance") or {})}
+        testnet = bool(bin_cfg.get("testnet", True))
+        base_url = bin_cfg.get("base_url")
+        recv_window = int(bin_cfg.get("recv_window", 5000))
+        timeout = float(bin_cfg.get("timeout", 15.0))
+        api_key_env = bin_cfg.get("api_key_env") or ("BINANCE_TESTNET_API_KEY" if testnet else "BINANCE_API_KEY")
+        api_secret_env = bin_cfg.get("api_secret_env") or (
+            "BINANCE_TESTNET_API_SECRET" if testnet else "BINANCE_API_SECRET"
+        )
+        api_key = os.getenv(api_key_env, "")
+        api_secret = os.getenv(api_secret_env, "")
+        if not api_key or not api_secret:
+            LOG.warning(
+                "Binance gateway requires API keys in environment: %s, %s",
+                api_key_env,
+                api_secret_env,
+            )
+            return None, None
+        gateway = BinanceBrokerGateway(
+            api_key=api_key,
+            api_secret=api_secret,
+            testnet=testnet,
+            base_url=base_url,
+            recv_window=recv_window,
+            timeout=timeout,
+        )
+    elif gateway_name == "sim":
+        if SimulatedBrokerGateway is None:
+            LOG.warning("Simulated gateway unavailable; live trading disabled")
+            return None, None
+        gateway = SimulatedBrokerGateway()
+    else:
+        LOG.warning("Unsupported live trading gateway '%s'", gateway_name)
+        return None, None
+
+    coordinator = LiveTradingCoordinator(
+        router,
+        gateway,
+        min_quantity=min_quantity,
+        quantity_rounding=quantity_rounding,
+    )
+    LOG.info(
+        "Live trading coordinator initialised (gateway=%s, min_qty=%s, rounding=%s)",
+        type(gateway).__name__,
+        min_quantity,
+        quantity_rounding,
+    )
+    return coordinator, gateway
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Логирование
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,11 +286,15 @@ FEATURES: Dict[str, bool] = {
     "market_ws":     env_bool("FEATURE_MARKET_WS", True) and _HAS_STREAMS,
     "user_ws":       env_bool("FEATURE_USER_WS", True) and _HAS_STREAMS,
     "autopilot":     env_bool("FEATURE_AUTOPILOT", True) and _HAS_AUTOPILOT,
+    "live_trading":  env_bool("FEATURE_LIVE", True) and _HAS_LIVE and (LiveTradingCoordinator is not None),
 }
 
 # Управление бэкграунд-тасками: включаем по умолчанию для prod/staging окружений
 _BG_DEFAULT = APP_ENV in {"prod", "production", "staging"}
 ENABLE_BG_TASKS = env_bool("ENABLE_BG_TASKS", _BG_DEFAULT)
+ENABLE_NEWS_INGEST = env_bool("ENABLE_NEWS_INGEST", ENABLE_BG_TASKS)
+NEWS_REFRESH_INTERVAL_SEC = env_int("NEWS_REFRESH_INTERVAL_SEC", 900)
+NEWS_REFRESH_INITIAL_DELAY_SEC = env_int("NEWS_REFRESH_INITIAL_DELAY_SEC", 10)
 
 # Binance / WS окружение
 BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY", "")
@@ -358,16 +473,43 @@ async def lifespan(app: FastAPI):
     app.state.keepalive_task = None
     app.state.ohlcv_bg_task  = None
     app.state.auto_bg_task   = None
+    app.state.news_bg_task   = None
     app.state.watchdog_task  = None
     app.state._watchdog      = None
 
     app.state.stream_router = None
     app.state.user_ws = None
     app.state.binance_rest = None
+    app.state.live_trading = None
+    app.state.live_gateway = None
 
     app.state.market_last_event_ts = 0
     app.state.user_last_event_ts   = 0
     app.state.market_ring: List[Dict[str, Any]] = []
+
+    exec_config: Dict[str, Any] = DEFAULT_MODEL_CONFIG if _HAS_MODEL_ROUTER else {}
+    if _HAS_MODEL_ROUTER and router_singleton is not None:
+        try:
+            raw_cfg = ModelRouter.load_from_file(EXEC_CONFIG_PATH)
+            exec_config = raw_cfg or DEFAULT_MODEL_CONFIG
+        except Exception as exc:  # pragma: no cover
+            LOG.warning("Failed to load exec config %s: %s", EXEC_CONFIG_PATH, exc)
+            exec_config = DEFAULT_MODEL_CONFIG
+        try:
+            router_singleton.configure(exec_config)
+        except Exception as exc:  # pragma: no cover
+            LOG.error("Model router configuration failed: %s", exc)
+            exec_config = DEFAULT_MODEL_CONFIG
+        app.state.model_router = router_singleton
+    else:
+        app.state.model_router = None
+    app.state.exec_config = exec_config
+
+    coordinator, gateway = _configure_live_trading(app, exec_config)
+    if coordinator is not None:
+        app.state.live_trading = coordinator
+    if gateway is not None:
+        app.state.live_gateway = gateway
 
     # Reconcile on start / periodic loop (если доступно и разрешено)
     if _HAS_RECONCILE and FEATURES.get("execution_api", False):
@@ -476,6 +618,14 @@ async def lifespan(app: FastAPI):
         app.state.ohlcv_bg_task = asyncio.create_task(ohlcv_bg(), name="ohlcv_bg")
     if ENABLE_BG_TASKS and _HAS_AUTO_BG:
         app.state.auto_bg_task = asyncio.create_task(auto_bg(), name="auto_bg")
+    if ENABLE_BG_TASKS and ENABLE_NEWS_INGEST and _HAS_NEWS_BG:
+        app.state.news_bg_task = asyncio.create_task(
+            news_bg(
+                interval_seconds=NEWS_REFRESH_INTERVAL_SEC,
+                initial_delay=NEWS_REFRESH_INITIAL_DELAY_SEC,
+            ),
+            name="news_ingest",
+        )
 
     # Process watchdog
     app.state._watchdog = EventLoopWatchdog(interval=5.0, max_consecutive_misses=12)
@@ -494,6 +644,7 @@ async def lifespan(app: FastAPI):
                 getattr(app.state, "reconcile_task", None),
                 getattr(app.state, "ohlcv_bg_task", None),
                 getattr(app.state, "auto_bg_task", None),
+                getattr(app.state, "news_bg_task", None),
                 getattr(app.state, "watchdog_task", None),
             ]
             for t in tasks:
@@ -531,6 +682,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         try:
+            gateway = getattr(app.state, "live_gateway", None)
+            if gateway is not None and hasattr(gateway, "close"):
+                gateway.close()
+        except Exception:
+            pass
+        try:
             await shutdown_engine()
         except Exception:  # pragma: no cover
             pass
@@ -553,6 +710,7 @@ tags_metadata = [
     {"name": "autopilot", "description": "Пилот автоторговли (force/test режим)."},
     {"name": "meta",      "description": "Служебные и диагностические эндпоинты."},
     {"name": "ui",        "description": "Мониторинг и быстрая ручная панель."},
+    {"name": "live",      "description": "Производственные эндпоинты live-торговли."},
 ]
 
 app = FastAPI(
@@ -746,23 +904,32 @@ async def prices(
 # ──────────────────────────────────────────────────────────────────────────────
 # Подключение роутеров
 # ──────────────────────────────────────────────────────────────────────────────
-if _HAS_OHLCV:
+if FEATURES.get("ohlcv_storage", False) and _HAS_OHLCV:
     app.include_router(ohlcv_router)  # router сам решает свой префикс/пути
 
-if _HAS_OHLCV_READ:
+if FEATURES.get("ohlcv_storage", False) and _HAS_OHLCV_READ:
     app.include_router(ohlcv_read_router, prefix="/ohlcv")
 
-if _HAS_TRADING:
+if (FEATURES.get("signals", False) or FEATURES.get("paper_trading", False)) and _HAS_TRADING:
     app.include_router(trading_router, tags=["strategy", "paper"])
 
-if _HAS_EXEC:
+if FEATURES.get("execution_api", False) and _HAS_EXEC:
     app.include_router(exec_router, tags=["exec"])
 
+if FEATURES.get("live_trading", False) and _HAS_LIVE and live_router is not None:
+    app.include_router(live_router, tags=["live"])
+
 if FEATURES["autopilot"] and _HAS_AUTOPILOT:
-    app.include_router(autopilot_router, tags=["autopilot"])
+    if ai_router is not None:
+        app.include_router(ai_router, tags=["ai"])
+    if autopilot_router is not None:
+        app.include_router(autopilot_router, tags=["autopilot"])
 
 if _HAS_UI and FEATURES["ui"]:
     app.include_router(ui_router, tags=["ui"])
+
+if _HAS_METRICS:
+    app.include_router(metrics_router, tags=["monitoring"])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fallback-маршруты для OHLCV (если по какой-то причине роутер не подключился)

@@ -1,0 +1,43 @@
+{
+  "strategies": [
+    {
+      "name": "ema_fast",
+      "kind": "ema_cross",
+      "weight": 0.5,
+      "params": {
+        "fast": 12,
+        "slow": 26,
+        "persist": 1,
+        "cooldown": 0,
+        "min_gap_pct": 0.001
+      }
+    },
+    {
+      "name": "rsi_revert",
+      "kind": "rsi_reversion",
+      "weight": 0.3,
+      "params": {
+        "period": 14,
+        "oversold": 30,
+        "overbought": 70
+      }
+    },
+    {
+      "name": "bb_breakout",
+      "kind": "bollinger_breakout",
+      "weight": 0.2,
+      "params": {
+        "period": 20,
+        "n_std": 2.0,
+        "mode": "trend"
+      }
+    }
+  ],
+  "ensemble": {
+    "threshold": 0.4
+  },
+  "frequency_filter": {
+    "min_bars_between": 3,
+    "max_signals_per_day": 12
+  }
+}

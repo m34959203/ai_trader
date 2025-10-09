@@ -24,6 +24,8 @@ setup(
         "ccxt>=4.3",
         "loguru>=0.7",
         "python-dotenv>=1.0",
+        "feedparser>=6.0",
+        "prometheus-client>=0.22",
     ],
     extras_require={
         "dev": ["black", "isort", "flake8", "mypy", "pytest-cov"],

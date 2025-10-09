@@ -22,18 +22,36 @@ from __future__ import annotations
 с короткими сериями (валидируют периоды и не падают при частичной истории).
 """
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 __all__ = [
     # MAs
-    "ema", "sma", "wma",
+    "ema",
+    "sma",
+    "wma",
     # Momentum / Volatility
-    "rsi", "macd", "bollinger_bands", "true_range", "atr", "stochastic", "adx",
+    "rsi",
+    "macd",
+    "bollinger_bands",
+    "true_range",
+    "atr",
+    "stochastic",
+    "adx",
+    "force_index",
+    "money_flow_index",
+    "on_balance_volume",
+    "awesome_oscillator",
+    # Candles / OHLC helpers
+    "heikin_ashi",
+    "candlestick_patterns",
+    "resample_ohlcv",
     # Cross helpers
-    "cross_over", "cross_under", "cross_level",
+    "cross_over",
+    "cross_under",
+    "cross_level",
 ]
 
 # ─────────────────────────────
@@ -437,6 +455,218 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     adx_val = dx.ewm(alpha=1 / period, adjust=False).mean()
 
     return pd.DataFrame({"pdi": pdi, "ndi": ndi, "adx": adx_val}, index=h.index)
+
+
+# ─────────────────────────────
+# Volume / Momentum расширения
+# ─────────────────────────────
+def force_index(close: pd.Series, volume: pd.Series, period: int = 13) -> pd.Series:
+    """Elder Force Index с экспоненциальным сглаживанием."""
+
+    c = _as_float_series(close)
+    v = _as_float_series(volume)
+    raw = c.diff().fillna(0.0) * v.fillna(0.0)
+    if period <= 1:
+        return raw
+    if period <= 0:
+        raise ValueError("force_index: period must be > 0")
+    return raw.ewm(span=period, adjust=False).mean()
+
+
+def money_flow_index(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    volume: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+    """
+    Money Flow Index (MFI) — объёмный RSI.
+    Возвращает значения в диапазоне 0..100.
+    """
+
+    if period <= 0:
+        raise ValueError("money_flow_index: period must be > 0")
+
+    h = _as_float_series(high)
+    l = _as_float_series(low)
+    c = _as_float_series(close)
+    v = _as_float_series(volume)
+
+    typical = (h + l + c) / 3.0
+    mf = typical * v
+    prev_typical = typical.shift(1)
+    pos = mf.where(typical > prev_typical, 0.0)
+    neg = mf.where(typical < prev_typical, 0.0)
+
+    pos_sum = pos.rolling(period, min_periods=period).sum()
+    neg_sum = neg.rolling(period, min_periods=period).sum()
+
+    ratio = pos_sum / neg_sum.replace(0.0, np.nan)
+    mfi = 100.0 - (100.0 / (1.0 + ratio))
+    return mfi.fillna(50.0)
+
+
+def on_balance_volume(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume (кумулятивный объём)."""
+
+    c = _as_float_series(close)
+    v = _as_float_series(volume).fillna(0.0)
+    direction = np.sign(c.diff().fillna(0.0))
+    direction = pd.Series(direction, index=c.index)
+    obv = (direction * v).cumsum().ffill()
+    return obv.fillna(0.0)
+
+
+def awesome_oscillator(high: pd.Series, low: pd.Series, fast: int = 5, slow: int = 34) -> pd.Series:
+    """Awesome Oscillator (AO) по Биллу Вильямсу."""
+
+    if fast <= 0 or slow <= 0:
+        raise ValueError("awesome_oscillator: periods must be > 0")
+    if fast >= slow:
+        fast, slow = slow, fast
+
+    median_price = (_as_float_series(high) + _as_float_series(low)) / 2.0
+    sma_fast = sma(median_price, fast)
+    sma_slow = sma(median_price, slow)
+    return (sma_fast - sma_slow).fillna(0.0)
+
+
+# ─────────────────────────────
+# Свечные паттерны / OHLC утилиты
+# ─────────────────────────────
+def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Строит свечи Heikin-Ashi из обычного OHLC DataFrame.
+
+    Возвращает DataFrame с колонками ha_open/ha_high/ha_low/ha_close.
+    """
+
+    required = {"open", "high", "low", "close"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"heikin_ashi: missing columns {sorted(missing)}")
+
+    o = _as_float_series(df["open"]).copy()
+    h = _as_float_series(df["high"]).copy()
+    l = _as_float_series(df["low"]).copy()
+    c = _as_float_series(df["close"]).copy()
+
+    if len(o) == 0:
+        return pd.DataFrame(columns=["ha_open", "ha_high", "ha_low", "ha_close"], index=o.index)
+
+    ha_close = (o + h + l + c) / 4.0
+    ha_open = pd.Series(index=o.index, dtype=float)
+    ha_open.iloc[0] = (o.iloc[0] + c.iloc[0]) / 2.0
+    for i in range(1, len(o)):
+        ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2.0
+    ha_high = pd.concat([h, ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([l, ha_open, ha_close], axis=1).min(axis=1)
+
+    return pd.DataFrame(
+        {
+            "ha_open": ha_open,
+            "ha_high": ha_high,
+            "ha_low": ha_low,
+            "ha_close": ha_close,
+        },
+        index=df.index,
+    )
+
+
+def candlestick_patterns(
+    df: pd.DataFrame,
+    *,
+    hammer_ratio: float = 2.0,
+    star_ratio: float = 2.0,
+    doji_frac: float = 0.1,
+) -> pd.DataFrame:
+    """
+    Вычисляет базовые свечные паттерны. Возвращает DataFrame с колонками:
+      hammer, inverted_hammer, shooting_star, bullish_engulfing,
+      bearish_engulfing, morning_star, evening_star, doji.
+    Значения bool.
+    """
+
+    required = {"open", "high", "low", "close"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"candlestick_patterns: missing columns {sorted(missing)}")
+
+    o = _as_float_series(df["open"])
+    h = _as_float_series(df["high"])
+    l = _as_float_series(df["low"])
+    c = _as_float_series(df["close"])
+
+    body = (c - o)
+    body_abs = body.abs()
+    upper_shadow = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower_shadow = pd.concat([o, c], axis=1).min(axis=1) - l
+    range_ = h - l
+
+    hammer = (body > 0) & (lower_shadow >= hammer_ratio * body_abs) & (upper_shadow <= body_abs)
+    inverted_hammer = (body > 0) & (upper_shadow >= hammer_ratio * body_abs) & (lower_shadow <= body_abs)
+    shooting_star = (body < 0) & (upper_shadow >= star_ratio * body_abs) & (lower_shadow <= body_abs)
+
+    prev_body = body.shift(1)
+    prev_open = o.shift(1)
+    prev_close = c.shift(1)
+
+    bullish_engulf = (body > 0) & (prev_body < 0) & (o <= prev_close) & (c >= prev_open)
+    bearish_engulf = (body < 0) & (prev_body > 0) & (o >= prev_close) & (c <= prev_open)
+
+    doji = body_abs <= (doji_frac * range_).replace(0.0, np.nan)
+
+    # Morning/Evening star (3 свечи)
+    gap_down = o > prev_close
+    gap_up = o < prev_close
+    prev_prev_close = c.shift(2)
+    prev_prev_open = o.shift(2)
+    morning_star = (
+        (prev_body < 0)
+        & gap_down
+        & (body > 0)
+        & (c > prev_prev_open)
+        & (prev_prev_close > prev_prev_open)
+    )
+    evening_star = (
+        (prev_body > 0)
+        & gap_up
+        & (body < 0)
+        & (c < prev_prev_open)
+        & (prev_prev_close < prev_prev_open)
+    )
+
+    return pd.DataFrame(
+        {
+            "hammer": hammer.fillna(False),
+            "inverted_hammer": inverted_hammer.fillna(False),
+            "shooting_star": shooting_star.fillna(False),
+            "bullish_engulfing": bullish_engulf.fillna(False),
+            "bearish_engulfing": bearish_engulf.fillna(False),
+            "morning_star": morning_star.fillna(False),
+            "evening_star": evening_star.fillna(False),
+            "doji": doji.fillna(False),
+        },
+        index=df.index,
+    )
+
+
+def resample_ohlcv(df: pd.DataFrame, rule: str, *, how: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+    """Ресемплинг OHLCV DataFrame (DatetimeIndex → rule)."""
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("resample_ohlcv: DataFrame index must be DatetimeIndex")
+
+    agg = how or {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    res = df.resample(rule).agg(agg)
+    return res.dropna(subset=["open", "high", "low", "close"], how="all")
 
 
 # ─────────────────────────────
