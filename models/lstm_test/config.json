@@ -1,0 +1,21 @@
+{
+  "sequence_length": 30,
+  "n_forecast": 3,
+  "features": [
+    "close",
+    "volume",
+    "rsi",
+    "macd",
+    "atr"
+  ],
+  "lstm_units": [
+    128,
+    64
+  ],
+  "dropout": 0.2,
+  "learning_rate": 0.001,
+  "batch_size": 32,
+  "epochs": 50,
+  "early_stopping_patience": 10,
+  "validation_split": 0.2
+}
