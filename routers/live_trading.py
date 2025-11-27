@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
+from routers.auth import verify_api_key
 from services.broker_gateway import BrokerGatewayError
 from schemas.live_trading import (
     LiveBrokerStatus,
@@ -48,7 +49,11 @@ async def live_status(request: Request) -> LiveStatusResponse:
 
 
 @router.post("/trade", response_model=LiveTradeResponse)
-async def live_trade(request: Request, payload: LiveTradeRequest) -> LiveTradeResponse:
+async def live_trade(
+    request: Request,
+    payload: LiveTradeRequest,
+    api_key: str = Depends(verify_api_key),
+) -> LiveTradeResponse:
     coordinator = _get_coordinator(request)
     try:
         summary: Dict[str, Any] = coordinator.route_and_execute(
@@ -97,6 +102,7 @@ async def live_cancel_order(
     request: Request,
     request_id: str,
     symbol: Optional[str] = None,
+    api_key: str = Depends(verify_api_key),
 ) -> LiveCancelOrderResponse:
     coordinator = _get_coordinator(request)
     try:
@@ -107,7 +113,10 @@ async def live_cancel_order(
 
 
 @router.post("/sync", response_model=LiveSyncResponse)
-async def live_sync(request: Request) -> LiveSyncResponse:
+async def live_sync(
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+) -> LiveSyncResponse:
     coordinator = _get_coordinator(request)
     try:
         snapshot = coordinator.sync_account()
@@ -162,6 +171,7 @@ async def update_strategy(
     request: Request,
     name: str,
     payload: StrategyUpdateRequest,
+    api_key: str = Depends(verify_api_key),
 ) -> StrategyState:
     coordinator = _get_coordinator(request)
     if hasattr(payload, "model_dump"):
