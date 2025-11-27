@@ -18,9 +18,16 @@ __pycache__/
 data/
 *.pth
 *.model
-*.h5venv/
-venv/
+*.h5
 venv/
 .venv/
 data/ai_trader.db
 data/state/
+
+# Secrets and sensitive files
+configs/.env*
+.env*
+*.pem
+*.key
+secrets/
+*.secret
