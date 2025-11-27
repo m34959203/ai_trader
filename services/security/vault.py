@@ -22,23 +22,54 @@ class HardwareSecurityModule(Protocol):
 
 
 @dataclass(slots=True)
-class LocalHSM:
-    """Tiny in-process HSM emulation used for development and testing."""
+class SecureHSM:
+    """AES-GCM based HSM for cryptographically secure key protection.
+
+    This replaces the previous XOR-based LocalHSM which was cryptographically insecure.
+    Uses AES-256-GCM for authenticated encryption of the master key.
+    """
 
     storage_dir: Path
 
     def __post_init__(self) -> None:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self._path = self.storage_dir / "hsm.key"
-        if not self._path.exists():
-            self._path.write_bytes(os.urandom(32))
+        self._key_path = self.storage_dir / "hsm.key"
+        self._key = self._load_or_generate_key()
+
+    def _load_or_generate_key(self) -> bytes:
+        """Load existing key or generate new 256-bit key."""
+        if self._key_path.exists():
+            key = self._key_path.read_bytes()
+            if len(key) != 32:
+                raise ValueError(f"Invalid HSM key length: {len(key)} bytes, expected 32")
+            return key
+
+        # Generate new 256-bit key
+        key = AESGCM.generate_key(bit_length=256)
+        self._key_path.write_bytes(key)
+        # Set read-only for owner only (0o600)
+        self._key_path.chmod(0o600)
+        return key
 
     def encrypt(self, data: bytes) -> bytes:  # type: ignore[override]
-        key = self._path.read_bytes()
-        return bytes(a ^ b for a, b in zip(data, key * (len(data) // len(key) + 1)))
+        """Encrypt data using AES-GCM with random nonce."""
+        aesgcm = AESGCM(self._key)
+        nonce = secrets.token_bytes(12)  # 96-bit nonce for GCM
+        ciphertext = aesgcm.encrypt(nonce, data, None)
+        # Return nonce + ciphertext
+        return nonce + ciphertext
 
     def decrypt(self, data: bytes) -> bytes:  # type: ignore[override]
-        return self.encrypt(data)
+        """Decrypt data using AES-GCM, verifying authentication tag."""
+        if len(data) < 12:
+            raise ValueError("Invalid encrypted data: too short")
+        aesgcm = AESGCM(self._key)
+        nonce, ciphertext = data[:12], data[12:]
+        return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+# Backwards compatibility alias (deprecated)
+LocalHSM = SecureHSM
 
 
 class SecretVault:
