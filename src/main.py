@@ -27,6 +27,9 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response, PlainTextResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Локальные импорты, требующиеся до инициализации логирования
@@ -827,6 +830,13 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Rate Limiting
+# ──────────────────────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute", "1000/hour"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Middlewares
 # ──────────────────────────────────────────────────────────────────────────────
 app.add_middleware(TraceIdMiddleware)
@@ -848,8 +858,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Trace-Id", "X-Request-ID"],
+    expose_headers=["X-Trace-Id"],
     max_age=3600,
 )
 gzip_min = int(os.getenv("GZIP_MIN_SIZE", "1024"))

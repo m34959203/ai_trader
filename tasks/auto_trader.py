@@ -840,7 +840,7 @@ async def background_loop(
         async with sem:
             await _process_symbol(client, sym, cfg, run_state)
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             while True:
                 run_state.iteration += 1
