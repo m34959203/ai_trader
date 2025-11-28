@@ -19,7 +19,7 @@ from pydantic import (
     model_validator,
 )
 
-from .indicators import bollinger_bands, cross_over, cross_under, ema, rsi
+from .indicators import bollinger_bands, cross_over, cross_under, ema, rsi, ichimoku, vwap
 
 
 ALLOWED_STRATEGY_KINDS = {
@@ -29,6 +29,10 @@ ALLOWED_STRATEGY_KINDS = {
     "rsi_mean_reversion",
     "bollinger",
     "bollinger_breakout",
+    "ichimoku",
+    "ichimoku_cloud",
+    "vwap",
+    "vwap_reversion",
 }
 
 
@@ -604,6 +608,164 @@ def bollinger_breakout_signals(
     return out
 
 
+def ichimoku_signals(
+    df: pd.DataFrame,
+    tenkan_period: int = 9,
+    kijun_period: int = 26,
+    senkou_b_period: int = 52,
+    displacement: int = 26,
+    mode: str = "cloud",
+) -> pd.DataFrame:
+    """Ichimoku Cloud strategy signals.
+
+    Args:
+        df: OHLCV DataFrame
+        tenkan_period: Conversion line period (default 9)
+        kijun_period: Base line period (default 26)
+        senkou_b_period: Leading span B period (default 52)
+        displacement: Cloud displacement (default 26)
+        mode: Signal mode - "cloud" (cloud breakout), "tenkan_kijun" (TK cross), or "both"
+
+    Returns:
+        DataFrame with Ichimoku indicators and signals
+    """
+    required = ["close", "high", "low"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"ichimoku_signals: missing columns: {missing}")
+
+    s = _ensure_time_cols(df).copy()
+    for col in ["close", "high", "low"]:
+        s[col] = pd.to_numeric(s[col], errors="coerce")
+    s = s.dropna(subset=required)
+
+    # Calculate Ichimoku
+    ichi = ichimoku(
+        s,
+        tenkan_period=tenkan_period,
+        kijun_period=kijun_period,
+        senkou_b_period=senkou_b_period,
+        displacement=displacement,
+    )
+    s = s.join(ichi)
+
+    s["signal"] = 0
+
+    mode = mode.lower()
+
+    # Cloud breakout signals (price vs cloud)
+    if mode in {"cloud", "both"}:
+        # Bullish: price crosses above cloud
+        above_cloud = (s["close"] > s["senkou_span_a"]) & (s["close"] > s["senkou_span_b"])
+        below_cloud = (s["close"] < s["senkou_span_a"]) & (s["close"] < s["senkou_span_b"])
+
+        bullish_break = (
+            (s["close"].shift(1) <= s[["senkou_span_a", "senkou_span_b"]].shift(1).max(axis=1)) &
+            above_cloud
+        )
+        bearish_break = (
+            (s["close"].shift(1) >= s[["senkou_span_a", "senkou_span_b"]].shift(1).min(axis=1)) &
+            below_cloud
+        )
+
+        s.loc[bullish_break, "signal"] = 1
+        s.loc[bearish_break, "signal"] = -1
+
+    # Tenkan-Kijun cross signals
+    if mode in {"tenkan_kijun", "tk_cross", "both"}:
+        tk_bullish = cross_over(s["tenkan_sen"], s["kijun_sen"])
+        tk_bearish = cross_under(s["tenkan_sen"], s["kijun_sen"])
+
+        if mode == "both":
+            # In "both" mode, reinforce signals
+            s.loc[tk_bullish & (s["signal"] == 0), "signal"] = 1
+            s.loc[tk_bearish & (s["signal"] == 0), "signal"] = -1
+        else:
+            s.loc[tk_bullish, "signal"] = 1
+            s.loc[tk_bearish, "signal"] = -1
+
+    out = s[["ts", "timestamp", "close", "tenkan_sen", "kijun_sen",
+             "senkou_span_a", "senkou_span_b", "chikou_span", "signal"]].copy()
+    out["ts"] = out["ts"].astype(np.int64)
+    out["timestamp"] = out["timestamp"].astype(np.int64)
+    out["signal"] = pd.to_numeric(out["signal"], errors="coerce").fillna(0).astype(int).clip(-1, 1)
+    return out
+
+
+def vwap_signals(
+    df: pd.DataFrame,
+    session_start_hour: int = 0,
+    mode: str = "reversion",
+    deviation_threshold: float = 0.002,
+) -> pd.DataFrame:
+    """VWAP (Volume-Weighted Average Price) strategy signals.
+
+    Args:
+        df: OHLCV DataFrame with volume
+        session_start_hour: Hour to reset VWAP (default 0 = midnight UTC)
+        mode: "reversion" (mean reversion) or "trend" (trend following)
+        deviation_threshold: Minimum % deviation from VWAP to trigger signal (default 0.2%)
+
+    Returns:
+        DataFrame with VWAP and signals
+    """
+    required = ["close", "volume"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"vwap_signals: missing columns: {missing}")
+
+    s = _ensure_time_cols(df).copy()
+    s["close"] = pd.to_numeric(s["close"], errors="coerce")
+    s["volume"] = pd.to_numeric(s["volume"], errors="coerce")
+    s = s.dropna(subset=required)
+
+    # Handle typical price if high/low available
+    if "high" in s.columns and "low" in s.columns:
+        s["high"] = pd.to_numeric(s["high"], errors="coerce")
+        s["low"] = pd.to_numeric(s["low"], errors="coerce")
+        s["typical_price"] = (s["high"] + s["low"] + s["close"]) / 3.0
+    else:
+        s["typical_price"] = s["close"]
+
+    # Calculate VWAP
+    vwap_series = vwap(
+        s,
+        session_start_hour=session_start_hour,
+        typical_price_col="typical_price",
+    )
+    s["vwap"] = vwap_series
+
+    # Calculate deviation from VWAP
+    s["vwap_dev"] = (s["close"] - s["vwap"]) / s["vwap"].replace(0.0, np.nan)
+
+    s["signal"] = 0
+
+    mode = mode.lower()
+
+    if mode in {"reversion", "mean_reversion"}:
+        # Mean reversion: sell when far above VWAP, buy when far below
+        overbought = s["vwap_dev"] > deviation_threshold  # Price > VWAP + threshold
+        oversold = s["vwap_dev"] < -deviation_threshold  # Price < VWAP - threshold
+
+        # Reversion to mean
+        s.loc[oversold, "signal"] = 1  # Buy when below VWAP
+        s.loc[overbought, "signal"] = -1  # Sell when above VWAP
+
+    elif mode in {"trend", "breakout"}:
+        # Trend following: buy when crossing above VWAP, sell when crossing below
+        cross_above = cross_over(s["close"], s["vwap"])
+        cross_below = cross_under(s["close"], s["vwap"])
+
+        s.loc[cross_above, "signal"] = 1
+        s.loc[cross_below, "signal"] = -1
+
+    out = s[["ts", "timestamp", "close", "vwap", "vwap_dev", "signal"]].copy()
+    out["ts"] = out["ts"].astype(np.int64)
+    out["timestamp"] = out["timestamp"].astype(np.int64)
+    out["signal"] = pd.to_numeric(out["signal"], errors="coerce").fillna(0).astype(int).clip(-1, 1)
+    return out
+
+
 def apply_frequency_filter(
     df: pd.DataFrame,
     *,
@@ -666,6 +828,10 @@ def _run_strategy_definition(df: pd.DataFrame, definition: StrategyDefinition) -
         return rsi_reversion_signals(df, **params)
     if kind in {"bollinger", "bollinger_breakout"}:
         return bollinger_breakout_signals(df, **params)
+    if kind in {"ichimoku", "ichimoku_cloud"}:
+        return ichimoku_signals(df, **params)
+    if kind in {"vwap", "vwap_reversion"}:
+        return vwap_signals(df, **params)
     raise ValueError(f"Unknown strategy kind: {definition.kind}")
 
 
