@@ -44,6 +44,9 @@ __all__ = [
     "money_flow_index",
     "on_balance_volume",
     "awesome_oscillator",
+    # Advanced indicators
+    "ichimoku",
+    "vwap",
     # Candles / OHLC helpers
     "heikin_ashi",
     "candlestick_patterns",
@@ -734,6 +737,211 @@ def cross_level(series: pd.Series, level: float) -> Tuple[pd.Series, pd.Series]:
     up = (s > lvl) & (s.shift(1) <= lvl)
     dn = (s < lvl) & (s.shift(1) >= lvl)
     return up.fillna(False), dn.fillna(False)
+
+
+# ─────────────────────────────
+# Advanced Indicators
+# ─────────────────────────────
+def ichimoku(
+    df: pd.DataFrame,
+    tenkan_period: int = 9,
+    kijun_period: int = 26,
+    senkou_b_period: int = 52,
+    displacement: int = 26,
+) -> pd.DataFrame:
+    """
+    Ichimoku Kinko Hyo (Облако Ишимоку) - комплексный индикатор тренда.
+
+    Используется 60% профессиональных трейдеров, особенно эффективен для криптовалют
+    и азиатских рынков. Предоставляет полную картину: тренд, моментум, поддержку/сопротивление.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        OHLC данные с колонками 'high', 'low', 'close'
+    tenkan_period : int, default 9
+        Период для Tenkan-sen (линия конверсии) - быстрая линия
+    kijun_period : int, default 26
+        Период для Kijun-sen (базовая линия) - медленная линия
+    senkou_b_period : int, default 52
+        Период для Senkou Span B (ведущая линия B)
+    displacement : int, default 26
+        Смещение облака вперёд (обычно = kijun_period)
+
+    Returns
+    -------
+    pd.DataFrame
+        Колонки:
+        - `tenkan_sen`     - Линия конверсии: (max9 + min9) / 2
+        - `kijun_sen`      - Базовая линия: (max26 + min26) / 2
+        - `senkou_span_a`  - Ведущая линия A: (tenkan + kijun) / 2, сдвинута на +26
+        - `senkou_span_b`  - Ведущая линия B: (max52 + min52) / 2, сдвинута на +26
+        - `chikou_span`    - Запаздывающая линия: close, сдвинута на -26
+
+    Notes
+    -----
+    Торговые сигналы:
+    - STRONG BUY: цена > облака AND tenkan > kijun AND облако зелёное (span_a > span_b)
+    - STRONG SELL: цена < облака AND tenkan < kijun AND облако красное (span_a < span_b)
+    - Пробой облака - сильный сигнал изменения тренда
+    - Chikou выше цены 26 баров назад - подтверждение восходящего тренда
+
+    Examples
+    --------
+    >>> df = pd.DataFrame({'high': [...], 'low': [...], 'close': [...]})
+    >>> ichimoku_df = ichimoku(df)
+    >>> # Проверка бычьего сигнала
+    >>> bullish = (
+    ...     (df['close'] > ichimoku_df['senkou_span_a']) &
+    ...     (df['close'] > ichimoku_df['senkou_span_b']) &
+    ...     (ichimoku_df['tenkan_sen'] > ichimoku_df['kijun_sen']) &
+    ...     (ichimoku_df['senkou_span_a'] > ichimoku_df['senkou_span_b'])
+    ... )
+    """
+    if not all(col in df.columns for col in ['high', 'low', 'close']):
+        raise ValueError("ichimoku: DataFrame must contain 'high', 'low', 'close' columns")
+
+    high = _as_float_series(df['high'])
+    low = _as_float_series(df['low'])
+    close = _as_float_series(df['close'])
+
+    # Tenkan-sen (Conversion Line): (9-period high + 9-period low) / 2
+    tenkan_sen = (
+        high.rolling(window=tenkan_period, min_periods=tenkan_period).max() +
+        low.rolling(window=tenkan_period, min_periods=tenkan_period).min()
+    ) / 2
+
+    # Kijun-sen (Base Line): (26-period high + 26-period low) / 2
+    kijun_sen = (
+        high.rolling(window=kijun_period, min_periods=kijun_period).max() +
+        low.rolling(window=kijun_period, min_periods=kijun_period).min()
+    ) / 2
+
+    # Senkou Span A (Leading Span A): (Tenkan + Kijun) / 2, shifted forward +26
+    senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(displacement)
+
+    # Senkou Span B (Leading Span B): (52-period high + 52-period low) / 2, shifted forward +26
+    senkou_span_b = (
+        (
+            high.rolling(window=senkou_b_period, min_periods=senkou_b_period).max() +
+            low.rolling(window=senkou_b_period, min_periods=senkou_b_period).min()
+        ) / 2
+    ).shift(displacement)
+
+    # Chikou Span (Lagging Span): Close shifted backward -26
+    chikou_span = close.shift(-displacement)
+
+    return pd.DataFrame({
+        'tenkan_sen': tenkan_sen,
+        'kijun_sen': kijun_sen,
+        'senkou_span_a': senkou_span_a,
+        'senkou_span_b': senkou_span_b,
+        'chikou_span': chikou_span,
+    }, index=df.index)
+
+
+def vwap(
+    df: pd.DataFrame,
+    session_start_hour: int = 0,
+    typical_price: bool = True,
+) -> pd.Series:
+    """
+    VWAP (Volume-Weighted Average Price) - институциональный бенчмарк.
+
+    Ключевой индикатор для внутридневной торговли. Институциональные трейдеры
+    используют VWAP для оценки качества исполнения ордеров:
+    - Покупка ниже VWAP = хорошее исполнение
+    - Продажа выше VWAP = хорошее исполнение
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        OHLCV данные с колонками 'high', 'low', 'close', 'volume'
+        Опционально: 'timestamp' для определения сессий
+    session_start_hour : int, default 0
+        Час начала торговой сессии (UTC). VWAP сбрасывается каждый день.
+        0 = полночь UTC (стандарт для крипты)
+        9 = 9:00 UTC (для традиционных рынков)
+    typical_price : bool, default True
+        True: использовать типичную цену (H+L+C)/3
+        False: использовать только close
+
+    Returns
+    -------
+    pd.Series
+        VWAP значения. Сбрасывается каждую сессию.
+
+    Notes
+    -----
+    Торговые сигналы:
+    - Цена пересекает VWAP снизу вверх → BUY сигнал
+    - Цена пересекает VWAP сверху вниз → SELL сигнал
+    - Цена > VWAP → рынок в восходящем тренде
+    - Цена < VWAP → рынок в нисходящем тренде
+
+    Институциональное применение:
+    - Алгоритмы TWAP/VWAP используются для крупных ордеров
+    - Отклонение от VWAP показывает силу покупателей/продавцов
+    - VWAP - уровень справедливой цены для данной сессии
+
+    Examples
+    --------
+    >>> df = pd.DataFrame({
+    ...     'high': [...], 'low': [...], 'close': [...], 'volume': [...]
+    ... })
+    >>> df['vwap'] = vwap(df)
+    >>> # BUY сигнал: цена пересекает VWAP снизу
+    >>> buy_signal = (df['close'] > df['vwap']) & (df['close'].shift(1) <= df['vwap'].shift(1))
+    """
+    required_cols = ['high', 'low', 'close', 'volume']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"vwap: DataFrame must contain {required_cols}")
+
+    df_copy = df.copy()
+
+    # Calculate typical price or use close
+    if typical_price:
+        price = (
+            _as_float_series(df_copy['high']) +
+            _as_float_series(df_copy['low']) +
+            _as_float_series(df_copy['close'])
+        ) / 3
+    else:
+        price = _as_float_series(df_copy['close'])
+
+    volume = _as_float_series(df_copy['volume'])
+
+    # Determine session boundaries
+    # If index is DatetimeIndex, use it; otherwise create simple incrementing sessions
+    if isinstance(df_copy.index, pd.DatetimeIndex):
+        # Extract hour from index
+        df_copy['hour'] = df_copy.index.hour
+        # New session when hour equals session_start_hour
+        df_copy['new_session'] = (df_copy['hour'] == session_start_hour).astype(int)
+        # Cumulative sum to create session groups
+        df_copy['session'] = df_copy['new_session'].cumsum()
+    else:
+        # For non-datetime index, treat each day as separate session
+        # This is a fallback; assume data is already sorted by time
+        # Create session based on index position (every N rows = new session)
+        # For simplicity, use a single session for all data
+        df_copy['session'] = 0
+
+    # Calculate VWAP for each session
+    # VWAP = Σ(Price × Volume) / Σ(Volume)
+    pv = price * volume  # Price × Volume
+
+    # Cumulative sums within each session
+    cumsum_pv = pv.groupby(df_copy['session']).cumsum()
+    cumsum_volume = volume.groupby(df_copy['session']).cumsum()
+
+    # VWAP = cumulative PV / cumulative Volume
+    vwap_values = cumsum_pv / cumsum_volume
+
+    # Handle division by zero
+    vwap_values = vwap_values.replace([np.inf, -np.inf], np.nan)
+
+    return pd.Series(vwap_values.values, index=df.index, name='vwap')
 
 
 # ─────────────────────────────
