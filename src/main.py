@@ -1391,3 +1391,30 @@ async def root() -> Dict[str, Any]:
             "ENABLE_BG_TASKS": ENABLE_BG_TASKS,
         },
     }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Monitoring & Dashboard
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from routers.monitoring import router as monitoring_router
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+    _HAS_MONITORING = True
+except Exception:
+    _HAS_MONITORING = False
+
+# Add monitoring router
+if _HAS_MONITORING:
+    app.include_router(monitoring_router, tags=["monitoring"])
+    # Serve static files for dashboard
+    try:
+        app.mount("/static", StaticFiles(directory="static"), name="static")
+        
+        @app.get("/dashboard", tags=["monitoring"])
+        async def dashboard():
+            """Serve monitoring dashboard."""
+            return FileResponse("static/dashboard.html")
+            
+        LOG.info("Monitoring dashboard available at /dashboard")
+    except Exception as e:
+        LOG.warning(f"Failed to mount static files: {e}")
