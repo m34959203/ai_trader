@@ -11,6 +11,19 @@ import pandas as pd
 from .analyze_market import AnalysisConfig, DEFAULT_CONFIG, analyze_market
 from ..strategy import StrategyEnsembleConfig, run_configured_ensemble
 
+# ML Integration
+try:
+    from .lstm_integration import LSTMSignalGenerator, integrate_lstm_with_technical
+    LSTM_AVAILABLE = True
+except ImportError:
+    LSTM_AVAILABLE = False
+
+try:
+    from ..models.meta_learner import MetaLearner, extract_meta_features
+    META_LEARNER_AVAILABLE = True
+except ImportError:
+    META_LEARNER_AVAILABLE = False
+
 __all__ = ["MultiStrategyOrchestrator", "OrchestratedSignal"]
 
 
@@ -31,6 +44,7 @@ class MultiStrategyOrchestrator:
       • use :func:`analyze_market` for enriched technical/news reasoning
       • execute a :class:`StrategyEnsembleConfig` and inspect per-strategy votes
       • combine the two streams into a single actionable decision
+      • ENHANCED: ML integration (LSTM + Meta-Learner)
     """
 
     def __init__(
@@ -39,10 +53,42 @@ class MultiStrategyOrchestrator:
         *,
         analysis_config: AnalysisConfig = DEFAULT_CONFIG,
         history_limit: int = 30,
+        lstm_model_path: Optional[str] = None,
+        meta_learner_path: Optional[str] = None,
+        enable_lstm: bool = True,
+        enable_meta_learner: bool = True,
+        lstm_weight: float = 0.3,  # 30% LSTM, 70% technical
     ) -> None:
         self._strategy_config = strategy_config
         self._analysis_config = analysis_config
         self._history_limit = max(5, int(history_limit))
+
+        # LSTM Integration
+        self.lstm_generator = None
+        self.enable_lstm = enable_lstm and LSTM_AVAILABLE
+        if self.enable_lstm and lstm_model_path:
+            try:
+                self.lstm_generator = LSTMSignalGenerator(
+                    model_path=lstm_model_path,
+                    min_confidence=0.55,
+                    min_move_pct=0.005,
+                )
+            except Exception as e:
+                print(f"Warning: Failed to load LSTM model: {e}")
+                self.enable_lstm = False
+
+        # Meta-Learner Integration
+        self.meta_learner = None
+        self.enable_meta_learner = enable_meta_learner and META_LEARNER_AVAILABLE
+        if self.enable_meta_learner and meta_learner_path:
+            try:
+                self.meta_learner = MetaLearner()
+                self.meta_learner.load(meta_learner_path)
+            except Exception as e:
+                print(f"Warning: Failed to load Meta-Learner: {e}")
+                self.enable_meta_learner = False
+
+        self.lstm_weight = lstm_weight
 
     @staticmethod
     def _prepare_strategy_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -176,10 +222,123 @@ class MultiStrategyOrchestrator:
                 latest.get("score"),
             )
 
+        # ML Enhancement: LSTM Integration
+        lstm_result = None
+        if self.enable_lstm and self.lstm_generator:
+            try:
+                lstm_signal = self.lstm_generator.generate_signal(df_fast)
+                lstm_result = {
+                    "direction": lstm_signal.direction,
+                    "confidence": lstm_signal.confidence,
+                    "predicted_move": lstm_signal.predicted_move,
+                    "signal": lstm_signal.signal,
+                }
+
+                # Integrate LSTM with technical signal
+                tech_signal = orchestrated.signal
+                tech_conf = orchestrated.confidence / 100.0  # Convert to 0-1
+
+                combined = integrate_lstm_with_technical(
+                    tech_signal=tech_signal,
+                    tech_confidence=tech_conf,
+                    lstm_signal=lstm_signal,
+                    lstm_weight=self.lstm_weight,
+                )
+
+                # Create enhanced orchestrated signal
+                enhanced_reasons = list(orchestrated.reasons)
+                enhanced_reasons.append(combined["reason"])
+
+                orchestrated = OrchestratedSignal(
+                    signal=combined["final_signal"],
+                    confidence=int(combined["final_confidence"] * 100),
+                    reasons=enhanced_reasons,
+                    sources={
+                        **orchestrated.sources,
+                        "lstm": lstm_result,
+                        "ml_combined": {
+                            "method": "weighted_ensemble",
+                            "lstm_weight": self.lstm_weight,
+                            "tech_weight": 1 - self.lstm_weight,
+                        },
+                    },
+                )
+            except Exception as e:
+                print(f"Warning: LSTM integration failed: {e}")
+
+        # ML Enhancement: Meta-Learner Filtering
+        meta_result = None
+        if self.enable_meta_learner and self.meta_learner and self.meta_learner.is_trained:
+            try:
+                # Convert signal to direction
+                signal_direction = {"buy": 1, "sell": -1, "flat": 0}.get(
+                    orchestrated.signal.lower(), 0
+                )
+
+                # Extract meta-features from current market state
+                meta_features = extract_meta_features(
+                    df=df_fast,
+                    signal_direction=signal_direction,
+                    signal_confidence=orchestrated.confidence / 100.0,
+                    signal_source="orchestrator",
+                )
+
+                # Get meta-learner prediction
+                meta_prediction = self.meta_learner.predict(
+                    features=meta_features,
+                    original_signal=signal_direction,
+                )
+
+                meta_result = meta_prediction.to_dict()
+
+                # Apply meta-learner filtering
+                if not meta_prediction.should_take:
+                    # Meta-learner recommends skipping this signal
+                    filtered_reasons = list(orchestrated.reasons)
+                    filtered_reasons.append(
+                        f"🚫 Meta-Learner filtered signal: {meta_prediction.reason}"
+                    )
+
+                    orchestrated = OrchestratedSignal(
+                        signal="flat",
+                        confidence=int(meta_prediction.confidence * 100),
+                        reasons=filtered_reasons,
+                        sources={
+                            **orchestrated.sources,
+                            "meta_learner": meta_result,
+                            "original_signal_before_filter": orchestrated.signal,
+                        },
+                    )
+                else:
+                    # Meta-learner approves - boost confidence
+                    boosted_conf = int(
+                        (orchestrated.confidence / 100.0 * 0.7 + meta_prediction.confidence * 0.3) * 100
+                    )
+                    approved_reasons = list(orchestrated.reasons)
+                    approved_reasons.append(
+                        f"✓ Meta-Learner approved ({meta_prediction.probability_profitable:.0%} prob): {meta_prediction.reason}"
+                    )
+
+                    orchestrated = OrchestratedSignal(
+                        signal=orchestrated.signal,
+                        confidence=min(100, boosted_conf),
+                        reasons=approved_reasons,
+                        sources={
+                            **orchestrated.sources,
+                            "meta_learner": meta_result,
+                        },
+                    )
+            except Exception as e:
+                print(f"Warning: Meta-learner integration failed: {e}")
+
         return {
             "analysis": analysis,
             "ensemble": ensemble_payload,
             "final": orchestrated,
+            "ml": {
+                "lstm": lstm_result,
+                "meta_learner": meta_result,
+            },
         }
 
 

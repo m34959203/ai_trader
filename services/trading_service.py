@@ -29,6 +29,15 @@ from utils.risk_config import load_risk_config
 from src.models.base import MarketFeatures
 from src.utils_math import clamp01
 from utils.structured_logging import get_logger
+
+# Advanced risk management
+try:
+    from risk.advanced_sizing import AdvancedPositionSizer
+    from risk.portfolio_correlation import PortfolioCorrelationTracker, Position as CorrelationPosition
+    from risk.gap_protection import GapProtector
+    ADVANCED_RISK_AVAILABLE = True
+except ImportError:
+    ADVANCED_RISK_AVAILABLE = False
 try:
     # Необязательная зависимость (если добавляли ранее)
     from risk.risk_manager import (
@@ -419,6 +428,26 @@ class TradingService:
         self._day_start_equity: Optional[float] = None
         self._day_trades_count: int = 0
 
+        # Advanced risk management integration
+        self._advanced_sizer: Optional[AdvancedPositionSizer] = None
+        self._correlation_tracker: Optional[PortfolioCorrelationTracker] = None
+        self._gap_protector: Optional[GapProtector] = None
+        if ADVANCED_RISK_AVAILABLE:
+            try:
+                # Will be initialized lazily when equity is known
+                self._advanced_sizer = None  # Initialized in _ensure_advanced_risk()
+                self._correlation_tracker = PortfolioCorrelationTracker(
+                    window=90,  # 90-day correlation window
+                    min_periods=30,
+                )
+                self._gap_protector = GapProtector()
+                LOG.info("Advanced risk management enabled (Kelly + Correlation + Gap Protection)")
+            except Exception as e:
+                LOG.warning(f"Failed to initialize advanced risk management: {e}")
+                self._advanced_sizer = None
+                self._correlation_tracker = None
+                self._gap_protector = None
+
     # ------------ lifecycle ------------
     async def close(self) -> None:
         """Освобождает ресурсы текущего исполнителя (HTTP-сессии и т.п.)."""
@@ -662,6 +691,18 @@ class TradingService:
             self._day_start_equity = self._estimate_equity(bal, self.risk.default_quote_ccy)
             LOG.info("Day start equity fixed: %.8f", self._day_start_equity)
 
+    async def _ensure_advanced_risk(self, current_equity: float) -> None:
+        """Lazily initialize advanced position sizer with current equity."""
+        if ADVANCED_RISK_AVAILABLE and self._advanced_sizer is None and current_equity > 0:
+            try:
+                self._advanced_sizer = AdvancedPositionSizer(
+                    initial_equity=current_equity,
+                    kelly_lookback=50,
+                )
+                LOG.info("Advanced position sizer initialized with equity: %.2f", current_equity)
+            except Exception as e:
+                LOG.warning(f"Failed to initialize advanced position sizer: {e}")
+
     @staticmethod
     def _estimate_equity(balance: Dict[str, Any], preferred_quote: str = "USDT") -> float:
         """
@@ -854,8 +895,51 @@ class TradingService:
             LOG.warning("Risk check: no price for %s; cannot size by risk nor portfolio check", symbol)
             return float(amount), "no_price_for_risk_check"
 
+        # Initialize advanced risk management
+        await self._ensure_advanced_risk(equity)
+
+        # ADVANCED RISK MANAGEMENT: Base risk calculation
+        base_risk_pct = float(cfg_local.per_trade_risk_pct)
+
+        # Apply advanced sizing if available (Kelly + Volatility + Drawdown)
+        advanced_adjustments = {}
+        if self._advanced_sizer:
+            try:
+                # Calculate ATR percentage for volatility adjustment
+                # Try to get ATR from features if available, otherwise estimate from price
+                atr_pct = 0.02  # Default 2% if not available
+
+                # Calculate advanced position size
+                final_risk_pct, adjustments = self._advanced_sizer.calculate_position_size(
+                    base_risk=base_risk_pct,
+                    atr_pct=atr_pct,
+                    current_equity=equity,
+                    signal_confidence=None,  # Could be passed from signal if available
+                    force_trading=False,
+                )
+
+                base_risk_pct = final_risk_pct
+                advanced_adjustments = adjustments
+
+                if adjustments.get("volatility", {}).get("multiplier", 1.0) == 0.0:
+                    # Extreme volatility halt
+                    reason = adjustments.get("volatility", {}).get("reason", "Extreme volatility halt")
+                    LOG.warning("BLOCK open: %s %s — %s", symbol, side, reason)
+                    raise ValueError(f"Trading halted: {reason}")
+
+                LOG.debug(
+                    "Advanced sizing: base=%.4f → final=%.4f (reduction=%.1f%%)",
+                    cfg_local.per_trade_risk_pct,
+                    final_risk_pct,
+                    adjustments.get("reduction_from_base", 0)
+                )
+            except ValueError:
+                raise  # Re-raise volatility halts
+            except Exception as e:
+                LOG.warning(f"Advanced sizing failed: {e}, falling back to base risk")
+
         # максимально допустимый нотиционал по per-trade:
-        max_notional = equity * float(cfg_local.per_trade_risk_pct) / float(sl_pct)
+        max_notional = equity * float(base_risk_pct) / float(sl_pct)
         wanted_notional = float(amount) * float(est_price)
 
         approved_amount = float(amount)
@@ -888,6 +972,90 @@ class TradingService:
             stop_loss_price=float(sl_abs),
             min_sl_distance_pct=cfg_risk.min_sl_distance_pct,
         )
+
+        # ADVANCED RISK: Correlation-adjusted sizing
+        if self._correlation_tracker and ADVANCED_RISK_AVAILABLE:
+            try:
+                # Convert positions to correlation format
+                corr_positions = []
+                for p in positions:
+                    corr_positions.append(CorrelationPosition(
+                        symbol=p["symbol"],
+                        side="long",  # Simplified - would need actual side from position
+                        quantity=p["qty"],
+                        entry_price=p["entry_price"],
+                        stop_loss=p.get("stop_loss_price", 0.0) or 0.0,
+                        risk_fraction=position_risk_fraction_from_params(
+                            equity=equity,
+                            qty=p["qty"],
+                            entry_price=p["entry_price"],
+                            stop_loss_price=p.get("stop_loss_price"),
+                            min_sl_distance_pct=cfg_risk.min_sl_distance_pct,
+                        ),
+                    ))
+
+                # Create proposed new position
+                new_position = CorrelationPosition(
+                    symbol=symbol,
+                    side="long" if side == "buy" else "short",
+                    quantity=approved_amount,
+                    entry_price=est_price,
+                    stop_loss=sl_abs,
+                    risk_fraction=new_risk_frac,
+                )
+
+                # Get correlation-adjusted size
+                adjusted_risk_frac, corr_warnings = self._correlation_tracker.calculate_correlation_adjusted_size(
+                    new_position=new_position,
+                    existing_positions=corr_positions,
+                    target_portfolio_risk=cfg_risk.portfolio_max_risk_pct,
+                )
+
+                if corr_warnings:
+                    for w in corr_warnings:
+                        LOG.info(f"Correlation adjustment: {w}")
+                    warn = (warn or "") + "|correlation_adjusted"
+
+                # Adjust amount based on correlation-adjusted risk
+                if adjusted_risk_frac < new_risk_frac:
+                    # Need to reduce position size
+                    reduction_factor = adjusted_risk_frac / new_risk_frac if new_risk_frac > 0 else 0.0
+                    approved_amount = approved_amount * reduction_factor
+                    new_risk_frac = adjusted_risk_frac
+                    LOG.info(
+                        f"Correlation-adjusted size: reduced by {(1 - reduction_factor) * 100:.1f}% "
+                        f"(new amount: {approved_amount:.8f})"
+                    )
+            except Exception as e:
+                LOG.warning(f"Correlation adjustment failed: {e}")
+
+        # ADVANCED RISK: Gap protection check
+        if self._gap_protector:
+            try:
+                from datetime import datetime, timezone
+                current_time = datetime.now(timezone.utc)
+                gap_adjustment = self._gap_protector.get_adjustment(current_time)
+
+                if gap_adjustment.should_trade:
+                    # Apply gap protection adjustments
+                    approved_amount *= gap_adjustment.size_multiplier
+                    # Note: stop_multiplier would need to be applied to SL/TP prices in the calling code
+                    if gap_adjustment.size_multiplier < 1.0:
+                        warn = (warn or "") + f"|gap_protection_{gap_adjustment.period}"
+                        LOG.info(
+                            f"Gap protection ({gap_adjustment.period}): "
+                            f"size reduced by {(1 - gap_adjustment.size_multiplier) * 100:.1f}%, "
+                            f"reason: {gap_adjustment.reason}"
+                        )
+                else:
+                    # Gap protection blocks trading
+                    reason = f"Gap protection halt ({gap_adjustment.period}): {gap_adjustment.reason}"
+                    LOG.warning("BLOCK open: %s %s — %s", symbol, side, reason)
+                    raise ValueError(reason)
+            except ValueError:
+                raise  # Re-raise gap protection halts
+            except Exception as e:
+                LOG.warning(f"Gap protection check failed: {e}")
 
         # проверка (число позиций и суммарный риск)
         if not can_open_new(

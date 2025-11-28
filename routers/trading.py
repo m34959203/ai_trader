@@ -28,6 +28,7 @@ from src.strategy import (
     run_configured_ensemble,
 )
 from src.paper import PaperTrader
+from src.slippage_model import SlippageModel, create_realistic_model
 
 LOG = logging.getLogger("ai_trader.trading")
 router = APIRouter(tags=["trading"])
@@ -560,7 +561,15 @@ async def run_backtest(
             validate="one_to_one",
         ).sort_values("ts")
 
-        # 5) симулятор сделок
+        # 5) Слипpage модель для реалистичных fills
+        slippage_model = create_realistic_model()
+
+        # Рассчитываем ATR для slippage
+        from src.indicators import atr as calc_atr
+        df_with_atr = df.copy()
+        df_with_atr['atr'] = calc_atr(df['high'], df['low'], df['close'], period=14)
+
+        # 6) симулятор сделок
         trader = PaperTrader(
             sl_pct=float(req.sl_pct),
             tp_pct=float(req.tp_pct),
@@ -569,7 +578,7 @@ async def run_backtest(
             qty=getattr(req, "qty", 1.0) if hasattr(req, "qty") else 1.0,
         )
 
-        for _, row in merged.iterrows():
+        for idx, row in merged.iterrows():
             ts = int(row["ts"])
             price_close = float(row["close"])
             # если high/low нет, берём close
@@ -579,8 +588,52 @@ async def run_backtest(
 
             # Сначала SL/TP (интрабар), затем обработка сигнала на close
             trader.check_sl_tp(ts, high=high, low=low)
+
             if signal != 0:
-                trader.on_signal(ts, price_close, signal)
+                # ИНТЕГРАЦИЯ SLIPPAGE: Реалистичная цена исполнения
+                qty = trader.qty
+
+                # Получаем ATR для данного бара
+                atr_value = df_with_atr.loc[df_with_atr['ts'] == ts, 'atr'].values
+                atr_val = float(atr_value[0]) if len(atr_value) > 0 else 0.0
+                volatility = atr_val / price_close if price_close > 0 else 0.02
+
+                # Средний volume за последние 20 баров
+                current_idx = df[df['ts'] == ts].index[0]
+                lookback_start = max(0, current_idx - 20)
+                avg_volume = df.iloc[lookback_start:current_idx]['volume'].mean()
+                if pd.isna(avg_volume) or avg_volume <= 0:
+                    avg_volume = df['volume'].mean()
+
+                # Детект gap events
+                is_gap = False
+                if current_idx > 0:
+                    prev_close = df.iloc[current_idx - 1]['close']
+                    gap_pct = abs(price_close - prev_close) / prev_close
+                    is_gap = gap_pct > 0.02  # 2% gap threshold
+
+                # Рассчитываем realistic fill price с slippage
+                fill_price = slippage_model.calculate_fill_price(
+                    entry_price=price_close,
+                    quantity=qty,
+                    avg_volume=avg_volume,
+                    volatility=volatility,
+                    side="buy" if signal > 0 else "sell",
+                    is_market_order=True,
+                    is_gap_event=is_gap,
+                )
+
+                # Логируем slippage для первых нескольких сделок
+                if len(trader.trades) < 3:
+                    slippage_pct = abs(fill_price - price_close) / price_close
+                    LOG.info(
+                        f"[SLIPPAGE] Signal={signal}, Close={price_close:.2f}, "
+                        f"Fill={fill_price:.2f}, Slippage={slippage_pct:.3%}, "
+                        f"Vol={volatility:.3%}, Gap={is_gap}"
+                    )
+
+                # Используем realistic fill price
+                trader.on_signal(ts, fill_price, signal)
 
         # 6) гарантия закрытия позиции по последнему close
         if trader.position is not None and len(merged) > 0:
