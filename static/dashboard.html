@@ -25,6 +25,15 @@
             border-radius: 15px;
             margin-bottom: 30px;
             box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .header-left {
+            flex: 1;
         }
 
         .header h1 {
@@ -37,6 +46,56 @@
             align-items: center;
             gap: 10px;
             font-size: 1.2em;
+        }
+
+        .header-controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .lang-switcher {
+            display: flex;
+            gap: 5px;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 5px;
+            border-radius: 8px;
+        }
+
+        .lang-btn {
+            background: transparent;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 6px;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+
+        .lang-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .lang-btn.active {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        .help-btn {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 1.1em;
+            transition: all 0.2s;
+        }
+
+        .help-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(1.05);
         }
 
         .status-indicator {
@@ -65,6 +124,14 @@
             padding: 20px;
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
             border: 1px solid #334155;
+            transition: all 0.3s;
+            position: relative;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 12px rgba(0, 0, 0, 0.2);
+            border-color: #475569;
         }
 
         .card h3 {
@@ -73,6 +140,59 @@
             text-transform: uppercase;
             letter-spacing: 1px;
             margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .info-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            background: rgba(100, 116, 139, 0.3);
+            border-radius: 50%;
+            font-size: 12px;
+            cursor: help;
+            color: #94a3b8;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+
+        .info-icon:hover {
+            background: rgba(100, 116, 139, 0.5);
+            transform: scale(1.1);
+        }
+
+        .tooltip {
+            position: relative;
+        }
+
+        .tooltiptext {
+            visibility: hidden;
+            width: 280px;
+            background-color: #334155;
+            color: #e2e8f0;
+            text-align: left;
+            border-radius: 8px;
+            padding: 12px;
+            position: absolute;
+            z-index: 1000;
+            top: 100%;
+            left: 0;
+            margin-top: 8px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 0.85em;
+            line-height: 1.5;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            border: 1px solid #475569;
+        }
+
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
         }
 
         .metric-value {
@@ -171,59 +291,216 @@
             padding: 40px;
             color: #64748b;
         }
+
+        /* Modal Styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(5px);
+        }
+
+        .modal-content {
+            background: #1e293b;
+            margin: 5% auto;
+            padding: 40px;
+            border: 1px solid #475569;
+            border-radius: 15px;
+            width: 90%;
+            max-width: 900px;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #334155;
+        }
+
+        .modal-header h2 {
+            font-size: 2em;
+            color: #e2e8f0;
+        }
+
+        .close {
+            color: #94a3b8;
+            font-size: 35px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .close:hover,
+        .close:focus {
+            color: #e2e8f0;
+            transform: scale(1.1);
+        }
+
+        .help-section {
+            margin-bottom: 30px;
+        }
+
+        .help-section h3 {
+            color: #667eea;
+            font-size: 1.5em;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .help-section ul {
+            margin-left: 20px;
+            line-height: 2;
+        }
+
+        .help-section li {
+            margin-bottom: 10px;
+            color: #cbd5e1;
+        }
+
+        .help-section strong {
+            color: #10b981;
+        }
+
+        .help-section code {
+            background: #0f172a;
+            padding: 2px 8px;
+            border-radius: 4px;
+            color: #3b82f6;
+            font-family: 'Courier New', monospace;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .feature-item {
+            background: #0f172a;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 3px solid #667eea;
+        }
+
+        @media (max-width: 768px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .header h1 {
+                font-size: 1.8em;
+            }
+
+            .modal-content {
+                padding: 20px;
+                margin: 10% auto;
+            }
+
+            .tooltiptext {
+                width: 200px;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🚀 AI Trader - Monitoring Dashboard</h1>
-        <div class="status">
-            <div class="status-indicator" id="statusIndicator"></div>
-            <span id="statusText">System Healthy</span>
+        <div class="header-left">
+            <h1 id="headerTitle">🚀 AI Trader - Monitoring Dashboard</h1>
+            <div class="status">
+                <div class="status-indicator" id="statusIndicator"></div>
+                <span id="statusText">System Healthy</span>
+            </div>
+        </div>
+        <div class="header-controls">
+            <div class="lang-switcher">
+                <button class="lang-btn active" onclick="switchLanguage('en')" id="btnEn">EN</button>
+                <button class="lang-btn" onclick="switchLanguage('ru')" id="btnRu">RU</button>
+            </div>
+            <button class="help-btn" onclick="openHelp()" id="helpBtn">❓ Help</button>
         </div>
     </div>
 
     <div class="alert-banner" id="alertBanner">
-        <strong>⚠️ Alert:</strong> <span id="alertMessage"></span>
+        <strong>⚠️ <span id="alertLabel">Alert</span>:</strong> <span id="alertMessage"></span>
     </div>
 
     <!-- Key Metrics -->
     <div class="grid">
         <div class="card">
-            <h3>Portfolio Value</h3>
+            <h3 class="tooltip">
+                <span id="metricPortfolio">Portfolio Value</span>
+                <span class="info-icon">?</span>
+                <span class="tooltiptext" id="tooltipPortfolio">Total value of your trading portfolio including cash and open positions. Updates in real-time.</span>
+            </h3>
             <div class="metric-value positive" id="portfolioValue">$0</div>
-            <div class="metric-label">Today's P&L: <span id="dailyPnl" class="neutral">$0 (0%)</span></div>
+            <div class="metric-label"><span id="labelDailyPnl">Today's P&L</span>: <span id="dailyPnl" class="neutral">$0 (0%)</span></div>
         </div>
 
         <div class="card">
-            <h3>Active Positions</h3>
+            <h3 class="tooltip">
+                <span id="metricPositions">Active Positions</span>
+                <span class="info-icon">?</span>
+                <span class="tooltiptext" id="tooltipPositions">Number of currently open trading positions. Monitor to ensure proper diversification.</span>
+            </h3>
             <div class="metric-value neutral" id="positionCount">0</div>
-            <div class="metric-label">Total exposure: <span id="exposure">0%</span></div>
+            <div class="metric-label"><span id="labelExposure">Total exposure</span>: <span id="exposure">0%</span></div>
         </div>
 
         <div class="card">
-            <h3>Total Trades</h3>
+            <h3 class="tooltip">
+                <span id="metricTrades">Total Trades</span>
+                <span class="info-icon">?</span>
+                <span class="tooltiptext" id="tooltipTrades">Total number of executed trades. Track your trading activity and frequency.</span>
+            </h3>
             <div class="metric-value" id="tradeCount">0</div>
-            <div class="metric-label">Win rate: <span id="winRate">0%</span></div>
+            <div class="metric-label"><span id="labelWinRate">Win rate</span>: <span id="winRate">0%</span></div>
         </div>
 
         <div class="card">
-            <h3>System Performance</h3>
+            <h3 class="tooltip">
+                <span id="metricPerformance">System Performance</span>
+                <span class="info-icon">?</span>
+                <span class="tooltiptext" id="tooltipPerformance">Average trade execution latency. Lower is better. Target: <50ms for optimal execution.</span>
+            </h3>
             <div class="metric-value neutral" id="avgLatency">0ms</div>
-            <div class="metric-label">Avg execution latency</div>
+            <div class="metric-label" id="labelAvgLatency">Avg execution latency</div>
         </div>
     </div>
 
     <!-- Health Checks -->
     <div class="card">
-        <h3>System Health</h3>
+        <h3 class="tooltip">
+            <span id="healthTitle">System Health</span>
+            <span class="info-icon">?</span>
+            <span class="tooltiptext" id="tooltipHealth">Real-time health status of critical system components: database, ML models, risk engine, and system resources.</span>
+        </h3>
         <div class="health-checks" id="healthChecks">
-            <div class="loading">Loading health checks...</div>
+            <div class="loading" id="loadingHealth">Loading health checks...</div>
         </div>
     </div>
 
     <!-- Performance Chart -->
     <div class="card">
-        <h3>Portfolio Performance (24h)</h3>
+        <h3 class="tooltip">
+            <span id="chartTitle">Portfolio Performance (24h)</span>
+            <span class="info-icon">?</span>
+            <span class="tooltiptext" id="tooltipChart">Real-time portfolio value over the last 24 hours. Track your performance visually.</span>
+        </h3>
         <div class="chart-container">
             <canvas id="perfChart"></canvas>
         </div>
@@ -231,32 +508,292 @@
 
     <!-- Recent Trades -->
     <div class="card">
-        <h3>Recent Trades</h3>
+        <h3 class="tooltip">
+            <span id="tradesTitle">Recent Trades</span>
+            <span class="info-icon">?</span>
+            <span class="tooltiptext" id="tooltipTrades2">Most recent trading activity with execution details and P&L results.</span>
+        </h3>
         <table class="trades-table">
             <thead>
                 <tr>
-                    <th>Time</th>
-                    <th>Symbol</th>
-                    <th>Side</th>
-                    <th>Quantity</th>
-                    <th>Price</th>
-                    <th>P&L</th>
-                    <th>Status</th>
+                    <th id="thTime">Time</th>
+                    <th id="thSymbol">Symbol</th>
+                    <th id="thSide">Side</th>
+                    <th id="thQuantity">Quantity</th>
+                    <th id="thPrice">Price</th>
+                    <th id="thPnl">P&L</th>
+                    <th id="thStatus">Status</th>
                 </tr>
             </thead>
             <tbody id="tradesTable">
                 <tr>
-                    <td colspan="7" class="loading">No trades yet</td>
+                    <td colspan="7" class="loading" id="loadingTrades">No trades yet</td>
                 </tr>
             </tbody>
         </table>
     </div>
 
     <div class="last-update">
-        Last updated: <span id="lastUpdate">Never</span>
+        <span id="labelLastUpdate">Last updated</span>: <span id="lastUpdate">Never</span>
+    </div>
+
+    <!-- Help Modal -->
+    <div id="helpModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="helpModalTitle">📖 Dashboard Help Guide</h2>
+                <span class="close" onclick="closeHelp()">&times;</span>
+            </div>
+
+            <div class="help-section">
+                <h3 id="helpWhatIs">🎯 What is this?</h3>
+                <p id="helpWhatIsText" style="color: #cbd5e1; line-height: 1.8; margin-top: 10px;">
+                    This is a real-time monitoring dashboard for your AI-powered trading system. It provides comprehensive visibility into your portfolio performance, system health, trading activity, and risk metrics. All data updates automatically via WebSocket connection.
+                </p>
+            </div>
+
+            <div class="help-section">
+                <h3 id="helpMetrics">📊 Key Metrics</h3>
+                <div class="feature-grid">
+                    <div class="feature-item">
+                        <strong id="helpPortfolio">Portfolio Value</strong>
+                        <p id="helpPortfolioText" style="font-size: 0.9em; margin-top: 8px; color: #94a3b8;">Total value of all assets. Includes cash and positions.</p>
+                    </div>
+                    <div class="feature-item">
+                        <strong id="helpPositions">Active Positions</strong>
+                        <p id="helpPositionsText" style="font-size: 0.9em; margin-top: 8px; color: #94a3b8;">Number of open trades. Monitor diversification.</p>
+                    </div>
+                    <div class="feature-item">
+                        <strong id="helpTrades">Total Trades</strong>
+                        <p id="helpTradesText" style="font-size: 0.9em; margin-top: 8px; color: #94a3b8;">Trading activity count. Track frequency.</p>
+                    </div>
+                    <div class="feature-item">
+                        <strong id="helpWinRate">Win Rate</strong>
+                        <p id="helpWinRateText" style="font-size: 0.9em; margin-top: 8px; color: #94a3b8;">Percentage of profitable trades. Target: >55%</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="help-section">
+                <h3 id="helpHealth">🏥 Health Checks</h3>
+                <ul id="helpHealthList">
+                    <li><strong>System Resources</strong> - CPU, RAM, disk usage monitoring</li>
+                    <li><strong>Database</strong> - Connection and query performance</li>
+                    <li><strong>ML Models</strong> - LSTM and Meta-Learner availability</li>
+                    <li><strong>Risk Engine</strong> - Kelly, correlation, gap protection status</li>
+                </ul>
+                <p id="helpHealthStatus" style="margin-top: 10px; color: #cbd5e1;">
+                    <strong style="color: #10b981;">Healthy</strong> - All systems operational |
+                    <strong style="color: #f59e0b;">Degraded</strong> - Some issues detected |
+                    <strong style="color: #ef4444;">Unhealthy</strong> - Critical failure
+                </p>
+            </div>
+
+            <div class="help-section">
+                <h3 id="helpFeatures">⚡ System Features</h3>
+                <ul id="helpFeaturesList">
+                    <li><strong>ML Ensemble</strong> - LSTM + Technical indicators (70/30 blend)</li>
+                    <li><strong>Meta-Learner</strong> - XGBoost filter removes 40-50% losing trades</li>
+                    <li><strong>Advanced Risk</strong> - Kelly Criterion + Correlation + Gap Protection</li>
+                    <li><strong>Strategies</strong> - EMA, RSI, Bollinger, Ichimoku, VWAP</li>
+                    <li><strong>Realistic Slippage</strong> - 0.05-0.2% based on volume/volatility</li>
+                    <li><strong>Real-time Updates</strong> - WebSocket connection every 2 seconds</li>
+                </ul>
+            </div>
+
+            <div class="help-section">
+                <h3 id="helpApi">🔗 API Endpoints</h3>
+                <ul id="helpApiList">
+                    <li><code>GET /api/monitoring/health</code> - System health status</li>
+                    <li><code>GET /api/monitoring/metrics</code> - All metrics summary</li>
+                    <li><code>GET /api/monitoring/metrics/{name}</code> - Specific metric stats</li>
+                    <li><code>GET /api/monitoring/metrics/{name}/timeseries</code> - Historical data</li>
+                    <li><code>WS /api/monitoring/ws</code> - Real-time WebSocket updates</li>
+                </ul>
+            </div>
+
+            <div class="help-section">
+                <h3 id="helpTips">💡 Tips</h3>
+                <ul id="helpTipsList">
+                    <li>Monitor <strong>Win Rate</strong> - aim for >55% for consistent profitability</li>
+                    <li>Watch <strong>Health Status</strong> - address degraded systems promptly</li>
+                    <li>Track <strong>Exposure</strong> - keep portfolio risk under control</li>
+                    <li>Check <strong>Execution Latency</strong> - ensure fast trade execution</li>
+                    <li>Review <strong>Recent Trades</strong> - validate strategy performance</li>
+                    <li>Use <strong>Language Switch</strong> - toggle between English and Russian</li>
+                </ul>
+            </div>
+        </div>
     </div>
 
     <script>
+        // Language translations
+        const translations = {
+            en: {
+                headerTitle: '🚀 AI Trader - Monitoring Dashboard',
+                statusHealthy: 'System Healthy',
+                statusDegraded: 'System Degraded',
+                statusUnhealthy: 'System Unhealthy',
+                alertLabel: 'Alert',
+                metricPortfolio: 'Portfolio Value',
+                tooltipPortfolio: 'Total value of your trading portfolio including cash and open positions. Updates in real-time.',
+                metricPositions: 'Active Positions',
+                tooltipPositions: 'Number of currently open trading positions. Monitor to ensure proper diversification.',
+                metricTrades: 'Total Trades',
+                tooltipTrades: 'Total number of executed trades. Track your trading activity and frequency.',
+                metricPerformance: 'System Performance',
+                tooltipPerformance: 'Average trade execution latency. Lower is better. Target: <50ms for optimal execution.',
+                labelDailyPnl: "Today's P&L",
+                labelExposure: 'Total exposure',
+                labelWinRate: 'Win rate',
+                labelAvgLatency: 'Avg execution latency',
+                healthTitle: 'System Health',
+                tooltipHealth: 'Real-time health status of critical system components: database, ML models, risk engine, and system resources.',
+                loadingHealth: 'Loading health checks...',
+                chartTitle: 'Portfolio Performance (24h)',
+                tooltipChart: 'Real-time portfolio value over the last 24 hours. Track your performance visually.',
+                tradesTitle: 'Recent Trades',
+                tooltipTrades2: 'Most recent trading activity with execution details and P&L results.',
+                thTime: 'Time',
+                thSymbol: 'Symbol',
+                thSide: 'Side',
+                thQuantity: 'Quantity',
+                thPrice: 'Price',
+                thPnl: 'P&L',
+                thStatus: 'Status',
+                loadingTrades: 'No trades yet',
+                labelLastUpdate: 'Last updated',
+                helpBtn: '❓ Help',
+                helpModalTitle: '📖 Dashboard Help Guide',
+                helpWhatIs: '🎯 What is this?',
+                helpWhatIsText: 'This is a real-time monitoring dashboard for your AI-powered trading system. It provides comprehensive visibility into your portfolio performance, system health, trading activity, and risk metrics. All data updates automatically via WebSocket connection.',
+                helpMetrics: '📊 Key Metrics',
+                helpPortfolio: 'Portfolio Value',
+                helpPortfolioText: 'Total value of all assets. Includes cash and positions.',
+                helpPositions: 'Active Positions',
+                helpPositionsText: 'Number of open trades. Monitor diversification.',
+                helpTrades: 'Total Trades',
+                helpTradesText: 'Trading activity count. Track frequency.',
+                helpWinRate: 'Win Rate',
+                helpWinRateText: 'Percentage of profitable trades. Target: >55%',
+                helpHealth: '🏥 Health Checks',
+                helpHealthList: '<li><strong>System Resources</strong> - CPU, RAM, disk usage monitoring</li><li><strong>Database</strong> - Connection and query performance</li><li><strong>ML Models</strong> - LSTM and Meta-Learner availability</li><li><strong>Risk Engine</strong> - Kelly, correlation, gap protection status</li>',
+                helpHealthStatus: '<strong style="color: #10b981;">Healthy</strong> - All systems operational | <strong style="color: #f59e0b;">Degraded</strong> - Some issues detected | <strong style="color: #ef4444;">Unhealthy</strong> - Critical failure',
+                helpFeatures: '⚡ System Features',
+                helpFeaturesList: '<li><strong>ML Ensemble</strong> - LSTM + Technical indicators (70/30 blend)</li><li><strong>Meta-Learner</strong> - XGBoost filter removes 40-50% losing trades</li><li><strong>Advanced Risk</strong> - Kelly Criterion + Correlation + Gap Protection</li><li><strong>Strategies</strong> - EMA, RSI, Bollinger, Ichimoku, VWAP</li><li><strong>Realistic Slippage</strong> - 0.05-0.2% based on volume/volatility</li><li><strong>Real-time Updates</strong> - WebSocket connection every 2 seconds</li>',
+                helpApi: '🔗 API Endpoints',
+                helpApiList: '<li><code>GET /api/monitoring/health</code> - System health status</li><li><code>GET /api/monitoring/metrics</code> - All metrics summary</li><li><code>GET /api/monitoring/metrics/{name}</code> - Specific metric stats</li><li><code>GET /api/monitoring/metrics/{name}/timeseries</code> - Historical data</li><li><code>WS /api/monitoring/ws</code> - Real-time WebSocket updates</li>',
+                helpTips: '💡 Tips',
+                helpTipsList: '<li>Monitor <strong>Win Rate</strong> - aim for >55% for consistent profitability</li><li>Watch <strong>Health Status</strong> - address degraded systems promptly</li><li>Track <strong>Exposure</strong> - keep portfolio risk under control</li><li>Check <strong>Execution Latency</strong> - ensure fast trade execution</li><li>Review <strong>Recent Trades</strong> - validate strategy performance</li><li>Use <strong>Language Switch</strong> - toggle between English and Russian</li>',
+            },
+            ru: {
+                headerTitle: '🚀 AI Трейдер - Панель Мониторинга',
+                statusHealthy: 'Система Здорова',
+                statusDegraded: 'Система Деградирована',
+                statusUnhealthy: 'Система Неработоспособна',
+                alertLabel: 'Внимание',
+                metricPortfolio: 'Стоимость Портфеля',
+                tooltipPortfolio: 'Общая стоимость вашего торгового портфеля, включая наличные и открытые позиции. Обновляется в реальном времени.',
+                metricPositions: 'Активные Позиции',
+                tooltipPositions: 'Количество открытых торговых позиций. Следите за диверсификацией портфеля.',
+                metricTrades: 'Всего Сделок',
+                tooltipTrades: 'Общее количество исполненных сделок. Отслеживайте торговую активность.',
+                metricPerformance: 'Производительность Системы',
+                tooltipPerformance: 'Средняя задержка исполнения сделок. Чем меньше, тем лучше. Цель: <50мс для оптимального исполнения.',
+                labelDailyPnl: 'Прибыль/Убыток за День',
+                labelExposure: 'Общая экспозиция',
+                labelWinRate: 'Процент прибыли',
+                labelAvgLatency: 'Средняя задержка исполнения',
+                healthTitle: 'Здоровье Системы',
+                tooltipHealth: 'Состояние критических компонентов системы: база данных, ML модели, система управления рисками и системные ресурсы.',
+                loadingHealth: 'Загрузка проверок здоровья...',
+                chartTitle: 'Производительность Портфеля (24ч)',
+                tooltipChart: 'Стоимость портфеля в реальном времени за последние 24 часа. Визуальное отслеживание результатов.',
+                tradesTitle: 'Последние Сделки',
+                tooltipTrades2: 'Последняя торговая активность с деталями исполнения и результатами P&L.',
+                thTime: 'Время',
+                thSymbol: 'Символ',
+                thSide: 'Направление',
+                thQuantity: 'Количество',
+                thPrice: 'Цена',
+                thPnl: 'P&L',
+                thStatus: 'Статус',
+                loadingTrades: 'Нет сделок',
+                labelLastUpdate: 'Последнее обновление',
+                helpBtn: '❓ Справка',
+                helpModalTitle: '📖 Справка по Панели',
+                helpWhatIs: '🎯 Что это такое?',
+                helpWhatIsText: 'Это панель мониторинга в реальном времени для вашей торговой системы с искусственным интеллектом. Она обеспечивает полную видимость производительности портфеля, состояния системы, торговой активности и метрик риска. Все данные обновляются автоматически через WebSocket соединение.',
+                helpMetrics: '📊 Основные Метрики',
+                helpPortfolio: 'Стоимость Портфеля',
+                helpPortfolioText: 'Общая стоимость всех активов. Включает наличные и позиции.',
+                helpPositions: 'Активные Позиции',
+                helpPositionsText: 'Количество открытых сделок. Следите за диверсификацией.',
+                helpTrades: 'Всего Сделок',
+                helpTradesText: 'Счетчик торговой активности. Отслеживайте частоту.',
+                helpWinRate: 'Процент Прибыли',
+                helpWinRateText: 'Процент прибыльных сделок. Цель: >55%',
+                helpHealth: '🏥 Проверки Здоровья',
+                helpHealthList: '<li><strong>Системные Ресурсы</strong> - мониторинг CPU, RAM, диска</li><li><strong>База Данных</strong> - соединение и производительность запросов</li><li><strong>ML Модели</strong> - доступность LSTM и Мета-обучения</li><li><strong>Система Рисков</strong> - статус Kelly, корреляции, защиты от гэпов</li>',
+                helpHealthStatus: '<strong style="color: #10b981;">Здоров</strong> - Все системы работают | <strong style="color: #f59e0b;">Деградирован</strong> - Обнаружены проблемы | <strong style="color: #ef4444;">Неработоспособен</strong> - Критический сбой',
+                helpFeatures: '⚡ Возможности Системы',
+                helpFeaturesList: '<li><strong>ML Ансамбль</strong> - LSTM + Технические индикаторы (смесь 70/30)</li><li><strong>Мета-обучение</strong> - XGBoost фильтр убирает 40-50% убыточных сделок</li><li><strong>Продвинутые Риски</strong> - Критерий Келли + Корреляция + Защита от Гэпов</li><li><strong>Стратегии</strong> - EMA, RSI, Bollinger, Ichimoku, VWAP</li><li><strong>Реалистичный Slippage</strong> - 0.05-0.2% на основе объема/волатильности</li><li><strong>Обновления в Реальном Времени</strong> - WebSocket соединение каждые 2 секунды</li>',
+                helpApi: '🔗 API Endpoints',
+                helpApiList: '<li><code>GET /api/monitoring/health</code> - Статус здоровья системы</li><li><code>GET /api/monitoring/metrics</code> - Сводка всех метрик</li><li><code>GET /api/monitoring/metrics/{name}</code> - Статистика конкретной метрики</li><li><code>GET /api/monitoring/metrics/{name}/timeseries</code> - Исторические данные</li><li><code>WS /api/monitoring/ws</code> - WebSocket обновления в реальном времени</li>',
+                helpTips: '💡 Советы',
+                helpTipsList: '<li>Следите за <strong>Процентом Прибыли</strong> - стремитесь к >55% для стабильной прибыльности</li><li>Наблюдайте за <strong>Здоровьем</strong> - оперативно решайте проблемы деградированных систем</li><li>Отслеживайте <strong>Экспозицию</strong> - контролируйте риски портфеля</li><li>Проверяйте <strong>Задержку Исполнения</strong> - обеспечьте быстрое исполнение сделок</li><li>Просматривайте <strong>Последние Сделки</strong> - проверяйте эффективность стратегии</li><li>Используйте <strong>Переключатель Языка</strong> - переключайтесь между английским и русским</li>',
+            }
+        };
+
+        let currentLang = 'en';
+
+        function switchLanguage(lang) {
+            currentLang = lang;
+            const t = translations[lang];
+
+            // Update all text elements
+            Object.keys(t).forEach(key => {
+                const element = document.getElementById(key);
+                if (element) {
+                    if (key.includes('List')) {
+                        element.innerHTML = t[key];
+                    } else {
+                        element.textContent = t[key];
+                    }
+                }
+            });
+
+            // Update button states
+            document.getElementById('btnEn').classList.toggle('active', lang === 'en');
+            document.getElementById('btnRu').classList.toggle('active', lang === 'ru');
+
+            // Store preference
+            localStorage.setItem('dashboardLang', lang);
+        }
+
+        // Load saved language preference
+        const savedLang = localStorage.getItem('dashboardLang') || 'en';
+        if (savedLang === 'ru') {
+            switchLanguage('ru');
+        }
+
+        // Modal functions
+        function openHelp() {
+            document.getElementById('helpModal').style.display = 'block';
+        }
+
+        function closeHelp() {
+            document.getElementById('helpModal').style.display = 'none';
+        }
+
+        // Close modal on outside click
+        window.onclick = function(event) {
+            const modal = document.getElementById('helpModal');
+            if (event.target == modal) {
+                modal.style.display = 'none';
+            }
+        }
+
         // WebSocket connection
         let ws = null;
         let perfChart = null;
@@ -335,7 +872,7 @@
                     type: 'line',
                     data: {
                         datasets: [{
-                            label: 'Portfolio Value',
+                            label: currentLang === 'en' ? 'Portfolio Value' : 'Стоимость Портфеля',
                             data: perfData.map(p => ({ x: p.time, y: p.value })),
                             borderColor: '#10b981',
                             backgroundColor: 'rgba(16, 185, 129, 0.1)',
@@ -378,6 +915,7 @@
                 });
             } else {
                 perfChart.data.datasets[0].data = perfData.map(p => ({ x: p.time, y: p.value }));
+                perfChart.data.datasets[0].label = currentLang === 'en' ? 'Portfolio Value' : 'Стоимость Портфеля';
                 perfChart.update('none');
             }
         }
@@ -408,9 +946,10 @@
                 }
 
                 // Update system status
-                document.getElementById('statusText').textContent = `System ${health.status}`;
-                document.getElementById('statusIndicator').style.background = 
-                    health.status === 'healthy' ? '#10b981' : 
+                const statusKey = `status${health.status.charAt(0).toUpperCase() + health.status.slice(1)}`;
+                document.getElementById('statusText').textContent = translations[currentLang][statusKey] || `System ${health.status}`;
+                document.getElementById('statusIndicator').style.background =
+                    health.status === 'healthy' ? '#10b981' :
                     health.status === 'degraded' ? '#f59e0b' : '#ef4444';
 
             } catch (error) {

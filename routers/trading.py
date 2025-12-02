@@ -6,8 +6,10 @@ import json
 import time
 from pathlib import Path
 from typing import Iterable, List, Dict, Any, Optional, Tuple
+from datetime import datetime
 
 import math
+import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +23,10 @@ from schemas.trading import (
     BacktestSummary,
     Trade,
     EquityPoint,
+    WalkForwardRequest,
+    WalkForwardResponse,
+    WalkForwardSummary as WalkForwardSummarySchema,
+    WalkForwardIterationResult,
 )
 from src.strategy import (
     ema_cross_signals,
@@ -742,3 +748,346 @@ async def run_backtest(
     except Exception as e:
         LOG.exception("POST /paper/backtest failed: %r", e)
         raise HTTPException(status_code=500, detail="Failed to run backtest")
+
+
+@router.post("/paper/walk-forward", response_model=WalkForwardResponse)
+async def run_walk_forward_backtest(
+    req: WalkForwardRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Run walk-forward backtest to detect overfitting.
+
+    Walk-forward testing is the gold standard for validating trading strategies:
+    1. Train on historical window (e.g., 12 months)
+    2. Test on future window (e.g., 3 months)
+    3. Roll window forward and repeat
+    4. Aggregate results across all iterations
+
+    If test performance is significantly worse than train performance,
+    overfitting is detected and strategy is not robust.
+
+    Args:
+        req: Walk-forward backtest request with configuration
+
+    Returns:
+        WalkForwardResponse with aggregate summary and per-iteration results
+    """
+    try:
+        # 1) Load historical data from DB
+        rows = await crud.query_ohlcv(
+            session,
+            source=req.source,
+            asset=req.symbol,
+            tf=req.tf,
+            limit=req.limit,
+            order="asc",
+        )
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No historical data found for {req.source}/{req.symbol}/{req.tf}"
+            )
+
+        df = _rows_to_df(rows)
+        if df.empty:
+            raise HTTPException(
+                status_code=404,
+                detail="Historical data is empty after processing"
+            )
+
+        # 2) Convert to DatetimeIndex for walk-forward testing
+        df['datetime'] = pd.to_datetime(df['ts'], unit='s', utc=True)
+        df = df.set_index('datetime')
+        df = df.sort_index()
+
+        LOG.info(
+            f"Walk-forward test: {req.symbol} {req.tf}, "
+            f"{len(df)} bars from {df.index[0]} to {df.index[-1]}"
+        )
+
+        # 3) Import walk-forward module
+        from src.backtest.walk_forward import (
+            WalkForwardTester,
+            WalkForwardConfig,
+        )
+
+        # 4) Create walk-forward configuration
+        wf_config = WalkForwardConfig(
+            train_window_days=req.train_window_days,
+            test_window_days=req.test_window_days,
+            step_days=req.step_days,
+            optimize_on_train=req.optimize_params,
+            use_anchored_walk=req.use_anchored_walk,
+        )
+
+        # 5) Define backtest function that walk-forward will call
+        def backtest_func(df_train: pd.DataFrame, df_test: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+            """Run backtest on given data with parameters."""
+            # Reset index to get 'ts' column back
+            df_bt = df_test.reset_index()
+            df_bt['ts'] = (df_bt['datetime'].astype('int64') / 1e9).astype('int64')
+
+            # Ensure we have required EMA parameters
+            fast = int(params.get('ema_fast', req.fast))
+            slow = int(params.get('ema_slow', req.slow))
+
+            if fast >= slow:
+                fast, slow = slow, fast
+
+            # Check minimum bars
+            min_need = max(fast, slow) + 5
+            if len(df_bt) < min_need:
+                # Return zero metrics if insufficient data
+                return {
+                    'sharpe': 0.0,
+                    'returns': 0.0,
+                    'max_dd': 0.0,
+                    'win_rate': 0.0,
+                    'trades': 0,
+                }
+
+            # Generate signals
+            sigs = ema_cross_signals(df_bt, fast, slow)
+
+            # Merge with OHLC
+            merged = pd.merge(
+                sigs,
+                df_bt[["ts", "high", "low"]],
+                on="ts",
+                how="left",
+                validate="one_to_one",
+            ).sort_values("ts")
+
+            # Create slippage model
+            slippage_model = create_realistic_model()
+
+            # Calculate ATR for slippage
+            from src.indicators import atr as calc_atr
+            df_bt_atr = df_bt.copy()
+            df_bt_atr['atr'] = calc_atr(df_bt['high'], df_bt['low'], df_bt['close'], period=14)
+
+            # Run paper trader
+            trader = PaperTrader(
+                sl_pct=float(req.sl_pct),
+                tp_pct=float(req.tp_pct),
+                fee_pct=float(req.fee_pct),
+            )
+
+            for idx, row in merged.iterrows():
+                ts = int(row["ts"])
+                price_close = float(row["close"])
+                high = float(row["high"]) if pd.notna(row["high"]) else price_close
+                low = float(row["low"]) if pd.notna(row["low"]) else price_close
+                signal = int(row["signal"])
+
+                # Check SL/TP
+                trader.check_sl_tp(ts, high=high, low=low)
+
+                if signal != 0:
+                    qty = trader.qty
+
+                    # Get ATR for slippage
+                    atr_value = df_bt_atr.loc[df_bt_atr['ts'] == ts, 'atr'].values
+                    atr_val = float(atr_value[0]) if len(atr_value) > 0 else 0.0
+                    volatility = atr_val / price_close if price_close > 0 else 0.02
+
+                    # Average volume
+                    current_idx = df_bt[df_bt['ts'] == ts].index[0]
+                    lookback_start = max(0, current_idx - 20)
+                    avg_volume = df_bt.iloc[lookback_start:current_idx]['volume'].mean()
+                    if pd.isna(avg_volume) or avg_volume <= 0:
+                        avg_volume = df_bt['volume'].mean()
+
+                    # Detect gaps
+                    is_gap = False
+                    if current_idx > 0:
+                        prev_close = df_bt.iloc[current_idx - 1]['close']
+                        gap_pct = abs(price_close - prev_close) / prev_close
+                        is_gap = gap_pct > 0.02
+
+                    # Calculate fill price with slippage
+                    fill_price = slippage_model.calculate_fill_price(
+                        entry_price=price_close,
+                        quantity=qty,
+                        avg_volume=avg_volume,
+                        volatility=volatility,
+                        side="buy" if signal > 0 else "sell",
+                        is_market_order=True,
+                        is_gap_event=is_gap,
+                    )
+
+                    trader.on_signal(ts, fill_price, signal)
+
+            # Close final position
+            if trader.position is not None and len(merged) > 0:
+                last = merged.iloc[-1]
+                trader.close(int(last["ts"]), float(last["close"]), reason="eod")
+
+            # Calculate metrics
+            trades_list = list(trader.trades or [])
+
+            if not trades_list:
+                return {
+                    'sharpe': 0.0,
+                    'returns': 0.0,
+                    'max_dd': 0.0,
+                    'win_rate': 0.0,
+                    'trades': 0,
+                }
+
+            # Calculate returns
+            total_pnl = sum(t['pnl'] for t in trades_list)
+            returns = total_pnl / req.start_equity
+
+            # Calculate win rate
+            wins = sum(1 for t in trades_list if t['pnl'] > 0)
+            win_rate = wins / len(trades_list) if trades_list else 0.0
+
+            # Calculate Sharpe ratio (simplified)
+            ret_pcts = [t['ret_pct'] for t in trades_list]
+            if ret_pcts:
+                mean_ret = np.mean(ret_pcts)
+                std_ret = np.std(ret_pcts)
+                sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret > 0 else 0.0
+            else:
+                sharpe = 0.0
+
+            # Calculate max drawdown
+            equity_values = [req.start_equity]
+            running_equity = req.start_equity
+            for t in trades_list:
+                running_equity += t['pnl']
+                equity_values.append(running_equity)
+            max_dd = _max_drawdown(equity_values)
+
+            return {
+                'sharpe': sharpe,
+                'returns': returns,
+                'max_dd': max_dd,
+                'win_rate': win_rate,
+                'trades': len(trades_list),
+            }
+
+        # 6) Define optimization function if enabled
+        optimize_func = None
+        if req.optimize_params:
+            def optimize_func(df_train: pd.DataFrame) -> Dict[str, Any]:
+                """Optimize EMA parameters on training data."""
+                # Try different EMA combinations
+                best_sharpe = -999.0
+                best_params = {'ema_fast': req.fast, 'ema_slow': req.slow}
+
+                # Grid search (limited for performance)
+                fast_range = [8, 12, 16, 20]
+                slow_range = [20, 26, 32, 40, 50]
+
+                for fast in fast_range:
+                    for slow in slow_range:
+                        if fast >= slow:
+                            continue
+
+                        try:
+                            params = {'ema_fast': fast, 'ema_slow': slow}
+                            metrics = backtest_func(df_train, df_train, params)
+
+                            if metrics['sharpe'] > best_sharpe and metrics['trades'] >= 10:
+                                best_sharpe = metrics['sharpe']
+                                best_params = params
+                        except Exception as e:
+                            LOG.debug(f"Optimization failed for {fast}/{slow}: {e}")
+                            continue
+
+                LOG.info(
+                    f"Optimized params: fast={best_params['ema_fast']}, "
+                    f"slow={best_params['ema_slow']}, sharpe={best_sharpe:.2f}"
+                )
+                return best_params
+
+        # 7) Run walk-forward test
+        tester = WalkForwardTester(
+            backtest_func=backtest_func,
+            optimize_func=optimize_func,
+            config=wf_config,
+        )
+
+        base_params = {
+            'ema_fast': req.fast,
+            'ema_slow': req.slow,
+        }
+
+        wf_summary = tester.run(df, base_params=base_params)
+
+        # 8) Convert to API response schemas
+        iterations_response = []
+        for it in wf_summary.iterations:
+            iterations_response.append(
+                WalkForwardIterationResult(
+                    iteration=it.iteration,
+                    train_start=it.train_start.isoformat() if isinstance(it.train_start, datetime) else str(it.train_start),
+                    train_end=it.train_end.isoformat() if isinstance(it.train_end, datetime) else str(it.train_end),
+                    test_start=it.test_start.isoformat() if isinstance(it.test_start, datetime) else str(it.test_start),
+                    test_end=it.test_end.isoformat() if isinstance(it.test_end, datetime) else str(it.test_end),
+                    optimized_params=it.optimized_params,
+                    train_sharpe=it.train_sharpe,
+                    train_returns=it.train_returns,
+                    train_max_dd=it.train_max_dd,
+                    train_win_rate=it.train_win_rate,
+                    train_trades=it.train_trades,
+                    test_sharpe=it.test_sharpe,
+                    test_returns=it.test_returns,
+                    test_max_dd=it.test_max_dd,
+                    test_win_rate=it.test_win_rate,
+                    test_trades=it.test_trades,
+                    sharpe_degradation=it.sharpe_degradation,
+                    returns_degradation=it.returns_degradation,
+                )
+            )
+
+        summary_response = WalkForwardSummarySchema(
+            total_iterations=wf_summary.total_iterations,
+            train_window_days=wf_config.train_window_days,
+            test_window_days=wf_config.test_window_days,
+            step_days=wf_config.step_days,
+            use_anchored_walk=wf_config.use_anchored_walk,
+            avg_test_sharpe=wf_summary.avg_test_sharpe,
+            avg_test_returns=wf_summary.avg_test_returns,
+            avg_test_max_dd=wf_summary.avg_test_max_dd,
+            avg_test_win_rate=wf_summary.avg_test_win_rate,
+            avg_sharpe_degradation=wf_summary.avg_sharpe_degradation,
+            avg_returns_degradation=wf_summary.avg_returns_degradation,
+            positive_test_periods=wf_summary.positive_test_periods,
+            sharpe_above_1_periods=wf_summary.sharpe_above_1_periods,
+            overfitting_detected=wf_summary.overfitting_detected,
+            overfitting_reason=wf_summary.overfitting_reason,
+            params={
+                "source": req.source,
+                "symbol": req.symbol,
+                "tf": req.tf,
+                "base_fast": req.fast,
+                "base_slow": req.slow,
+                "optimize_params": req.optimize_params,
+                "sl_pct": req.sl_pct,
+                "tp_pct": req.tp_pct,
+                "fee_pct": req.fee_pct,
+            },
+        )
+
+        LOG.info(
+            f"Walk-forward complete: {req.symbol} {req.tf}, "
+            f"{wf_summary.total_iterations} iterations, "
+            f"avg_test_sharpe={wf_summary.avg_test_sharpe:.2f}, "
+            f"overfitting={wf_summary.overfitting_detected}"
+        )
+
+        return WalkForwardResponse(
+            summary=summary_response,
+            iterations=iterations_response,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.exception("POST /paper/walk-forward failed: %r", e)
+        raise HTTPException(status_code=500, detail=f"Walk-forward backtest failed: {str(e)}")
